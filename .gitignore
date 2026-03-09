@@ -1,0 +1,11 @@
+/target/
+**/*.rs.bk
+/Cargo.lock
+
+# Java build output
+bindings/java/target/
+
+# Python build artifacts
+**/__pycache__/
+*.pyc
+*.so

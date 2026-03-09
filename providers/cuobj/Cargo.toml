@@ -1,0 +1,13 @@
+[package]
+name        = "s3-rdma-cuobj"
+version     = "0.2.0"
+edition     = "2021"
+description = "cuObject RDMA provider plugin for S3 clients (cdylib)"
+license     = "MIT"
+
+[lib]
+name       = "s3_rdma_cuobj"
+crate-type = ["cdylib"]
+
+[dependencies]
+s3-rdma = { path = "../../core", features = ["cuobj", "c-abi"] }

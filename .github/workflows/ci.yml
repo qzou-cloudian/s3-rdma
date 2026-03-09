@@ -1,0 +1,116 @@
+name: s3-rdma CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    name: Check (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""                                      # no features
+          - "client"
+          - "server"
+          - "buffer-pool"
+          - "io"
+          - "io-uring"
+          - "client,server"
+          - "client,server,buffer-pool"
+          - "client,server,buffer-pool,io"
+          - "client,server,buffer-pool,io-uring"   # all features
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.features }}
+
+      - name: cargo check
+        # cuobject-sys requires the CUDA SDK to build; check only the cuobject
+        # crate without building cuobject-sys (no CUDA on CI runners).
+        run: |
+          FEATURES="${{ matrix.features }}"
+          if [ -z "$FEATURES" ]; then
+            cargo check -p cuobject --message-format short
+          else
+            cargo check -p cuobject --features "$FEATURES" --message-format short
+          fi
+
+  test:
+    name: Test (io)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: cargo test --features io
+        run: cargo test -p cuobject --features io
+
+      - name: cargo test --features io,io-uring
+        run: cargo test -p cuobject --features io,io-uring
+
+  lint:
+    name: Clippy + fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain with extras
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (no features)
+        run: cargo clippy -p cuobject -- -D warnings
+
+      - name: cargo clippy (io + io-uring)
+        run: cargo clippy -p cuobject --features io,io-uring -- -D warnings
+
+  doc:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo doc --features io,io-uring
+        run: cargo doc -p cuobject --no-deps --features io,io-uring
+        env:
+          RUSTDOCFLAGS: "-D warnings"
