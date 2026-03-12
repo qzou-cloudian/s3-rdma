@@ -1,13 +1,35 @@
 //! Mock RDMA provider – no NVIDIA hardware required.
 //!
-//! Suitable for testing and development.  Memory suitability is simulated
-//! (buffers ≥ 1 MiB are accepted).  Tokens are deterministic ASCII strings.
+//! Uses POSIX shared memory (`/dev/shm`) so that the client and an out-of-process
+//! relay server on the **same host** can exchange object data without copying
+//! through the HTTP body.
+//!
+//! ## Token format
+//! ```text
+//! RDMA_{PUT|GET}_{shm-name}_{size}_{offset}_key_{s3-key}
+//! ```
+//! `shm-name` is `rdma-{pid}-{buf_ptr_hex}` (hyphens only, no underscores).
+//!
+//! ## Lifecycle
+//! | Step | Client calls | Effect |
+//! |------|-------------|--------|
+//! | 1 | `register_memory(ptr, size)` | Creates `/dev/shm/{shm-name}`, `mmap`s it |
+//! | 2 | `prepare_put_token(…)` | Copies `ptr[offset..offset+size]` → shm, returns token |
+//! | 2 | `prepare_get_token(…)` | Returns token (shm left empty; relay will fill it) |
+//! | 3 | *(HTTP exchange)* | Relay reads or writes the shm file |
+//! | 4 | `process_reply_token(…)` | For GET: copies shm → `ptr`; cleans up shm |
+//! | 5 | `deregister_memory(ptr)` | Cleans up if not already done by step 4 |
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::os::unix::io::AsRawFd;
 use std::sync::Mutex;
 
 use crate::error::RdmaError;
 use crate::provider::{RdmaCompletionCallback, RdmaCompletionResult, RdmaProvider};
+
+/// Base directory for shared-memory files.
+const SHM_DIR: &str = "/dev/shm";
 
 fn env_or(var: &str, default: &'static str) -> &'static str {
     match std::env::var(var) {
@@ -16,10 +38,37 @@ fn env_or(var: &str, default: &'static str) -> &'static str {
     }
 }
 
-/// Pure-Rust mock RDMA provider.  Does not require the NVIDIA cuObject SDK.
+struct ShmEntry {
+    /// Basename, e.g. `rdma-12345-7fab12340000`.
+    name: String,
+    /// Full path `/dev/shm/rdma-…`.
+    path: String,
+    /// `mmap`-ed pointer into the shared-memory region.
+    shm_ptr: *mut libc::c_void,
+    /// Original client buffer pointer (destination for GET copies).
+    buf_ptr: *mut u8,
+    size: usize,
+}
+
+// SAFETY: raw pointers are only accessed under the `registered` Mutex.
+unsafe impl Send for ShmEntry {}
+unsafe impl Sync for ShmEntry {}
+
+impl ShmEntry {
+    /// Unmap and delete the shared-memory file.
+    ///
+    /// # Safety
+    /// Must be called at most once per entry.
+    unsafe fn cleanup(&self) {
+        libc::munmap(self.shm_ptr, self.size);
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Pure-Rust mock RDMA provider backed by `/dev/shm` shared memory.
 pub struct MockRdmaProvider {
     debug: bool,
-    registered: Mutex<HashMap<usize, usize>>,
+    registered: Mutex<HashMap<usize, ShmEntry>>,
     token_header: &'static str,
     reply_header: &'static str,
 }
@@ -51,34 +100,71 @@ impl MockRdmaProvider {
 }
 
 impl RdmaProvider for MockRdmaProvider {
-    fn name(&self) -> &str {
-        "MockRdmaProvider"
-    }
-
-    fn version(&self) -> u32 {
-        1
-    }
+    fn name(&self) -> &str { "MockRdmaProvider" }
+    fn version(&self) -> u32 { 1 }
 
     fn is_memory_suitable(&self, ptr: *const u8, size: usize) -> bool {
-        // Mock accepts any non-empty buffer so RDMA paths can be exercised
-        // without hardware or large allocations.
-        let suitable = !ptr.is_null() && size > 0;
-        self.dbg(&format!("is_memory_suitable ptr={ptr:p} size={size} -> {suitable}"));
-        suitable
+        let ok = !ptr.is_null() && size > 0;
+        self.dbg(&format!("is_memory_suitable ptr={ptr:p} size={size} -> {ok}"));
+        ok
     }
 
+    /// Create a `/dev/shm` segment and `mmap` it, ready for PUT or GET.
     fn register_memory(&self, ptr: *mut u8, size: usize) -> Result<(), RdmaError> {
         self.dbg(&format!("register_memory ptr={ptr:p} size={size}"));
-        self.registered.lock().unwrap().insert(ptr as usize, size);
+
+        let name = format!("rdma-{}-{:x}", std::process::id(), ptr as usize);
+        let path = format!("{SHM_DIR}/{name}");
+
+        let file = OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open(&path)
+            .map_err(|e| RdmaError::MemoryRegistrationFailed {
+                ptr: ptr as usize, size,
+                reason: format!("create {path}: {e}"),
+            })?;
+        file.set_len(size as u64)
+            .map_err(|e| RdmaError::MemoryRegistrationFailed {
+                ptr: ptr as usize, size,
+                reason: format!("resize {path}: {e}"),
+            })?;
+
+        // SAFETY: fd is valid and file is correctly sized.
+        let shm_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(), size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED, file.as_raw_fd(), 0,
+            )
+        };
+        if shm_ptr == libc::MAP_FAILED {
+            let _ = std::fs::remove_file(&path);
+            return Err(RdmaError::MemoryRegistrationFailed {
+                ptr: ptr as usize, size,
+                reason: format!("mmap {path}: {}", std::io::Error::last_os_error()),
+            });
+        }
+        // fd may be closed; the mapping persists until munmap.
+        drop(file);
+
+        self.registered.lock().unwrap().insert(
+            ptr as usize,
+            ShmEntry { name, path, shm_ptr, buf_ptr: ptr, size },
+        );
         Ok(())
     }
 
     fn deregister_memory(&self, ptr: *mut u8) -> Result<(), RdmaError> {
         self.dbg(&format!("deregister_memory ptr={ptr:p}"));
-        self.registered.lock().unwrap().remove(&(ptr as usize));
+        if let Some(entry) = self.registered.lock().unwrap().remove(&(ptr as usize)) {
+            // SAFETY: entry is removed from the map; cleanup called exactly once.
+            unsafe { entry.cleanup(); }
+        }
         Ok(())
     }
 
+    /// Copy client buffer → shm, then return a token the relay can use to open
+    /// `/dev/shm/{shm-name}` and read the data.
     fn prepare_put_token(
         &self,
         s3_key: &[u8],
@@ -87,14 +173,34 @@ impl RdmaProvider for MockRdmaProvider {
         offset: usize,
     ) -> Result<Vec<u8>, RdmaError> {
         let key = String::from_utf8_lossy(s3_key);
-        let token = format!("RDMA_PUT_{buffer:p}_{size}_{offset}_key_{key}").into_bytes();
-        self.dbg(&format!(
-            "prepare_put_token key={key} token={}",
-            String::from_utf8_lossy(&token)
-        ));
+        let registered = self.registered.lock().unwrap();
+        let entry = registered.get(&(buffer as usize)).ok_or_else(|| {
+            RdmaError::TokenGenerationFailed {
+                key: key.to_string(),
+                reason: format!("buffer {buffer:p} not registered"),
+            }
+        })?;
+
+        // SAFETY: buffer..+size is valid (caller's responsibility); shm_ptr is
+        // a valid MAP_SHARED mapping of `entry.size` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                buffer.add(offset),
+                entry.shm_ptr as *mut u8,
+                size,
+            );
+            // Flush to page cache so the relay's read() syscall sees the data.
+            libc::msync(entry.shm_ptr, size, libc::MS_SYNC);
+        }
+
+        let token = format!("RDMA_PUT_{}_{}_{}_key_{}", entry.name, size, offset, key)
+            .into_bytes();
+        self.dbg(&format!("prepare_put_token key={key} shm={}", entry.name));
         Ok(token)
     }
 
+    /// Return a token encoding the (empty) shm region; the relay will fill it
+    /// with fetched object data before replying.
     fn prepare_get_token(
         &self,
         s3_key: &[u8],
@@ -103,28 +209,78 @@ impl RdmaProvider for MockRdmaProvider {
         offset: usize,
     ) -> Result<Vec<u8>, RdmaError> {
         let key = String::from_utf8_lossy(s3_key);
-        let token =
-            format!("RDMA_GET_{buffer:p}_{size}_{offset}_key_{key}").into_bytes();
-        self.dbg(&format!(
-            "prepare_get_token key={key} token={}",
-            String::from_utf8_lossy(&token)
-        ));
+        let registered = self.registered.lock().unwrap();
+        let entry = registered.get(&(buffer as usize)).ok_or_else(|| {
+            RdmaError::TokenGenerationFailed {
+                key: key.to_string(),
+                reason: format!("buffer {buffer:p} not registered"),
+            }
+        })?;
+
+        let token = format!("RDMA_GET_{}_{}_{}_key_{}", entry.name, size, offset, key)
+            .into_bytes();
+        self.dbg(&format!("prepare_get_token key={key} shm={}", entry.name));
         Ok(token)
     }
 
+    /// For GET: the relay has written data into the shm file; copy it into the
+    /// client's original buffer.  Then clean up the shm entry.
     fn process_reply_token(
         &self,
         reply_token: &[u8],
         callback: RdmaCompletionCallback,
     ) -> Result<(), RdmaError> {
-        self.dbg(&format!(
-            "process_reply_token token={}",
-            String::from_utf8_lossy(reply_token)
-        ));
-        callback(RdmaCompletionResult {
-            error_code: 0,
-            reply_token: reply_token.to_vec(),
-        });
+        let token_str = std::str::from_utf8(reply_token).unwrap_or("");
+        self.dbg(&format!("process_reply_token token={token_str}"));
+
+        // Parse: RDMA_{PUT|GET}_{shm-name}_{size}_{offset}_key_{s3-key}
+        let parts: Vec<&str> = token_str.splitn(7, '_').collect();
+        let entry_to_drop: Option<ShmEntry> = if parts.len() >= 5 && parts[0] == "RDMA" {
+            let op = parts[1];
+            let shm_name = parts[2];
+            let size: usize = parts[3].parse().unwrap_or(0);
+            let offset: usize = parts[4].parse().unwrap_or(0);
+
+            let mut registered = self.registered.lock().unwrap();
+            // Find the entry by shm name (linear scan; few entries in practice).
+            let found_ptr = registered.iter()
+                .find(|(_, e)| e.name == shm_name)
+                .map(|(&k, _)| k);
+
+            found_ptr.and_then(|ptr| {
+                let entry = registered.remove(&ptr)?;
+                if op == "GET" && size > 0 {
+                    // The relay wrote `size` bytes to the shm file; copy into
+                    // the client's buffer via the existing MAP_SHARED mapping.
+                    // Clamp to avoid writing beyond the registered region.
+                    let available = entry.size.saturating_sub(offset);
+                    let copy_len = size.min(available);
+                    if copy_len > 0 {
+                        // SAFETY: shm_ptr is a valid MAP_SHARED mapping of entry.size
+                        // bytes; buf_ptr+offset..+copy_len is within the registered
+                        // region (offset + copy_len <= entry.size, enforced above).
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                entry.shm_ptr as *const u8,
+                                entry.buf_ptr.add(offset),
+                                copy_len,
+                            );
+                        }
+                    }
+                }
+                Some(entry)
+            })
+        } else {
+            None
+        };
+
+        // Clean up outside the lock.
+        if let Some(entry) = entry_to_drop {
+            // SAFETY: removed from map; cleanup called exactly once.
+            unsafe { entry.cleanup(); }
+        }
+
+        callback(RdmaCompletionResult { error_code: 0, reply_token: reply_token.to_vec() });
         Ok(())
     }
 

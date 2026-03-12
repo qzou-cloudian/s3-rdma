@@ -16,5 +16,6 @@ c-abi    = []
 pyo3     = ["dep:pyo3", "pyo3/extension-module"]
 
 [dependencies]
+libc       = "0.2"
 libloading = { version = "0.8", optional = true }
 pyo3       = { version = "0.22", optional = true }

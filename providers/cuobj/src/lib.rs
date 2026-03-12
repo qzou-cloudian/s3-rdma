@@ -92,8 +92,28 @@ fn do_prepare_put(
     // PUT: server will RDMA-READ from the client buffer; the cast from
     // *const to *mut is safe — the buffer is writable; we just expose it
     // as const to signal that the provider won't modify it.
-    let buf: RegisteredBuffer<'static> =
-        provider.client.register_raii(ptr as *mut u8, size)?;
+    let mptr = ptr as *mut u8;
+    let buf: RegisteredBuffer<'static> = match provider.client.register_raii(mptr, size) {
+        Ok(buf) => buf,
+        Err(CuObjClientError::AlreadyRegistered { .. }) => {
+            // The buffer is still registered from a previous multipart part
+            // whose RDMA transfer was not confirmed via x-amz-rdma-reply
+            // (server ignored or didn't support RDMA).  The HTTP response for
+            // that part has been received, so any RDMA transfer has completed.
+            // Drop the stale PendingOp(s) so the RegisteredBuffer inside them
+            // deregisters the MR and clears the entry in client.registered.
+            {
+                let mut pending = provider.pending.lock().unwrap();
+                pending.retain(|_, op| op._buf.ptr() != mptr);
+                // pending lock dropped here — RegisteredBuffer::drop (which
+                // calls client.deregister) runs after the lock is released to
+                // avoid a potential re-entrant lock.
+            }
+            // Now the MR is deregistered; register fresh.
+            provider.client.register_raii(mptr, size)?
+        }
+        Err(e) => return Err(e),
+    };
     let token = buf.put_token(offset, size)?;
     let key = token.as_bytes().to_vec();
     provider.pending.lock().unwrap().insert(key.clone(), PendingOp { _buf: buf, _token: token });
