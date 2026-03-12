@@ -63,6 +63,8 @@ pub use cuobj::cuobj_available;
 
 use std::sync::Arc;
 
+pub use error::RdmaError;
+
 /// Minimum buffer size (bytes) considered suitable for RDMA by the mock provider.
 #[allow(dead_code)]
 pub const RDMA_MIN_BUFFER_SIZE: usize = 1024 * 1024; // 1 MiB
@@ -83,36 +85,52 @@ pub fn rdma_provider_info() -> String {
     format!("RDMA providers: {}", entries.join(", "))
 }
 
-/// Build an `Arc<dyn RdmaProvider>` based on the requested mode.
+/// Build an `Arc<dyn RdmaProvider>` for the named provider.
 ///
-/// - `use_mock = true`  → always use [`MockRdmaProvider`].
-/// - `use_mock = false` → try [`CuObjProvider`] (requires `cuobj` feature),
-///   falling back to [`MockRdmaProvider`] if the SDK is unavailable.
-pub fn create_provider(use_mock: bool, debug: bool) -> Arc<dyn RdmaProvider> {
-    if use_mock {
-        if debug {
-            eprintln!("[rdma] Using MockRdmaProvider (mock mode)");
-        }
-        return Arc::new(MockRdmaProvider::new(debug));
-    }
-
-    #[cfg(feature = "cuobj")]
-    {
-        match CuObjProvider::new() {
-            Ok(p) => {
-                if debug {
-                    eprintln!("[rdma] Using CuObjProvider");
-                }
-                return Arc::new(p);
+/// `provider` must be one of:
+/// - `"mock"`  → [`MockRdmaProvider`]
+/// - `"cuobj"` → [`CuObjProvider`] (requires the `cuobj` feature)
+///
+/// Returns [`RdmaError::ProviderUnavailable`] if the name is unrecognised,
+/// the required feature is not compiled in, or the underlying SDK fails to
+/// initialise.
+pub fn create_provider(provider: &str, debug: bool) -> Result<Arc<dyn RdmaProvider>, RdmaError> {
+    match provider {
+        "mock" => {
+            if debug {
+                eprintln!("[rdma] Using MockRdmaProvider");
             }
-            Err(e) => {
-                eprintln!("[rdma] CuObjProvider unavailable ({e}); falling back to mock");
-            }
+            Ok(Arc::new(MockRdmaProvider::new(debug)))
         }
+        "cuobj" => {
+            let result: Result<Arc<dyn RdmaProvider>, RdmaError>;
+            #[cfg(feature = "cuobj")]
+            {
+                result = match CuObjProvider::new() {
+                    Ok(p) => {
+                        if debug {
+                            eprintln!("[rdma] Using CuObjProvider");
+                        }
+                        Ok(Arc::new(p))
+                    }
+                    Err(e) => Err(RdmaError::ProviderUnavailable {
+                        provider: provider.to_owned(),
+                        reason: e.to_string(),
+                    }),
+                };
+            }
+            #[cfg(not(feature = "cuobj"))]
+            {
+                result = Err(RdmaError::ProviderUnavailable {
+                    provider: provider.to_owned(),
+                    reason: "compiled without the `cuobj` feature".to_owned(),
+                });
+            }
+            result
+        }
+        other => Err(RdmaError::ProviderUnavailable {
+            provider: other.to_owned(),
+            reason: "unknown provider".to_owned(),
+        }),
     }
-
-    if debug {
-        eprintln!("[rdma] Using MockRdmaProvider (fallback)");
-    }
-    Arc::new(MockRdmaProvider::new(debug))
 }

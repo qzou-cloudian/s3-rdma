@@ -10,4 +10,5 @@ name       = "s3_rdma_cuobj"
 crate-type = ["cdylib"]
 
 [dependencies]
-s3-rdma = { path = "../../core", features = ["cuobj", "c-abi"] }
+s3-rdma = { path = "../../core" }
+cuobj   = { path = "../../../cuobj", features = ["client"] }

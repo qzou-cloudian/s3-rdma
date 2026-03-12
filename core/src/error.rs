@@ -16,6 +16,8 @@ pub enum RdmaError {
     ReplyTokenProcessingFailed(String),
     /// cuObject client failed to connect.
     CuObjConnectionFailed(String),
+    /// Requested provider is unknown or could not be initialised.
+    ProviderUnavailable { provider: String, reason: String },
     /// I/O error.
     Io(std::io::Error),
 }
@@ -56,6 +58,9 @@ impl fmt::Display for RdmaError {
             }
             RdmaError::CuObjConnectionFailed(msg) => {
                 write!(f, "cuObject client failed to connect: {msg}")
+            }
+            RdmaError::ProviderUnavailable { provider, reason } => {
+                write!(f, "RDMA provider '{provider}' unavailable: {reason}")
             }
             RdmaError::Io(e) => write!(f, "I/O error: {e}"),
         }
