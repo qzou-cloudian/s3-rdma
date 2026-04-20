@@ -17,7 +17,7 @@
 //! | 2 | `prepare_put_token(…)` | Copies `ptr[offset..offset+size]` → shm, returns token |
 //! | 2 | `prepare_get_token(…)` | Returns token (shm left empty; relay will fill it) |
 //! | 3 | *(HTTP exchange)* | Relay reads or writes the shm file |
-//! | 4 | `process_reply_token(…)` | For GET: copies shm → `ptr`; cleans up shm |
+//! | 4 | `process_rdma_reply(status, request_token, transferred, cb)` | For GET: copies shm → `ptr`; cleans up shm |
 //! | 5 | `deregister_memory(ptr)` | Cleans up if not already done by step 4 |
 //!
 //! ## Server lifecycle (`MockRdmaServerProvider`)
@@ -229,8 +229,80 @@ impl RdmaProvider for MockRdmaProvider {
         Ok(token)
     }
 
-    /// For GET: the relay has written data into the shm file; copy it into the
-    /// client's original buffer.  Then clean up the shm entry.
+    /// Process the `x-amz-rdma-reply` numeric status code returned by the server.
+    ///
+    /// For GET operations: if `rdma_status` is 2xx, parses `request_token` to
+    /// locate the shm region and copies `transferred` bytes into the client
+    /// buffer.  For PUT operations: just cleans up the shm entry.
+    /// If `rdma_status` is not 2xx, fires `callback` with a non-zero error code.
+    fn process_rdma_reply(
+        &self,
+        rdma_status: u16,
+        request_token: &[u8],
+        transferred: usize,
+        callback: RdmaCompletionCallback,
+    ) -> Result<(), RdmaError> {
+        self.dbg(&format!("process_rdma_reply status={rdma_status} transferred={transferred}"));
+
+        if !(200..300).contains(&rdma_status) {
+            callback(RdmaCompletionResult { error_code: rdma_status as i32, reply_token: vec![] });
+            return Ok(());
+        }
+
+        // Parse the original request token to find the shm entry.
+        let token_str = std::str::from_utf8(request_token).unwrap_or("");
+        let parts: Vec<&str> = token_str.splitn(7, '_').collect();
+        let entry_to_drop: Option<ShmEntry> = if parts.len() >= 5 && parts[0] == "RDMA" {
+            let op = parts[1];
+            let shm_name = parts[2];
+            let offset: usize = parts[4].parse().unwrap_or(0);
+
+            let mut registered = self.registered.lock().unwrap();
+            let found_ptr = registered.iter()
+                .find(|(_, e)| e.name == shm_name)
+                .map(|(&k, _)| k);
+
+            found_ptr.and_then(|ptr| {
+                let entry = registered.remove(&ptr)?;
+                if op == "GET" && transferred > 0 {
+                    // Relay wrote `transferred` bytes to the shm file; copy into
+                    // the client's buffer via the existing MAP_SHARED mapping.
+                    let available = entry.size.saturating_sub(offset);
+                    let copy_len = transferred.min(available);
+                    if copy_len > 0 {
+                        // SAFETY: shm_ptr is a valid MAP_SHARED mapping of entry.size
+                        // bytes; buf_ptr+offset..+copy_len is within the registered
+                        // region (enforced by the min above).
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                entry.shm_ptr as *const u8,
+                                entry.buf_ptr.add(offset),
+                                copy_len,
+                            );
+                        }
+                    }
+                }
+                Some(entry)
+            })
+        } else {
+            None
+        };
+
+        if let Some(entry) = entry_to_drop {
+            // SAFETY: removed from map; cleanup called exactly once.
+            unsafe { entry.cleanup(); }
+        }
+
+        callback(RdmaCompletionResult { error_code: 0, reply_token: vec![] });
+        Ok(())
+    }
+
+    /// Process the `x-amz-rdma-reply` token returned by the S3 server.
+    ///
+    /// **Deprecated**: use [`process_rdma_reply`](Self::process_rdma_reply)
+    /// instead. The reply value is now a numeric status code (200/204/206/501),
+    /// not an opaque echo token.
+    #[allow(deprecated)]
     fn process_reply_token(
         &self,
         reply_token: &[u8],
@@ -248,7 +320,6 @@ impl RdmaProvider for MockRdmaProvider {
             let offset: usize = parts[4].parse().unwrap_or(0);
 
             let mut registered = self.registered.lock().unwrap();
-            // Find the entry by shm name (linear scan; few entries in practice).
             let found_ptr = registered.iter()
                 .find(|(_, e)| e.name == shm_name)
                 .map(|(&k, _)| k);
@@ -256,15 +327,9 @@ impl RdmaProvider for MockRdmaProvider {
             found_ptr.and_then(|ptr| {
                 let entry = registered.remove(&ptr)?;
                 if op == "GET" && size > 0 {
-                    // The relay wrote `size` bytes to the shm file; copy into
-                    // the client's buffer via the existing MAP_SHARED mapping.
-                    // Clamp to avoid writing beyond the registered region.
                     let available = entry.size.saturating_sub(offset);
                     let copy_len = size.min(available);
                     if copy_len > 0 {
-                        // SAFETY: shm_ptr is a valid MAP_SHARED mapping of entry.size
-                        // bytes; buf_ptr+offset..+copy_len is within the registered
-                        // region (offset + copy_len <= entry.size, enforced above).
                         unsafe {
                             std::ptr::copy_nonoverlapping(
                                 entry.shm_ptr as *const u8,
@@ -280,9 +345,7 @@ impl RdmaProvider for MockRdmaProvider {
             None
         };
 
-        // Clean up outside the lock.
         if let Some(entry) = entry_to_drop {
-            // SAFETY: removed from map; cleanup called exactly once.
             unsafe { entry.cleanup(); }
         }
 
@@ -347,15 +410,14 @@ impl RdmaServerProvider for MockRdmaServerProvider {
 
     /// RDMA PUT: read the data that the client wrote into `/dev/shm/{shm-name}`.
     ///
-    /// Returns `(data, reply_token)`.  The reply token echoes the original
-    /// request token so the client's [`MockRdmaProvider::process_reply_token`]
-    /// can locate and clean up the shm entry.
+    /// Returns the received `data`.  The HTTP handler is responsible for
+    /// setting `x-amz-rdma-reply: 200` on success.
     fn handle_put(
         &self,
         _s3_key: &[u8],
         token: &[u8],
         size: usize,
-    ) -> Result<(Vec<u8>, Vec<u8>), RdmaError> {
+    ) -> Result<Vec<u8>, RdmaError> {
         let (op, shm_name, token_size, offset) = Self::parse_token(token)?;
         if op != "PUT" {
             return Err(RdmaError::TransferFailed(format!(
@@ -372,24 +434,23 @@ impl RdmaServerProvider for MockRdmaServerProvider {
 
         let start = offset.min(file_bytes.len());
         let end = (offset + read_size).min(file_bytes.len());
-        let data = file_bytes[start..end].to_vec();
-
-        Ok((data, token.to_vec()))
+        Ok(file_bytes[start..end].to_vec())
     }
 
     /// RDMA GET: write `data` into `/dev/shm/{shm-name}` so the client can
-    /// copy it to its buffer via [`MockRdmaProvider::process_reply_token`].
+    /// copy it to its buffer via [`MockRdmaProvider::process_rdma_reply`].
     ///
     /// Clips the write to the client's buffer capacity (encoded in the token)
-    /// so the shm file is never overfilled.  Returns `(written, reply_token)`
-    /// where `written` ≤ `data.len()` and the reply token embeds `written`
-    /// so the client's `process_reply_token` copies exactly that many bytes.
+    /// so the shm file is never overfilled.  Returns `written` — the number
+    /// of bytes actually transferred (≤ `data.len()`).  The HTTP handler sets
+    /// `x-amz-rdma-reply: 200` (full) or `206` (partial), plus
+    /// `x-amz-rdma-bytes: <written>` or `<written>/<total>`.
     fn handle_get(
         &self,
         _s3_key: &[u8],
         data: &[u8],
         token: &[u8],
-    ) -> Result<(usize, Vec<u8>), RdmaError> {
+    ) -> Result<usize, RdmaError> {
         let (op, shm_name, capacity, offset) = Self::parse_token(token)?;
         if op != "GET" {
             return Err(RdmaError::TransferFailed(format!(
@@ -414,16 +475,6 @@ impl RdmaServerProvider for MockRdmaServerProvider {
         file.write_all(&data[..write_len])
             .map_err(|e| RdmaError::TransferFailed(format!("write {path}: {e}")))?;
 
-        // Extract the s3-key suffix (parts[5..]) and rebuild the reply token
-        // with the actual byte count so process_reply_token copies the right amount.
-        let token_str = std::str::from_utf8(token).unwrap_or("");
-        let key_suffix = {
-            // token = "RDMA_GET_{shm}_{size}_{offset}_key_{s3-key}"
-            // splitn(6, '_') gives: ["RDMA","GET",shm,size,offset,"key_{s3-key}"]
-            let parts6: Vec<&str> = token_str.splitn(6, '_').collect();
-            if parts6.len() >= 6 { parts6[5] } else { "" }
-        };
-        let reply = format!("RDMA_GET_{shm_name}_{write_len}_{offset}_{key_suffix}").into_bytes();
-        Ok((write_len, reply))
+        Ok(write_len)
     }
 }

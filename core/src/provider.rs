@@ -79,15 +79,45 @@ pub trait RdmaProvider: Send + Sync {
         offset: usize,
     ) -> Result<Vec<u8>, RdmaError>;
 
+    /// Process the `x-amz-rdma-reply` status code returned by the S3 server.
+    ///
+    /// `rdma_status` is the numeric value of the `x-amz-rdma-reply` response
+    /// header (200, 204, 206 = success; 501 = RDMA fallback/failure).
+    /// `request_token` is the raw value of the original `x-amz-rdma-token`
+    /// request header (used by the mock to locate the shm region).
+    /// `transferred` is the number of bytes transferred (from `x-amz-rdma-bytes`).
+    ///
+    /// The default implementation fires `callback` immediately: error_code=0
+    /// for 2xx (real RDMA already placed data in the buffer), non-zero for
+    /// other status codes.  Mock providers override this to copy shm data.
+    fn process_rdma_reply(
+        &self,
+        rdma_status: u16,
+        _request_token: &[u8],
+        _transferred: usize,
+        callback: RdmaCompletionCallback,
+    ) -> Result<(), RdmaError> {
+        let error_code = if (200..300).contains(&rdma_status) { 0 } else { rdma_status as i32 };
+        callback(RdmaCompletionResult { error_code, reply_token: vec![] });
+        Ok(())
+    }
+
     /// Process the `x-amz-rdma-reply` token returned by the S3 server.
     ///
-    /// The provider confirms the RDMA transfer and invokes `callback` with
-    /// the result.
+    /// **Deprecated**: use [`process_rdma_reply`](Self::process_rdma_reply)
+    /// instead. The reply value is now a numeric status code (200/204/206/501),
+    /// not an opaque echo token.
+    #[deprecated(note = "use process_rdma_reply with numeric rdma_status instead")]
     fn process_reply_token(
         &self,
         reply_token: &[u8],
         callback: RdmaCompletionCallback,
-    ) -> Result<(), RdmaError>;
+    ) -> Result<(), RdmaError> {
+        // Legacy default: treat as success.
+        let _ = reply_token;
+        callback(RdmaCompletionResult { error_code: 0, reply_token: reply_token.to_vec() });
+        Ok(())
+    }
 
     // ── HTTP header names ────────────────────────────────────────────────────
 
@@ -133,14 +163,14 @@ pub trait RdmaServerProvider: Send + Sync {
     /// `x-amz-rdma-token` request header; `size` is the expected transfer
     /// size (0 = derive from token).
     ///
-    /// Returns `(data, reply_token)` where `reply_token` is sent back in
-    /// the `x-amz-rdma-reply` response header.
+    /// Returns the received `data`.  The HTTP handler sets `x-amz-rdma-reply:
+    /// 200` on success (or `501` if the transfer failed).
     fn handle_put(
         &self,
         s3_key: &[u8],
         token: &[u8],
         size: usize,
-    ) -> Result<(Vec<u8>, Vec<u8>), crate::RdmaError>;
+    ) -> Result<Vec<u8>, crate::RdmaError>;
 
     /// Handle an RDMA GET from a client: write `data` into the client's
     /// registered buffer identified by `token` (semantics: RDMA_WRITE).
@@ -149,15 +179,14 @@ pub trait RdmaServerProvider: Send + Sync {
     /// `data` is larger the transfer is partial and only the first `capacity`
     /// bytes are written.
     ///
-    /// Returns `(written, reply_token)` where `written` is the number of bytes
-    /// actually transferred (≤ `data.len()`), and `reply_token` is sent back
-    /// in the `x-amz-rdma-reply` header.  The server SHOULD also set the
-    /// `x-amz-rdma-bytes` response header to `<written>` or `<written>/<total>`
-    /// so the client knows whether the transfer was complete.
+    /// Returns `written` — the number of bytes actually transferred
+    /// (≤ `data.len()`).  The HTTP handler sets `x-amz-rdma-reply: 200`
+    /// (full) or `206` (partial), plus `x-amz-rdma-bytes: <written>` or
+    /// `<written>/<total>` so the client knows the transfer extent.
     fn handle_get(
         &self,
         s3_key: &[u8],
         data: &[u8],
         token: &[u8],
-    ) -> Result<(usize, Vec<u8>), crate::RdmaError>;
+    ) -> Result<usize, crate::RdmaError>;
 }
