@@ -145,13 +145,19 @@ pub trait RdmaServerProvider: Send + Sync {
     /// Handle an RDMA GET from a client: write `data` into the client's
     /// registered buffer identified by `token` (semantics: RDMA_WRITE).
     ///
-    /// Returns `reply_token` to send back in the `x-amz-rdma-reply` header.
-    /// The client's [`RdmaProvider::process_reply_token`] uses this value to
-    /// confirm that data is available in the client buffer.
+    /// Writes at most the client's buffer capacity (encoded in `token`); if
+    /// `data` is larger the transfer is partial and only the first `capacity`
+    /// bytes are written.
+    ///
+    /// Returns `(written, reply_token)` where `written` is the number of bytes
+    /// actually transferred (≤ `data.len()`), and `reply_token` is sent back
+    /// in the `x-amz-rdma-reply` header.  The server SHOULD also set the
+    /// `x-amz-rdma-bytes` response header to `<written>` or `<written>/<total>`
+    /// so the client knows whether the transfer was complete.
     fn handle_get(
         &self,
         s3_key: &[u8],
         data: &[u8],
         token: &[u8],
-    ) -> Result<Vec<u8>, crate::RdmaError>;
+    ) -> Result<(usize, Vec<u8>), crate::RdmaError>;
 }

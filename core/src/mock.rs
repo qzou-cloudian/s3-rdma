@@ -380,23 +380,27 @@ impl RdmaServerProvider for MockRdmaServerProvider {
     /// RDMA GET: write `data` into `/dev/shm/{shm-name}` so the client can
     /// copy it to its buffer via [`MockRdmaProvider::process_reply_token`].
     ///
-    /// Returns a reply token with the same format but with the actual byte
-    /// count, which the client parses to determine how many bytes to copy.
+    /// Clips the write to the client's buffer capacity (encoded in the token)
+    /// so the shm file is never overfilled.  Returns `(written, reply_token)`
+    /// where `written` ≤ `data.len()` and the reply token embeds `written`
+    /// so the client's `process_reply_token` copies exactly that many bytes.
     fn handle_get(
         &self,
         _s3_key: &[u8],
         data: &[u8],
         token: &[u8],
-    ) -> Result<Vec<u8>, RdmaError> {
-        let (op, shm_name, _token_size, offset) = Self::parse_token(token)?;
+    ) -> Result<(usize, Vec<u8>), RdmaError> {
+        let (op, shm_name, capacity, offset) = Self::parse_token(token)?;
         if op != "GET" {
             return Err(RdmaError::TransferFailed(format!(
                 "expected GET token, got {op}"
             )));
         }
+        // Clip to client buffer capacity to avoid overfilling the shm file.
+        let write_len = data.len().min(capacity);
         let path = format!("{SHM_DIR}/{shm_name}");
         self.dbg(&format!(
-            "handle_get shm={shm_name} size={} offset={offset}",
+            "handle_get shm={shm_name} write={write_len}/{} offset={offset}",
             data.len()
         ));
 
@@ -407,7 +411,7 @@ impl RdmaServerProvider for MockRdmaServerProvider {
             .map_err(|e| RdmaError::TransferFailed(format!("open {path}: {e}")))?;
         file.seek(SeekFrom::Start(offset as u64))
             .map_err(|e| RdmaError::TransferFailed(format!("seek {path}: {e}")))?;
-        file.write_all(data)
+        file.write_all(&data[..write_len])
             .map_err(|e| RdmaError::TransferFailed(format!("write {path}: {e}")))?;
 
         // Extract the s3-key suffix (parts[5..]) and rebuild the reply token
@@ -419,8 +423,7 @@ impl RdmaServerProvider for MockRdmaServerProvider {
             let parts6: Vec<&str> = token_str.splitn(6, '_').collect();
             if parts6.len() >= 6 { parts6[5] } else { "" }
         };
-        let reply = format!("RDMA_GET_{shm_name}_{}_{}_{key_suffix}", data.len(), offset)
-            .into_bytes();
-        Ok(reply)
+        let reply = format!("RDMA_GET_{shm_name}_{write_len}_{offset}_{key_suffix}").into_bytes();
+        Ok((write_len, reply))
     }
 }
