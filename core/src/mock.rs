@@ -10,7 +10,7 @@
 //! ```
 //! `shm-name` is `rdma-{pid}-{buf_ptr_hex}` (hyphens only, no underscores).
 //!
-//! ## Lifecycle
+//! ## Client lifecycle
 //! | Step | Client calls | Effect |
 //! |------|-------------|--------|
 //! | 1 | `register_memory(ptr, size)` | Creates `/dev/shm/{shm-name}`, `mmap`s it |
@@ -19,6 +19,12 @@
 //! | 3 | *(HTTP exchange)* | Relay reads or writes the shm file |
 //! | 4 | `process_reply_token(…)` | For GET: copies shm → `ptr`; cleans up shm |
 //! | 5 | `deregister_memory(ptr)` | Cleans up if not already done by step 4 |
+//!
+//! ## Server lifecycle (`MockRdmaServerProvider`)
+//! | Step | Server calls | Effect |
+//! |------|-------------|--------|
+//! | 1 | `handle_put(token, size)` | Opens `/dev/shm/{shm-name}`, reads `size` bytes |
+//! | 2 | `handle_get(data, token)` | Opens `/dev/shm/{shm-name}`, writes `data` |
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -26,7 +32,7 @@ use std::os::unix::io::AsRawFd;
 use std::sync::Mutex;
 
 use crate::error::RdmaError;
-use crate::provider::{RdmaCompletionCallback, RdmaCompletionResult, RdmaProvider};
+use crate::provider::{RdmaCompletionCallback, RdmaCompletionResult, RdmaProvider, RdmaServerProvider};
 
 /// Base directory for shared-memory files.
 const SHM_DIR: &str = "/dev/shm";
@@ -286,4 +292,135 @@ impl RdmaProvider for MockRdmaProvider {
 
     fn rdma_token_header_name(&self) -> &[u8] { self.token_header.as_bytes() }
     fn rdma_reply_header_name(&self) -> &[u8] { self.reply_header.as_bytes() }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MockRdmaServerProvider
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Server-side counterpart to [`MockRdmaProvider`].
+///
+/// Both sides must share the same `/dev/shm` directory (e.g. via Docker
+/// `ipc: host`).  The server reads from / writes to the file that the client
+/// created in [`MockRdmaProvider::register_memory`].
+pub struct MockRdmaServerProvider {
+    debug: bool,
+}
+
+impl MockRdmaServerProvider {
+    pub fn new(debug: bool) -> Self {
+        Self { debug }
+    }
+
+    fn dbg(&self, msg: &str) {
+        if self.debug {
+            eprintln!("[MockRdmaServerProvider] {msg}");
+        }
+    }
+
+    /// Parse the mock token: `RDMA_{op}_{shm-name}_{size}_{offset}_key_{s3-key}`.
+    ///
+    /// Returns `(op, shm_name, token_size, offset)` on success.
+    fn parse_token(token: &[u8]) -> Result<(&str, &str, usize, usize), RdmaError> {
+        let s = std::str::from_utf8(token).map_err(|e| {
+            RdmaError::TransferFailed(format!("token is not valid UTF-8: {e}"))
+        })?;
+        // Split into at most 7 fields; the last field (s3-key) may contain '_'.
+        let parts: Vec<&str> = s.splitn(7, '_').collect();
+        if parts.len() < 5 || parts[0] != "RDMA" {
+            return Err(RdmaError::TransferFailed(format!(
+                "invalid mock RDMA token: {s}"
+            )));
+        }
+        let op = parts[1];
+        let shm_name = parts[2];
+        let size: usize = parts[3].parse().unwrap_or(0);
+        let offset: usize = parts[4].parse().unwrap_or(0);
+        Ok((op, shm_name, size, offset))
+    }
+}
+
+impl RdmaServerProvider for MockRdmaServerProvider {
+    fn name(&self) -> &str {
+        "MockRdmaServerProvider"
+    }
+
+    /// RDMA PUT: read the data that the client wrote into `/dev/shm/{shm-name}`.
+    ///
+    /// Returns `(data, reply_token)`.  The reply token echoes the original
+    /// request token so the client's [`MockRdmaProvider::process_reply_token`]
+    /// can locate and clean up the shm entry.
+    fn handle_put(
+        &self,
+        _s3_key: &[u8],
+        token: &[u8],
+        size: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>), RdmaError> {
+        let (op, shm_name, token_size, offset) = Self::parse_token(token)?;
+        if op != "PUT" {
+            return Err(RdmaError::TransferFailed(format!(
+                "expected PUT token, got {op}"
+            )));
+        }
+        let read_size = if size > 0 { size } else { token_size };
+        let path = format!("{SHM_DIR}/{shm_name}");
+        self.dbg(&format!("handle_put shm={shm_name} size={read_size} offset={offset}"));
+
+        let file_bytes = std::fs::read(&path).map_err(|e| {
+            RdmaError::TransferFailed(format!("read {path}: {e}"))
+        })?;
+
+        let start = offset.min(file_bytes.len());
+        let end = (offset + read_size).min(file_bytes.len());
+        let data = file_bytes[start..end].to_vec();
+
+        Ok((data, token.to_vec()))
+    }
+
+    /// RDMA GET: write `data` into `/dev/shm/{shm-name}` so the client can
+    /// copy it to its buffer via [`MockRdmaProvider::process_reply_token`].
+    ///
+    /// Returns a reply token with the same format but with the actual byte
+    /// count, which the client parses to determine how many bytes to copy.
+    fn handle_get(
+        &self,
+        _s3_key: &[u8],
+        data: &[u8],
+        token: &[u8],
+    ) -> Result<Vec<u8>, RdmaError> {
+        let (op, shm_name, _token_size, offset) = Self::parse_token(token)?;
+        if op != "GET" {
+            return Err(RdmaError::TransferFailed(format!(
+                "expected GET token, got {op}"
+            )));
+        }
+        let path = format!("{SHM_DIR}/{shm_name}");
+        self.dbg(&format!(
+            "handle_get shm={shm_name} size={} offset={offset}",
+            data.len()
+        ));
+
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|e| RdmaError::TransferFailed(format!("open {path}: {e}")))?;
+        file.seek(SeekFrom::Start(offset as u64))
+            .map_err(|e| RdmaError::TransferFailed(format!("seek {path}: {e}")))?;
+        file.write_all(data)
+            .map_err(|e| RdmaError::TransferFailed(format!("write {path}: {e}")))?;
+
+        // Extract the s3-key suffix (parts[5..]) and rebuild the reply token
+        // with the actual byte count so process_reply_token copies the right amount.
+        let token_str = std::str::from_utf8(token).unwrap_or("");
+        let key_suffix = {
+            // token = "RDMA_GET_{shm}_{size}_{offset}_key_{s3-key}"
+            // splitn(6, '_') gives: ["RDMA","GET",shm,size,offset,"key_{s3-key}"]
+            let parts6: Vec<&str> = token_str.splitn(6, '_').collect();
+            if parts6.len() >= 6 { parts6[5] } else { "" }
+        };
+        let reply = format!("RDMA_GET_{shm_name}_{}_{}_{key_suffix}", data.len(), offset)
+            .into_bytes();
+        Ok(reply)
+    }
 }

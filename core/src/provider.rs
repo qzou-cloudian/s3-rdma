@@ -107,3 +107,51 @@ pub trait RdmaProvider: Send + Sync {
         RDMA_BYTES_HEADER.as_bytes()
     }
 }
+
+// ── RdmaServerProvider trait ─────────────────────────────────────────────────
+
+/// Server-side RDMA provider, symmetric counterpart to [`RdmaProvider`].
+///
+/// An S3 gateway implements this trait to move data between its own buffers
+/// and a remote client's registered memory region — either by reading actual
+/// RDMA fabric operations (cuObj) or by reading/writing `/dev/shm` files
+/// (mock).
+///
+/// Implementations:
+/// - [`MockRdmaServerProvider`](crate::mock::MockRdmaServerProvider) —
+///   `/dev/shm`-backed, no hardware required.
+/// - For real cuObj server support, wrap [`cuobj::CuObjServer`] via the
+///   `hsg-io` buffer pool; that path requires the `rdma` feature in `hsg-relay`.
+pub trait RdmaServerProvider: Send + Sync {
+    /// Human-readable provider name.
+    fn name(&self) -> &str;
+
+    /// Handle an RDMA PUT from a client: read `size` bytes from the client's
+    /// registered buffer identified by `token` (semantics: RDMA_READ).
+    ///
+    /// `s3_key` is the object path; `token` is the raw value of the
+    /// `x-amz-rdma-token` request header; `size` is the expected transfer
+    /// size (0 = derive from token).
+    ///
+    /// Returns `(data, reply_token)` where `reply_token` is sent back in
+    /// the `x-amz-rdma-reply` response header.
+    fn handle_put(
+        &self,
+        s3_key: &[u8],
+        token: &[u8],
+        size: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>), crate::RdmaError>;
+
+    /// Handle an RDMA GET from a client: write `data` into the client's
+    /// registered buffer identified by `token` (semantics: RDMA_WRITE).
+    ///
+    /// Returns `reply_token` to send back in the `x-amz-rdma-reply` header.
+    /// The client's [`RdmaProvider::process_reply_token`] uses this value to
+    /// confirm that data is available in the client buffer.
+    fn handle_get(
+        &self,
+        s3_key: &[u8],
+        data: &[u8],
+        token: &[u8],
+    ) -> Result<Vec<u8>, crate::RdmaError>;
+}

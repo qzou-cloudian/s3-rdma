@@ -18,6 +18,8 @@ pub enum RdmaError {
     CuObjConnectionFailed(String),
     /// Requested provider is unknown or could not be initialised.
     ProviderUnavailable { provider: String, reason: String },
+    /// RDMA data transfer failed (server side).
+    TransferFailed(String),
     /// I/O error.
     Io(std::io::Error),
 }
@@ -61,6 +63,9 @@ impl fmt::Display for RdmaError {
             }
             RdmaError::ProviderUnavailable { provider, reason } => {
                 write!(f, "RDMA provider '{provider}' unavailable: {reason}")
+            }
+            RdmaError::TransferFailed(msg) => {
+                write!(f, "RDMA transfer failed: {msg}")
             }
             RdmaError::Io(e) => write!(f, "I/O error: {e}"),
         }

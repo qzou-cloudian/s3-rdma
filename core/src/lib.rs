@@ -54,7 +54,9 @@ pub fn get_vtable_ptr() -> *const ffi::RdmaProviderVtable {
 }
 
 pub use mock::MockRdmaProvider;
+pub use mock::MockRdmaServerProvider;
 pub use provider::RdmaProvider;
+pub use provider::RdmaServerProvider;
 
 #[cfg(feature = "cuobj")]
 pub use cuobj::CuObjProvider;
@@ -131,6 +133,35 @@ pub fn create_provider(provider: &str, debug: bool) -> Result<Arc<dyn RdmaProvid
         other => Err(RdmaError::ProviderUnavailable {
             provider: other.to_owned(),
             reason: "unknown provider".to_owned(),
+        }),
+    }
+}
+
+/// Build an `Arc<dyn RdmaServerProvider>` for the named server-side provider.
+///
+/// `provider` must be one of:
+/// - `"mock"` → [`MockRdmaServerProvider`] (reads/writes `/dev/shm` files)
+///
+/// For cuObj server-side RDMA (real RDMA hardware), use `hsg-io::BufferPool`
+/// with a `cuobj::CuObjServer` attached, wrapped in a `CuObjServerAdapter`
+/// (available in `hsg-relay` when built with the `rdma` feature).
+///
+/// Returns [`RdmaError::ProviderUnavailable`] if the name is unrecognised.
+pub fn create_server_provider(
+    provider: &str,
+    debug: bool,
+) -> Result<Arc<dyn RdmaServerProvider>, RdmaError> {
+    match provider {
+        "mock" => {
+            if debug {
+                eprintln!("[rdma] Using MockRdmaServerProvider");
+            }
+            Ok(Arc::new(MockRdmaServerProvider::new(debug)))
+        }
+        other => Err(RdmaError::ProviderUnavailable {
+            provider: other.to_owned(),
+            reason: "unknown server provider (cuobj server: use hsg-relay 'rdma' feature)"
+                .to_owned(),
         }),
     }
 }
