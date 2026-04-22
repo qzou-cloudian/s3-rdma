@@ -35,6 +35,7 @@
 //! | (default)   | Only [`MockRdmaProvider`] is available               |
 
 pub mod cuobj;
+pub mod cuobj_server;
 pub mod error;
 pub mod ffi;
 pub mod mock;
@@ -62,6 +63,10 @@ pub use provider::RdmaServerProvider;
 pub use cuobj::CuObjProvider;
 #[cfg(feature = "cuobj")]
 pub use cuobj::cuobj_available;
+
+#[cfg(feature = "cuobj-server")]
+pub use cuobj_server::CuObjServerProvider;
+pub use cuobj_server::CuObjServerConfig;
 
 use std::sync::Arc;
 
@@ -140,16 +145,17 @@ pub fn create_provider(provider: &str, debug: bool) -> Result<Arc<dyn RdmaProvid
 /// Build an `Arc<dyn RdmaServerProvider>` for the named server-side provider.
 ///
 /// `provider` must be one of:
-/// - `"mock"` → [`MockRdmaServerProvider`] (reads/writes `/dev/shm` files)
+/// - `"mock"`  → [`MockRdmaServerProvider`] (reads/writes `/dev/shm` files)
+/// - `"cuobj"` → [`CuObjServerProvider`] loaded from `libs3_rdma_cuobj_server.so`
+///              at runtime; requires the `cuobj-server` feature and a non-empty
+///              `cuobj_cfg` (listen addr/port + pool config).
 ///
-/// For cuObj server-side RDMA (real RDMA hardware), use `hsg-io::BufferPool`
-/// with a `cuobj::CuObjServer` attached, wrapped in a `CuObjServerAdapter`
-/// (available in `hsg-relay` when built with the `rdma` feature).
-///
-/// Returns [`RdmaError::ProviderUnavailable`] if the name is unrecognised.
+/// Returns [`RdmaError::ProviderUnavailable`] if the name is unrecognised,
+/// the required feature is not compiled in, or the plugin fails to initialise.
 pub fn create_server_provider(
     provider: &str,
     debug: bool,
+    cuobj_cfg: Option<&CuObjServerConfig>,
 ) -> Result<Arc<dyn RdmaServerProvider>, RdmaError> {
     match provider {
         "mock" => {
@@ -158,10 +164,40 @@ pub fn create_server_provider(
             }
             Ok(Arc::new(MockRdmaServerProvider::new(debug)))
         }
+        "cuobj" => {
+            let result: Result<Arc<dyn RdmaServerProvider>, RdmaError>;
+            #[cfg(feature = "cuobj-server")]
+            {
+                let cfg = cuobj_cfg.ok_or_else(|| RdmaError::ProviderUnavailable {
+                    provider: provider.to_owned(),
+                    reason: "cuobj server requires a CuObjServerConfig".to_owned(),
+                })?;
+                result = match CuObjServerProvider::new(cfg) {
+                    Ok(p) => {
+                        if debug {
+                            eprintln!("[rdma] Using CuObjServerProvider");
+                        }
+                        Ok(Arc::new(p))
+                    }
+                    Err(e) => Err(RdmaError::ProviderUnavailable {
+                        provider: provider.to_owned(),
+                        reason: e.to_string(),
+                    }),
+                };
+            }
+            #[cfg(not(feature = "cuobj-server"))]
+            {
+                let _ = cuobj_cfg;
+                result = Err(RdmaError::ProviderUnavailable {
+                    provider: provider.to_owned(),
+                    reason: "compiled without the `cuobj-server` feature".to_owned(),
+                });
+            }
+            result
+        }
         other => Err(RdmaError::ProviderUnavailable {
             provider: other.to_owned(),
-            reason: "unknown server provider (cuobj server: use hsg-relay 'rdma' feature)"
-                .to_owned(),
+            reason: "unknown server provider".to_owned(),
         }),
     }
 }

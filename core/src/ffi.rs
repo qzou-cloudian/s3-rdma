@@ -131,3 +131,89 @@ unsafe impl Sync for RdmaProviderVtable {}
 /// const RdmaProviderVtable *hsc_rdma_provider_get_vtable(void);
 /// ```
 pub type GetVtableFn = unsafe extern "C" fn() -> *const RdmaProviderVtable;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RdmaServerVtable
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Configuration passed to `RdmaServerVtable::init`.
+///
+/// All fields must be valid for the duration of the `init` call; the plugin
+/// is responsible for copying any strings it needs to retain.
+#[repr(C)]
+pub struct RdmaServerInitParams {
+    /// Null-terminated listen address string (e.g. `"192.168.1.1"`).
+    pub listen_addr: *const c_char,
+    /// Listen port for the RDMA server.
+    pub listen_port: u16,
+    /// Number of pre-allocated buffer slots in the pool.
+    pub pool_count:  usize,
+    /// Size in bytes of each buffer slot.
+    pub buf_size:    usize,
+}
+
+// SAFETY: only used during init() on the calling thread.
+unsafe impl Send for RdmaServerInitParams {}
+unsafe impl Sync for RdmaServerInitParams {}
+
+/// C vtable exported by every RDMA **server** provider plugin.
+///
+/// A plugin `cdylib` must export:
+/// ```c
+/// const RdmaServerVtable *s3_rdma_server_provider_get_vtable(void);
+/// ```
+///
+/// Function pointers may be `None`/null if the operation is not supported.
+#[repr(C)]
+pub struct RdmaServerVtable {
+    /// Human-readable provider name (null-terminated C string).
+    pub provider_name:    *const c_char,
+    /// Version integer for compatibility checks.
+    pub provider_version: u32,
+
+    /// Initialise the server provider with the given config.
+    /// On success sets `*ctx` and returns 0; non-zero on failure.
+    pub init:    Option<unsafe extern "C" fn(*const RdmaServerInitParams, *mut *mut c_void) -> i32>,
+    /// Destroy the server provider context.
+    pub cleanup: Option<unsafe extern "C" fn(*mut c_void)>,
+
+    /// Handle an RDMA PUT: the server RDMA_READs `size` bytes from the
+    /// client buffer identified by `token`.
+    ///
+    /// On success writes the received bytes into `*out_data` (plugin allocates
+    /// with `Box::into_raw`; caller frees with `Box::from_raw`).
+    /// Returns 0 on success, non-zero on failure.
+    pub handle_put: Option<unsafe extern "C" fn(
+        ctx:      *mut c_void,
+        s3_key:   *const ByteCursor,
+        token:    *const ByteCursor,
+        size:     usize,
+        out_data: *mut ByteCursor,
+    ) -> i32>,
+
+    /// Handle an RDMA GET: the server RDMA_WRITEs `data` into the client
+    /// buffer identified by `token`.
+    ///
+    /// On success writes the number of bytes transferred into `*out_written`.
+    /// Returns 0 on success, non-zero on failure.
+    pub handle_get: Option<unsafe extern "C" fn(
+        ctx:         *mut c_void,
+        s3_key:      *const ByteCursor,
+        data:        *const ByteCursor,
+        token:       *const ByteCursor,
+        out_written: *mut usize,
+    ) -> i32>,
+}
+
+// SAFETY: vtable contains only function pointers and a static string pointer,
+// all safe to share across threads.
+unsafe impl Send for RdmaServerVtable {}
+unsafe impl Sync for RdmaServerVtable {}
+
+/// Function signature of the server plugin entry point.
+///
+/// Every RDMA server provider `.so` must export:
+/// ```c
+/// const RdmaServerVtable *s3_rdma_server_provider_get_vtable(void);
+/// ```
+pub type GetServerVtableFn = unsafe extern "C" fn() -> *const RdmaServerVtable;
