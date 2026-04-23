@@ -138,6 +138,47 @@ pub trait RdmaProvider: Send + Sync {
     }
 }
 
+// ── RdmaServerConfig ─────────────────────────────────────────────────────────
+
+/// Unified configuration for any RDMA **server** provider.
+///
+/// Always defined (no feature gate) so callers can build the config without
+/// conditional compilation.  Fields that are irrelevant for a given provider
+/// are silently ignored:
+///
+/// | Field         | mock | cuobj |
+/// |---------------|------|-------|
+/// | `shm_path`    | ✓    | –     |
+/// | `listen_addr` | –    | ✓     |
+/// | `listen_port` | –    | ✓     |
+/// | `pool_count`  | –    | ✓     |
+/// | `buf_size`    | –    | ✓     |
+pub struct RdmaServerConfig {
+    /// Directory used for POSIX shared-memory files (mock provider).
+    /// Defaults to `"/dev/shm"`.
+    pub shm_path: String,
+    /// RDMA listen address for the cuObj provider (e.g. `"192.168.1.1"`).
+    pub listen_addr: String,
+    /// RDMA listen port for the cuObj provider.
+    pub listen_port: u16,
+    /// Number of pre-allocated buffer slots (cuObj provider).
+    pub pool_count: usize,
+    /// Size in bytes of each buffer slot (cuObj provider).
+    pub buf_size: usize,
+}
+
+impl Default for RdmaServerConfig {
+    fn default() -> Self {
+        Self {
+            shm_path:    "/dev/shm".to_owned(),
+            listen_addr: String::new(),
+            listen_port: 0,
+            pool_count:  4,
+            buf_size:    128 * 1024 * 1024,
+        }
+    }
+}
+
 // ── RdmaServerProvider trait ─────────────────────────────────────────────────
 
 /// Server-side RDMA provider, symmetric counterpart to [`RdmaProvider`].

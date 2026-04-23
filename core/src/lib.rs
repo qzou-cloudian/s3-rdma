@@ -56,8 +56,7 @@ pub fn get_vtable_ptr() -> *const ffi::RdmaProviderVtable {
 
 pub use mock::MockRdmaProvider;
 pub use mock::MockRdmaServerProvider;
-pub use provider::RdmaProvider;
-pub use provider::RdmaServerProvider;
+pub use provider::{RdmaProvider, RdmaServerProvider, RdmaServerConfig};
 
 #[cfg(feature = "cuobj")]
 pub use cuobj::CuObjProvider;
@@ -66,7 +65,6 @@ pub use cuobj::cuobj_available;
 
 #[cfg(feature = "cuobj-server")]
 pub use cuobj_server::CuObjServerProvider;
-pub use cuobj_server::RdmaServerConfig;
 
 use std::sync::Arc;
 
