@@ -63,12 +63,19 @@ use crate::provider::RDMA_TOKEN_SEPARATOR;
 ///
 /// Wraps the raw `x-amz-rdma-token` bytes with parsed metadata:
 ///
-/// | Field      | Meaning |
-/// |------------|---------|
-/// | `provider` | Which provider generated the token (`"mock"`, `"cuobj"`, or `""` for unknown). |
-/// | `token`    | Raw bytes passed to `handle_put` / `handle_get`. |
-/// | `offset`   | Byte offset within the client buffer this instance covers. |
-/// | `size`     | Byte count this instance covers (`0` = unknown / single-shot). |
+/// | Field        | Meaning |
+/// |--------------|---------|
+/// | `provider`   | Which provider generated the token (`"mock"`, `"cuobj"`, or `""` for unknown). |
+/// | `token`      | Raw bytes passed to `handle_put` / `handle_get`. |
+/// | `offset`     | Byte offset within the client buffer this instance covers. |
+/// | `size`       | Byte count this instance covers (`0` = unknown / single-shot). |
+/// | `size_exact` | Whether `size` is the exact intended transfer byte count. |
+///
+/// `size_exact` is `true` for mock tokens (size always embedded) and for cuObj tokens
+/// that carry the optional `:ext_size:ext_offset` extension.  It is `false` for basic
+/// cuObj tokens (where `size` = registered buffer capacity, not transfer size) and for
+/// opaque tokens.  Callers should check [`size_is_exact`](Self::size_is_exact) before
+/// using [`size`](Self::size) as a streaming limit instead of a hardware capacity.
 ///
 /// Use [`slice`](Self::slice) to derive a sub-range token for chunked transfers,
 /// and [`split`](Self::split) to partition a large token into equal-sized slices.
@@ -86,6 +93,11 @@ pub struct RdmaToken {
     offset: usize,
     /// Byte count this instance covers (`0` = unknown / use single-shot).
     size: usize,
+    /// `true` when `size` is the exact intended transfer byte count.
+    ///
+    /// `false` for basic cuObj tokens (where `size` = registered capacity)
+    /// and opaque tokens (where `size = 0`).
+    size_exact: bool,
 }
 
 impl RdmaToken {
@@ -103,19 +115,21 @@ impl RdmaToken {
     pub fn parse(raw: &[u8]) -> Self {
         if let Ok(s) = std::str::from_utf8(raw) {
             if let Some((provider, offset, size)) = Self::parse_mock_str(s) {
-                return Self { provider, token: raw.to_vec(), offset, size };
+                return Self { provider, token: raw.to_vec(), offset, size, size_exact: true };
             }
             let (base, ext_size, ext_offset) = Self::split_cuobj_extension(s);
             if let Some(base_size) = Self::parse_cuobj_base(base) {
+                let has_ext = ext_size.is_some();
                 return Self {
-                    provider: "cuobj".to_owned(),
-                    token:    base.as_bytes().to_vec(),
-                    offset:   ext_offset.unwrap_or(0),
-                    size:     ext_size.unwrap_or(base_size),
+                    provider:   "cuobj".to_owned(),
+                    token:      base.as_bytes().to_vec(),
+                    offset:     ext_offset.unwrap_or(0),
+                    size:       ext_size.unwrap_or(base_size),
+                    size_exact: has_ext,
                 };
             }
         }
-        Self { provider: String::new(), token: raw.to_vec(), offset: 0, size: 0 }
+        Self { provider: String::new(), token: raw.to_vec(), offset: 0, size: 0, size_exact: false }
     }
 
     /// Convenience constructor from a string slice.
@@ -186,6 +200,36 @@ impl RdmaToken {
         self.provider.is_empty()
     }
 
+    /// `true` when [`size`](Self::size) is the exact intended transfer byte count.
+    ///
+    /// Use this before relying on `size()` as a streaming transfer limit:
+    ///
+    /// - **`true`**: `size()` is the number of bytes to transfer (mock tokens always;
+    ///   cuObj tokens with an `:ext_size:ext_offset` extension).
+    /// - **`false`**: `size()` is either `0` (opaque) or the cuObj registered buffer
+    ///   capacity (which may exceed the actual transfer).
+    ///
+    /// # Example
+    /// ```rust
+    /// # use s3_rdma::RdmaToken;
+    /// // Mock token: size always exact.
+    /// let tok = RdmaToken::from_str("RDMA_PUT_rdma-1_64_0_key_b/k");
+    /// assert!(tok.size_is_exact());
+    /// assert_eq!(tok.size(), 64);
+    ///
+    /// // Basic cuObj: size = registered capacity, NOT the transfer size.
+    /// let tok = RdmaToken::from_str("7fab000000000000:20000000:deadbeef0000:extra");
+    /// assert!(!tok.size_is_exact());
+    ///
+    /// // Extended cuObj: size = exact transfer size.
+    /// let tok = RdmaToken::from_str("7fab000000000000:20000000:deadbeef0000:extra:67108864:0");
+    /// assert!(tok.size_is_exact());
+    /// assert_eq!(tok.size(), 67108864);
+    /// ```
+    pub fn size_is_exact(&self) -> bool {
+        self.size_exact
+    }
+
     /// Base virtual address encoded in the raw token.
     ///
     /// For cuObj tokens (`provider == "cuobj"`) this is the client buffer's
@@ -241,10 +285,11 @@ impl RdmaToken {
     /// ```
     pub fn slice(&self, offset: usize, size: usize) -> Self {
         Self {
-            provider: self.provider.clone(),
-            token: self.token.clone(),
+            provider:   self.provider.clone(),
+            token:      self.token.clone(),
             offset,
             size,
+            size_exact: self.size_exact,
         }
     }
 
@@ -369,21 +414,23 @@ impl From<Vec<u8>> for RdmaToken {
     fn from(bytes: Vec<u8>) -> Self {
         if let Ok(s) = std::str::from_utf8(&bytes) {
             if let Some((provider, offset, size)) = Self::parse_mock_str(s) {
-                return Self { provider, token: bytes, offset, size };
+                return Self { provider, token: bytes, offset, size, size_exact: true };
             }
             let (base, ext_size, ext_offset) = Self::split_cuobj_extension(s);
             if let Some(base_size) = Self::parse_cuobj_base(base) {
+                let has_ext = ext_size.is_some();
                 // Store only the base descriptor; strip any extension.
                 let token = if base.len() == s.len() { bytes } else { base.as_bytes().to_vec() };
                 return Self {
-                    provider: "cuobj".to_owned(),
+                    provider:   "cuobj".to_owned(),
                     token,
-                    offset: ext_offset.unwrap_or(0),
-                    size:   ext_size.unwrap_or(base_size),
+                    offset:     ext_offset.unwrap_or(0),
+                    size:       ext_size.unwrap_or(base_size),
+                    size_exact: has_ext,
                 };
             }
         }
-        Self { provider: String::new(), token: bytes, offset: 0, size: 0 }
+        Self { provider: String::new(), token: bytes, offset: 0, size: 0, size_exact: false }
     }
 }
 
@@ -412,6 +459,7 @@ mod tests {
         assert_eq!(tok.size(),   1073741824);
         assert_eq!(tok.offset(), 0);
         assert!(!tok.is_opaque());
+        assert!(tok.size_is_exact()); // mock tokens always exact
         assert_eq!(tok.total_buffer_size(), 1073741824);
     }
 
@@ -421,6 +469,7 @@ mod tests {
         assert_eq!(tok.provider(), "mock");
         assert_eq!(tok.size(),   268435456);
         assert_eq!(tok.offset(), 4096);
+        assert!(tok.size_is_exact());
     }
 
     #[test]
@@ -430,6 +479,7 @@ mod tests {
         assert_eq!(tok.size(), 0);
         assert_eq!(tok.offset(), 0);
         assert!(tok.is_opaque());
+        assert!(!tok.size_is_exact()); // opaque: size unknown
     }
 
     #[test]
@@ -438,6 +488,7 @@ mod tests {
         let tok = RdmaToken::from_str("cuobj:abcdef1234");
         assert!(tok.is_opaque());
         assert_eq!(tok.size(), 0);
+        assert!(!tok.size_is_exact());
     }
 
     #[test]
@@ -530,9 +581,11 @@ mod tests {
     fn parse_cuobj_basic() {
         let tok = RdmaToken::from_str(CUOBJ_TOK);
         assert_eq!(tok.provider(), "cuobj");
-        assert_eq!(tok.size(), 0x20000000);  // 512 MiB
+        assert_eq!(tok.size(), 0x20000000);  // 512 MiB = registered capacity
         assert_eq!(tok.offset(), 0);
         assert!(!tok.is_opaque());
+        // Basic cuObj: size is registered capacity, NOT the transfer size.
+        assert!(!tok.size_is_exact());
     }
 
     #[test]
@@ -628,6 +681,8 @@ mod tests {
         assert_eq!(tok.size(),   67108864); // decimal extension, not 0x20000000
         assert_eq!(tok.offset(), 4096);
         assert!(!tok.is_opaque());
+        // Extended cuObj: size IS the exact transfer size.
+        assert!(tok.size_is_exact());
     }
 
     #[test]
@@ -664,9 +719,10 @@ mod tests {
         assert_eq!(slices[0].size(),   chunk);
         assert_eq!(slices[3].offset(), 4096 + 3 * chunk);
         assert_eq!(slices[3].size(),   chunk);
-        // All slices carry the clean base descriptor.
+        // All slices carry the clean base descriptor and propagate size_is_exact.
         for sl in &slices {
             assert_eq!(sl.raw(), CUOBJ_TOK.as_bytes());
+            assert!(sl.size_is_exact());
         }
     }
 
@@ -679,6 +735,7 @@ mod tests {
         assert_eq!(tok.offset(), 4096);
         // Stored token is the base descriptor only.
         assert_eq!(tok.raw(), CUOBJ_TOK.as_bytes());
+        assert!(tok.size_is_exact());
     }
 
     #[test]
@@ -695,5 +752,22 @@ mod tests {
         assert_eq!(tok.size(), 0x20000000); // from size_hex, no override
         assert_eq!(tok.offset(), 0);
         assert_eq!(tok.raw(), CUOBJ_TOK.as_bytes());
+        assert!(!tok.size_is_exact()); // basic cuObj: capacity, not transfer size
+    }
+
+    #[test]
+    fn size_is_exact_propagates_through_slice() {
+        // slice() preserves size_is_exact from the parent token.
+        let mock = RdmaToken::from_str("RDMA_PUT_rdma-1_512_0_key_b/k");
+        let sl   = mock.slice(128, 64);
+        assert!(sl.size_is_exact());
+
+        let cuobj_ext = RdmaToken::from_str(CUOBJ_EXT);
+        let sl2 = cuobj_ext.slice(0, 1024);
+        assert!(sl2.size_is_exact());
+
+        let cuobj_basic = RdmaToken::from_str(CUOBJ_TOK);
+        let sl3 = cuobj_basic.slice(0, 1024);
+        assert!(!sl3.size_is_exact());
     }
 }
