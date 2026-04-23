@@ -20,6 +20,10 @@ pub enum RdmaError {
     ProviderUnavailable { provider: String, reason: String },
     /// RDMA data transfer failed (server side).
     TransferFailed(String),
+    /// Server buffer is smaller than the size the client requested to transfer.
+    /// The caller should signal `x-amz-rdma-reply: 501` so the client retries
+    /// with a standard HTTP body.
+    BufferTooSmall { server_capacity: usize, requested: usize },
     /// I/O error.
     Io(std::io::Error),
 }
@@ -66,6 +70,12 @@ impl fmt::Display for RdmaError {
             }
             RdmaError::TransferFailed(msg) => {
                 write!(f, "RDMA transfer failed: {msg}")
+            }
+            RdmaError::BufferTooSmall { server_capacity, requested } => {
+                write!(
+                    f,
+                    "server buffer too small: capacity={server_capacity}, client requested={requested}"
+                )
             }
             RdmaError::Io(e) => write!(f, "I/O error: {e}"),
         }
