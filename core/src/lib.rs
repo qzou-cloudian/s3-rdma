@@ -162,7 +162,7 @@ pub fn create_server_provider(
             if debug {
                 eprintln!("[rdma] Using MockRdmaServerProvider (shm: {})", cfg.shm_path);
             }
-            Ok(Arc::new(MockRdmaServerProvider::new(debug, &cfg.shm_path)))
+            Ok(Arc::new(MockRdmaServerProvider::new(debug, &cfg.shm_path, cfg.buf_size)))
         }
         "cuobj" => {
             let result: Result<Arc<dyn RdmaServerProvider>, RdmaError>;

@@ -53,9 +53,10 @@ mod real {
     /// Wraps a `CuObjServer` + `BufferPool` internally (inside the plugin);
     /// the gateway has no compile-time dependency on either.
     pub struct CuObjServerProvider {
-        vtable: *const RdmaServerVtable,
-        ctx:    *mut c_void,
-        _lib:   Library,
+        vtable:   *const RdmaServerVtable,
+        ctx:      *mut c_void,
+        buf_size: usize,
+        _lib:     Library,
     }
 
     unsafe impl Send for CuObjServerProvider {}
@@ -102,7 +103,7 @@ mod real {
                 }
             }
 
-            Ok(Self { vtable, ctx, _lib: lib })
+            Ok(Self { vtable, ctx, buf_size: cfg.buf_size, _lib: lib })
         }
 
         fn vtable(&self) -> &RdmaServerVtable {
@@ -121,10 +122,13 @@ mod real {
     impl RdmaServerProvider for CuObjServerProvider {
         fn name(&self) -> &str { "CuObjServerProvider" }
 
+        fn buf_size(&self) -> usize { self.buf_size }
+
         fn handle_put(
             &self,
             s3_key: &[u8],
             token: &[u8],
+            offset: usize,
             size: usize,
         ) -> Result<Vec<u8>, RdmaError> {
             let f = self.vtable().handle_put.ok_or_else(|| {
@@ -133,7 +137,7 @@ mod real {
             let key_cursor   = ByteCursor::from_slice(s3_key);
             let token_cursor = ByteCursor::from_slice(token);
             let mut out      = ByteCursor::null();
-            let rc = unsafe { f(self.ctx, &key_cursor, &token_cursor, size, &mut out) };
+            let rc = unsafe { f(self.ctx, &key_cursor, &token_cursor, offset, size, &mut out) };
             if rc != 0 {
                 return Err(RdmaError::TransferFailed(
                     format!("cuobj server handle_put returned {rc}")

@@ -178,7 +178,10 @@ pub struct RdmaServerVtable {
     pub cleanup: Option<unsafe extern "C" fn(*mut c_void)>,
 
     /// Handle an RDMA PUT: the server RDMA_READs `size` bytes from the
-    /// client buffer identified by `token`.
+    /// client buffer identified by `token`, starting at `offset` bytes into
+    /// the client's buffer.
+    ///
+    /// `offset=0, size=0` means "read the full buffer as described by the token".
     ///
     /// On success writes the received bytes into `*out_data` (plugin allocates
     /// with `Box::into_raw`; caller frees with `Box::from_raw`).
@@ -187,6 +190,7 @@ pub struct RdmaServerVtable {
         ctx:      *mut c_void,
         s3_key:   *const ByteCursor,
         token:    *const ByteCursor,
+        offset:   usize,
         size:     usize,
         out_data: *mut ByteCursor,
     ) -> i32>,

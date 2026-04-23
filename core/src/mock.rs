@@ -369,11 +369,12 @@ impl RdmaProvider for MockRdmaProvider {
 pub struct MockRdmaServerProvider {
     debug:    bool,
     shm_path: String,
+    buf_size: usize,
 }
 
 impl MockRdmaServerProvider {
-    pub fn new(debug: bool, shm_path: impl Into<String>) -> Self {
-        Self { debug, shm_path: shm_path.into() }
+    pub fn new(debug: bool, shm_path: impl Into<String>, buf_size: usize) -> Self {
+        Self { debug, shm_path: shm_path.into(), buf_size }
     }
 
     fn dbg(&self, msg: &str) {
@@ -409,17 +410,27 @@ impl RdmaServerProvider for MockRdmaServerProvider {
         "MockRdmaServerProvider"
     }
 
-    /// RDMA PUT: read the data that the client wrote into `/dev/shm/{shm-name}`.
+    fn buf_size(&self) -> usize {
+        // Use configured buf_size as the RDMA chunk size for mock.
+        // When 0 (unconfigured), return usize::MAX to disable chunking.
+        if self.buf_size > 0 { self.buf_size } else { usize::MAX }
+    }
+
+    /// RDMA PUT: read `size` bytes from `/dev/shm/{shm-name}` starting at
+    /// `offset` bytes into the client's buffer.
     ///
-    /// Returns the received `data`.  The HTTP handler is responsible for
-    /// setting `x-amz-rdma-reply: 200` on success.
+    /// `offset` overrides the offset encoded in the token (the token's offset
+    /// always describes the base of the full client buffer; chunked callers
+    /// supply the per-chunk byte offset explicitly).  If `size == 0` the
+    /// whole token-encoded buffer is read from `offset`.
     fn handle_put(
         &self,
         _s3_key: &[u8],
         token: &[u8],
+        offset: usize,
         size: usize,
     ) -> Result<Vec<u8>, RdmaError> {
-        let (op, shm_name, token_size, offset) = Self::parse_token(token)?;
+        let (op, shm_name, token_size, _token_offset) = Self::parse_token(token)?;
         if op != "PUT" {
             return Err(RdmaError::TransferFailed(format!(
                 "expected PUT token, got {op}"
@@ -427,7 +438,7 @@ impl RdmaServerProvider for MockRdmaServerProvider {
         }
         let read_size = if size > 0 { size } else { token_size };
         let path = format!("{}/{shm_name}", self.shm_path);
-        self.dbg(&format!("handle_put shm={shm_name} size={read_size} offset={offset}"));
+        self.dbg(&format!("handle_put shm={shm_name} offset={offset} size={read_size}"));
 
         let file_bytes = std::fs::read(&path).map_err(|e| {
             RdmaError::TransferFailed(format!("read {path}: {e}"))

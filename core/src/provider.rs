@@ -197,19 +197,34 @@ pub trait RdmaServerProvider: Send + Sync {
     /// Human-readable provider name.
     fn name(&self) -> &str;
 
+    /// Size in bytes of the server's per-slot transfer buffer.
+    ///
+    /// This is the maximum number of bytes that can be transferred in a
+    /// single `handle_put` call.  When the object is larger than this value
+    /// the gateway drives a loop: it calls `handle_put` repeatedly with
+    /// `offset` advancing by `buf_size()` each time, streaming each chunk
+    /// directly to the storage backend.
+    ///
+    /// Should match the chunked-backend chunk size for best efficiency.
+    fn buf_size(&self) -> usize;
+
     /// Handle an RDMA PUT from a client: read `size` bytes from the client's
-    /// registered buffer identified by `token` (semantics: RDMA_READ).
+    /// registered buffer identified by `token`, starting at byte `offset`
+    /// within that buffer (semantics: RDMA_READ).
     ///
     /// `s3_key` is the object path; `token` is the raw value of the
-    /// `x-amz-rdma-token` request header; `size` is the expected transfer
-    /// size (0 = derive from token).
+    /// `x-amz-rdma-token` request header; `offset` is the start position
+    /// within the client's buffer; `size` is the number of bytes to read
+    /// (0 = read the full buffer as described by the token, only valid when
+    /// `offset == 0`).
     ///
-    /// Returns the received `data`.  The HTTP handler sets `x-amz-rdma-reply:
-    /// 200` on success (or `501` if the transfer failed).
+    /// Returns the received `data` for this chunk.  The HTTP handler drives
+    /// the loop and feeds each chunk to the storage backend directly.
     fn handle_put(
         &self,
         s3_key: &[u8],
         token: &[u8],
+        offset: usize,
         size: usize,
     ) -> Result<Vec<u8>, crate::RdmaError>;
 
