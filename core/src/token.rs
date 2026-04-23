@@ -6,10 +6,11 @@
 //!
 //! ## Token formats
 //!
-//! | Provider | Example | Parsed |
-//! |----------|---------|--------|
-//! | `"mock"` | `RDMA_PUT_rdma-12345-7fab_1073741824_0_key_b/k` | Full |
-//! | `""` (opaque) | `<cuObj binary descriptor>` | size = 0, offset = 0 |
+//! | Provider  | Format / Example | Parsed |
+//! |-----------|-----------------|--------|
+//! | `"mock"`  | `RDMA_PUT_rdma-1-abc_536870912_0_key_b/k` | Full |
+//! | `"cuobj"` | `7fab00000000:20000000:deadbeef:…`        | vaddr + size |
+//! | `""`      | binary / unknown                           | size = 0, offset = 0 |
 //!
 //! ## Common workflows
 //!
@@ -48,7 +49,7 @@ use crate::provider::RDMA_TOKEN_SEPARATOR;
 ///
 /// | Field      | Meaning |
 /// |------------|---------|
-/// | `provider` | Which provider generated the token (`"mock"` or `""` for opaque). |
+/// | `provider` | Which provider generated the token (`"mock"`, `"cuobj"`, or `""` for unknown). |
 /// | `token`    | Raw bytes passed to `handle_put` / `handle_get`. |
 /// | `offset`   | Byte offset within the client buffer this instance covers. |
 /// | `size`     | Byte count this instance covers (`0` = unknown / single-shot). |
@@ -57,7 +58,7 @@ use crate::provider::RDMA_TOKEN_SEPARATOR;
 /// and [`split`](Self::split) to partition a large token into equal-sized slices.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RdmaToken {
-    /// Inferred provider (`"mock"` or `""` for opaque cuObj tokens).
+    /// Inferred provider: `"mock"`, `"cuobj"`, or `""` for unrecognised formats.
     provider: String,
     /// Raw token bytes (the `x-amz-rdma-token` header value).
     token: Vec<u8>,
@@ -72,11 +73,12 @@ impl RdmaToken {
 
     /// Parse raw token bytes into a structured descriptor.
     ///
-    /// Mock tokens (`RDMA_{PUT|GET}_…`) are fully parsed; all other formats
-    /// are treated as opaque with `size = 0` and `offset = 0`.
+    /// Tries mock format first, then cuObj format.  Falls back to
+    /// `provider = ""`, `size = 0`, `offset = 0` for unrecognised tokens.
     pub fn parse(raw: &[u8]) -> Self {
         let (provider, offset, size) =
-            std::str::from_utf8(raw).ok().and_then(Self::parse_mock_str)
+            std::str::from_utf8(raw).ok()
+                .and_then(|s| Self::parse_mock_str(s).or_else(|| Self::parse_cuobj_str(s)))
                 .unwrap_or_default();
         Self { provider, token: raw.to_vec(), offset, size }
     }
@@ -120,7 +122,7 @@ impl RdmaToken {
         std::str::from_utf8(&self.token).ok()
     }
 
-    /// Inferred provider name (`"mock"`) or empty string for opaque tokens.
+    /// Inferred provider name: `"mock"`, `"cuobj"`, or `""` for unrecognised tokens.
     pub fn provider(&self) -> &str {
         &self.provider
     }
@@ -132,30 +134,48 @@ impl RdmaToken {
 
     /// Byte count this instance covers.
     ///
-    /// Returns `0` for opaque (cuObj) tokens where the size cannot be
+    /// Returns `0` for unrecognised tokens where the size cannot be
     /// determined without a hardware call; callers should then use
     /// single-shot semantics (`handle_put(key, raw(), 0, 0)`).
     pub fn size(&self) -> usize {
         self.size
     }
 
-    /// `true` when the token is opaque and neither `size` nor `offset` can be
-    /// determined without calling into the RDMA hardware.
+    /// `true` when the token is unrecognised and neither `size` nor `offset`
+    /// can be determined without calling into the RDMA hardware.
     pub fn is_opaque(&self) -> bool {
         self.provider.is_empty()
+    }
+
+    /// Base virtual address encoded in the raw token.
+    ///
+    /// For cuObj tokens (`provider == "cuobj"`) this is the client buffer's
+    /// remote virtual address.  Adding [`offset`](Self::offset) gives the
+    /// `remote_start` pointer required by `cuobj_srv_handle_put` /
+    /// `cuobj_srv_handle_get`.
+    ///
+    /// Returns `0` for mock and unrecognised tokens.
+    pub fn remote_addr(&self) -> usize {
+        self.as_str()
+            .and_then(|s| s.split(':').next())
+            .and_then(|hex| usize::from_str_radix(hex, 16).ok())
+            .unwrap_or(0)
     }
 
     /// Full buffer capacity as encoded in the raw token bytes.
     ///
     /// For a sliced token (`slice(off, sz)`), this is the capacity of the
-    /// *original* buffer, not the slice size.  Returns `0` for opaque tokens.
+    /// *original* buffer, not the slice size.
     ///
-    /// For mock tokens this equals the `_{size}_` field regardless of any
-    /// slicing that has been applied to this instance.
+    /// - Mock tokens: the `_{size}_` field (decimal).
+    /// - cuObj tokens: the second `:` field (hexadecimal).
+    /// - Unknown tokens: `0`.
     pub fn total_buffer_size(&self) -> usize {
         std::str::from_utf8(&self.token).ok()
-            .and_then(Self::parse_mock_str)
-            .map(|(_, _, sz)| sz)
+            .and_then(|s| {
+                Self::parse_mock_str(s).map(|(_, _, sz)| sz)
+                    .or_else(|| Self::parse_cuobj_str(s).map(|(_, _, sz)| sz))
+            })
             .unwrap_or(0)
     }
 
@@ -240,6 +260,23 @@ impl RdmaToken {
         if kw != "key" { return None; }
         Some(("mock".to_owned(), offset, size))
     }
+
+    /// Parse a cuObj RDMA descriptor string `<vaddr_hex>:<size_hex>:<rkey_hex>:…`.
+    ///
+    /// Returns `(provider, offset=0, size)` on success, `None` otherwise.
+    /// The `offset` is always `0` on construction; use [`slice`](Self::slice)
+    /// to adjust it for chunked transfers.
+    fn parse_cuobj_str(s: &str) -> Option<(String, usize, usize)> {
+        // Require at least three colon-separated fields.
+        let mut fields = s.splitn(4, ':');
+        let vaddr_hex = fields.next()?;
+        let size_hex  = fields.next()?;
+        let _rkey     = fields.next()?; // must be present
+        // Both vaddr and size must parse as hexadecimal.
+        usize::from_str_radix(vaddr_hex.trim(), 16).ok()?;
+        let size = usize::from_str_radix(size_hex.trim(), 16).ok()?;
+        Some(("cuobj".to_owned(), 0, size))
+    }
 }
 
 // ── Standard trait impls ──────────────────────────────────────────────────────
@@ -256,7 +293,8 @@ impl From<&str> for RdmaToken {
 impl From<Vec<u8>> for RdmaToken {
     fn from(token: Vec<u8>) -> Self {
         let (provider, offset, size) =
-            std::str::from_utf8(&token).ok().and_then(Self::parse_mock_str)
+            std::str::from_utf8(&token).ok()
+                .and_then(|s| Self::parse_mock_str(s).or_else(|| Self::parse_cuobj_str(s)))
                 .unwrap_or_default();
         Self { provider, token, offset, size }
     }
@@ -390,11 +428,83 @@ mod tests {
 
     #[test]
     fn parse_multi_opaque_tokens() {
-        // Opaque tokens have size 0; callers use single-shot / Fix-B semantics.
-        let toks = RdmaToken::parse_multi("cuobj:abc|cuobj:def");
+        // Tokens with fewer than 3 colon-separated fields → opaque (size = 0).
+        let toks = RdmaToken::parse_multi("unknown-binary-blob|another-blob");
         assert_eq!(toks.len(), 2);
         assert_eq!(toks[0].size(), 0);
         assert_eq!(toks[1].size(), 0);
+    }
+
+    // ── cuObj token tests ─────────────────────────────────────────────────────
+
+    const CUOBJ_TOK: &str = "7fab000000000000:20000000:deadbeef0000:extra";
+
+    #[test]
+    fn parse_cuobj_basic() {
+        let tok = RdmaToken::from_str(CUOBJ_TOK);
+        assert_eq!(tok.provider(), "cuobj");
+        assert_eq!(tok.size(), 0x20000000);  // 512 MiB
+        assert_eq!(tok.offset(), 0);
+        assert!(!tok.is_opaque());
+    }
+
+    #[test]
+    fn parse_cuobj_remote_addr() {
+        let tok = RdmaToken::from_str(CUOBJ_TOK);
+        assert_eq!(tok.remote_addr(), 0x7fab000000000000usize);
+    }
+
+    #[test]
+    fn parse_cuobj_total_buffer_size() {
+        let tok = RdmaToken::from_str(CUOBJ_TOK);
+        assert_eq!(tok.total_buffer_size(), 0x20000000);
+        // After slicing, total_buffer_size still reflects the full token size.
+        let sl = tok.slice(0x10000000, 0x10000000);
+        assert_eq!(sl.total_buffer_size(), 0x20000000);
+        assert_eq!(sl.size(), 0x10000000);
+    }
+
+    #[test]
+    fn parse_cuobj_split() {
+        let tok = RdmaToken::from_str(CUOBJ_TOK); // 512 MiB
+        let chunk = 128 * 1024 * 1024; // 128 MiB
+        let slices = tok.split(chunk);
+        assert_eq!(slices.len(), 4);
+        assert_eq!(slices[0].offset(), 0);
+        assert_eq!(slices[1].offset(), chunk);
+        assert_eq!(slices[3].offset(), 3 * chunk);
+        assert_eq!(slices[3].size(), chunk);
+        // raw bytes unchanged across all slices
+        for sl in &slices {
+            assert_eq!(sl.raw(), tok.raw());
+            assert_eq!(sl.provider(), "cuobj");
+        }
+    }
+
+    #[test]
+    fn cuobj_not_confused_with_opaque() {
+        // Must not accidentally be treated as opaque (provider == "").
+        let tok = RdmaToken::from_str(CUOBJ_TOK);
+        assert!(!tok.is_opaque());
+        assert_eq!(tok.provider(), "cuobj");
+    }
+
+    #[test]
+    fn opaque_non_cuobj_still_empty_provider() {
+        // A string with colons but non-hex first field → opaque.
+        let tok = RdmaToken::from_str("not-hex:10000:rkey:extra");
+        assert_eq!(tok.provider(), "");
+        assert!(tok.is_opaque());
+        assert_eq!(tok.size(), 0);
+    }
+
+    #[test]
+    fn cuobj_remote_addr_with_offset() {
+        // remote_addr() returns the base vaddr regardless of slice offset.
+        let tok = RdmaToken::from_str(CUOBJ_TOK);
+        let sl = tok.slice(0x1000, 0x1000000);
+        assert_eq!(sl.remote_addr(), 0x7fab000000000000usize);
+        assert_eq!(sl.offset(), 0x1000);
     }
 
     #[test]
