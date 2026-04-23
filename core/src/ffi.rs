@@ -196,7 +196,12 @@ pub struct RdmaServerVtable {
     ) -> i32>,
 
     /// Handle an RDMA GET: the server RDMA_WRITEs `data` into the client
-    /// buffer identified by `token`.
+    /// buffer identified by `token`, starting at byte `offset` within that
+    /// buffer.
+    ///
+    /// `offset=0` writes from the start of the client buffer (original
+    /// single-shot behaviour).  When streaming, callers advance `offset` by
+    /// the `written` count returned from the previous call.
     ///
     /// On success writes the number of bytes transferred into `*out_written`.
     /// Returns 0 on success, non-zero on failure.
@@ -205,6 +210,7 @@ pub struct RdmaServerVtable {
         s3_key:      *const ByteCursor,
         data:        *const ByteCursor,
         token:       *const ByteCursor,
+        offset:      usize,
         out_written: *mut usize,
     ) -> i32>,
 }

@@ -160,6 +160,7 @@ mod real {
             s3_key: &[u8],
             data: &[u8],
             token: &[u8],
+            offset: usize,
         ) -> Result<usize, RdmaError> {
             let f = self.vtable().handle_get.ok_or_else(|| {
                 RdmaError::TransferFailed("handle_get not implemented in plugin".into())
@@ -169,7 +170,7 @@ mod real {
             let token_cursor = ByteCursor::from_slice(token);
             let mut written: usize = 0;
             let rc = unsafe {
-                f(self.ctx, &key_cursor, &data_cursor, &token_cursor, &mut written)
+                f(self.ctx, &key_cursor, &data_cursor, &token_cursor, offset, &mut written)
             };
             if rc != 0 {
                 return Err(RdmaError::TransferFailed(

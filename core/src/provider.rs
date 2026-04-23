@@ -229,20 +229,25 @@ pub trait RdmaServerProvider: Send + Sync {
     ) -> Result<Vec<u8>, crate::RdmaError>;
 
     /// Handle an RDMA GET from a client: write `data` into the client's
-    /// registered buffer identified by `token` (semantics: RDMA_WRITE).
+    /// registered buffer identified by `token`, starting at byte `offset`
+    /// within that buffer (semantics: RDMA_WRITE).
     ///
-    /// Writes at most the client's buffer capacity (encoded in `token`); if
-    /// `data` is larger the transfer is partial and only the first `capacity`
-    /// bytes are written.
+    /// `offset=0` writes from the start of the client's buffer (original
+    /// single-shot behaviour).  Streaming callers advance `offset` by the
+    /// `written` count returned from the previous call so each chunk lands at
+    /// the correct position.
     ///
-    /// Returns `written` — the number of bytes actually transferred
-    /// (≤ `data.len()`).  The HTTP handler sets `x-amz-rdma-reply: 200`
-    /// (full) or `206` (partial), plus `x-amz-rdma-bytes: <written>` or
-    /// `<written>/<total>` so the client knows the transfer extent.
+    /// Writes at most `client_capacity - offset` bytes (clips to the
+    /// remaining space in the client buffer so it is never overfilled).
+    ///
+    /// Returns `written` — the bytes actually transferred for this chunk
+    /// (≤ `data.len()`).  The HTTP handler drives the loop and accumulates
+    /// `written` to produce the final `x-amz-rdma-bytes` header.
     fn handle_get(
         &self,
         s3_key: &[u8],
         data: &[u8],
         token: &[u8],
+        offset: usize,
     ) -> Result<usize, crate::RdmaError>;
 }

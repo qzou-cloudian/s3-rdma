@@ -457,23 +457,33 @@ impl RdmaServerProvider for MockRdmaServerProvider {
     /// of bytes actually transferred (≤ `data.len()`).  The HTTP handler sets
     /// `x-amz-rdma-reply: 200` (full) or `206` (partial), plus
     /// `x-amz-rdma-bytes: <written>` or `<written>/<total>`.
+    /// RDMA GET: write `data` into `/dev/shm/{shm-name}` at `token_base + offset`.
+    ///
+    /// `offset` is the caller-supplied byte position within the client's buffer
+    /// (0 = start, advances per chunk in streaming mode).  The token's embedded
+    /// offset is added as the base so the shm file position is
+    /// `token_offset + offset`.  Clips the write to the remaining capacity
+    /// (`capacity - offset`) so the client buffer is never overfilled.
     fn handle_get(
         &self,
         _s3_key: &[u8],
         data: &[u8],
         token: &[u8],
+        offset: usize,
     ) -> Result<usize, RdmaError> {
-        let (op, shm_name, capacity, offset) = Self::parse_token(token)?;
+        let (op, shm_name, capacity, token_offset) = Self::parse_token(token)?;
         if op != "GET" {
             return Err(RdmaError::TransferFailed(format!(
                 "expected GET token, got {op}"
             )));
         }
-        // Clip to client buffer capacity to avoid overfilling the shm file.
-        let write_len = data.len().min(capacity);
+        // Remaining space in the client's buffer from the current chunk offset.
+        let remaining_cap = capacity.saturating_sub(offset);
+        let write_len = data.len().min(remaining_cap);
+        let write_start = token_offset + offset;
         let path = format!("{}/{shm_name}", self.shm_path);
         self.dbg(&format!(
-            "handle_get shm={shm_name} write={write_len}/{} offset={offset}",
+            "handle_get shm={shm_name} write={write_len}/{} write_start={write_start}",
             data.len()
         ));
 
@@ -482,7 +492,7 @@ impl RdmaServerProvider for MockRdmaServerProvider {
             .write(true)
             .open(&path)
             .map_err(|e| RdmaError::TransferFailed(format!("open {path}: {e}")))?;
-        file.seek(SeekFrom::Start(offset as u64))
+        file.seek(SeekFrom::Start(write_start as u64))
             .map_err(|e| RdmaError::TransferFailed(format!("seek {path}: {e}")))?;
         file.write_all(&data[..write_len])
             .map_err(|e| RdmaError::TransferFailed(format!("write {path}: {e}")))?;
