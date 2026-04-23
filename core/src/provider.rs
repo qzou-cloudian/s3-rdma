@@ -20,6 +20,16 @@ pub type RdmaCompletionCallback = Box<dyn FnOnce(RdmaCompletionResult) + Send + 
 pub const RDMA_TOKEN_HEADER: &str = "x-amz-rdma-token";
 pub const RDMA_REPLY_HEADER: &str = "x-amz-rdma-reply";
 pub const RDMA_BYTES_HEADER: &str = "x-amz-rdma-bytes";
+/// Header that signals HTTP/2 streaming token mode.
+///
+/// When present with value `"true"`, the PUT request body contains
+/// newline-delimited RDMA token strings (one per line) instead of object data.
+/// Each token line uses the extended format `<base_token>:<size>:<offset>` so
+/// the server knows the exact transfer size and object offset for every chunk.
+/// The actual object bytes are fetched from the client's RDMA buffers via
+/// concurrent RDMA_READ operations.  Requires HTTP/2 (so the body can be
+/// streamed while RDMA_READs proceed in parallel).
+pub const RDMA_STREAM_HEADER: &str = "x-amz-rdma-stream";
 
 /// Separator used when multiple RDMA tokens (or sizes) are packed into a single
 /// HTTP header value.
