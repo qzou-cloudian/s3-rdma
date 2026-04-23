@@ -86,45 +86,25 @@ impl RdmaToken {
         Self::parse(s.as_bytes())
     }
 
-    /// Parse the `|`-separated multi-token header into individual tokens,
-    /// optionally pairing each with a per-token size from `sizes_header`.
+    /// Parse the `|`-separated multi-token header into individual tokens.
     ///
-    /// Sizes from `sizes_header` override the token-embedded sizes where
-    /// present.  Pass an empty string for `sizes_header` when the
-    /// `x-amz-rdma-sizes` header is absent.
+    /// Each token's size is read from its embedded encoding.  Pass an empty
+    /// string (or use [`from_str`](Self::from_str)) for single-token requests.
     ///
     /// # Example
     /// ```rust
     /// # use s3_rdma::RdmaToken;
     /// let toks = RdmaToken::parse_multi(
     ///     "RDMA_PUT_a_256_0_key_b/k|RDMA_PUT_b_128_0_key_b/k",
-    ///     "256|128",
     /// );
     /// assert_eq!(toks.len(), 2);
     /// assert_eq!(toks[0].size(), 256);
     /// assert_eq!(toks[1].size(), 128);
     /// ```
-    pub fn parse_multi(tokens_header: &str, sizes_header: &str) -> Vec<Self> {
-        let raw_toks: Vec<&str> = tokens_header.split(RDMA_TOKEN_SEPARATOR).collect();
-        let sizes: Vec<usize> = if sizes_header.is_empty() {
-            vec![]
-        } else {
-            sizes_header
-                .split(RDMA_TOKEN_SEPARATOR)
-                .filter_map(|s| s.trim().parse().ok())
-                .collect()
-        };
-        raw_toks
-            .iter()
-            .enumerate()
-            .map(|(i, raw)| {
-                let mut tok = Self::from_str(raw);
-                // Explicit sizes header takes precedence over the token-embedded size.
-                if let Some(&sz) = sizes.get(i) {
-                    tok.size = sz;
-                }
-                tok
-            })
+    pub fn parse_multi(tokens_header: &str) -> Vec<Self> {
+        tokens_header
+            .split(RDMA_TOKEN_SEPARATOR)
+            .map(Self::from_str)
             .collect()
     }
 
@@ -399,10 +379,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_multi_no_sizes() {
+    fn parse_multi_from_tokens() {
         let toks = RdmaToken::parse_multi(
             "RDMA_PUT_rdma-a_256_0_key_b/k|RDMA_PUT_rdma-b_128_0_key_b/k",
-            "",
         );
         assert_eq!(toks.len(), 2);
         assert_eq!(toks[0].size(), 256);
@@ -410,15 +389,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_multi_with_sizes_override() {
-        // sizes header overrides token-embedded sizes.
-        let toks = RdmaToken::parse_multi(
-            "RDMA_PUT_rdma-a_1073741824_0_key_b/k|RDMA_PUT_rdma-b_1073741824_0_key_b/k",
-            "268435456|134217728",
-        );
+    fn parse_multi_opaque_tokens() {
+        // Opaque tokens have size 0; callers use single-shot / Fix-B semantics.
+        let toks = RdmaToken::parse_multi("cuobj:abc|cuobj:def");
         assert_eq!(toks.len(), 2);
-        assert_eq!(toks[0].size(), 268435456);
-        assert_eq!(toks[1].size(), 134217728);
+        assert_eq!(toks[0].size(), 0);
+        assert_eq!(toks[1].size(), 0);
     }
 
     #[test]

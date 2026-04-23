@@ -30,26 +30,17 @@ pub const RDMA_BYTES_HEADER: &str = "x-amz-rdma-bytes";
 /// # Multi-token protocol
 ///
 /// **PUT** — the client registers N non-contiguous (or sub-range) memory regions
-/// and sends their tokens and byte counts as pipe-separated lists:
+/// and sends their tokens as a pipe-separated list:
 /// ```text
 /// x-amz-rdma-token:  tok0|tok1|tok2
-/// x-amz-rdma-sizes:  1073741824|1073741824|536870912
 /// ```
-/// The server reads each token's buffer sequentially (with its own offset loop),
-/// feeding bytes directly into the storage backend as one contiguous object.
+/// Each token encodes its own byte count.  The server reads each token's buffer
+/// sequentially, feeding bytes directly into the storage backend as one object.
 ///
-/// **GET** — the client pre-allocates N receive buffers, sends their tokens and
-/// capacities the same way.  The server writes backend data into the buffers in
-/// order, advancing to the next buffer when the current one is full.
+/// **GET** — the client pre-allocates N receive buffers and sends their tokens
+/// the same way.  The server writes backend data into the buffers in order,
+/// advancing to the next buffer when the current one is full.
 pub const RDMA_TOKEN_SEPARATOR: char = '|';
-
-/// Header name for per-token buffer sizes in a multi-token RDMA transfer
-/// (`x-amz-rdma-sizes`).
-///
-/// Value: `|`-separated decimal byte counts, one per entry in the matching
-/// `x-amz-rdma-token` header.  Absent for single-token transfers where the
-/// size can be inferred from the mock-token format or `x-amz-rdma-bytes`.
-pub const RDMA_SIZES_HEADER: &str = "x-amz-rdma-sizes";
 
 // ── RdmaProvider trait ───────────────────────────────────────────────────────
 
@@ -162,12 +153,6 @@ pub trait RdmaProvider: Send + Sync {
     /// Header name for the RDMA byte-count (default: `x-amz-rdma-bytes`).
     fn rdma_bytes_header_name(&self) -> &[u8] {
         RDMA_BYTES_HEADER.as_bytes()
-    }
-
-    /// Header name for per-token buffer sizes in a multi-token transfer
-    /// (default: `x-amz-rdma-sizes`).
-    fn rdma_sizes_header_name(&self) -> &[u8] {
-        RDMA_SIZES_HEADER.as_bytes()
     }
 }
 
