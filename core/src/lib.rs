@@ -41,6 +41,7 @@ pub mod error;
 pub mod ffi;
 pub mod mock;
 pub mod provider;
+pub mod token;
 #[cfg(feature = "c-abi")]
 mod c_abi;
 #[cfg(feature = "pyo3")]
@@ -58,6 +59,7 @@ pub fn get_vtable_ptr() -> *const ffi::RdmaProviderVtable {
 pub use mock::MockRdmaProvider;
 pub use mock::MockRdmaServerProvider;
 pub use provider::{RdmaProvider, RdmaServerProvider, RdmaServerConfig};
+pub use token::RdmaToken;
 
 #[cfg(feature = "cuobj-client")]
 pub use cuobj_client::CuObjClientProvider;
