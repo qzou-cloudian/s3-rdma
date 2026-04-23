@@ -29,12 +29,13 @@
 //!
 //! ## Feature flags
 //!
-//! | Feature     | Effect                                               |
-//! |-------------|------------------------------------------------------|
-//! | `cuobj`     | Enable real [`CuObjProvider`] (needs NVIDIA SDK)  |
-//! | (default)   | Only [`MockRdmaProvider`] is available               |
+//! | Feature        | Effect                                                    |
+//! |----------------|-----------------------------------------------------------|
+//! | `cuobj-client` | Enable real [`CuObjClientProvider`] (loads plugin at runtime) |
+//! | `cuobj-server` | Enable real [`CuObjServerProvider`] (loads plugin at runtime) |
+//! | (default)      | Only [`MockRdmaProvider`] / [`MockRdmaServerProvider`]        |
 
-pub mod cuobj;
+pub mod cuobj_client;
 pub mod cuobj_server;
 pub mod error;
 pub mod ffi;
@@ -47,7 +48,7 @@ mod python;
 
 /// Returns a pointer to the static C vtable for use by provider cdylibs.
 ///
-/// Called by `s3-rdma-cuobj`'s `lib.rs` which re-exports it as
+/// Called by `s3-rdma-cuobj-client`'s `lib.rs` which re-exports it as
 /// `#[no_mangle] s3_rdma_provider_get_vtable`.
 #[cfg(feature = "c-abi")]
 pub fn get_vtable_ptr() -> *const ffi::RdmaProviderVtable {
@@ -58,10 +59,10 @@ pub use mock::MockRdmaProvider;
 pub use mock::MockRdmaServerProvider;
 pub use provider::{RdmaProvider, RdmaServerProvider, RdmaServerConfig};
 
-#[cfg(feature = "cuobj")]
-pub use cuobj::CuObjProvider;
-#[cfg(feature = "cuobj")]
-pub use cuobj::cuobj_available;
+#[cfg(feature = "cuobj-client")]
+pub use cuobj_client::CuObjClientProvider;
+#[cfg(feature = "cuobj-client")]
+pub use cuobj_client::cuobj_available;
 
 #[cfg(feature = "cuobj-server")]
 pub use cuobj_server::CuObjServerProvider;
@@ -79,7 +80,7 @@ pub const RDMA_MIN_BUFFER_SIZE: usize = 1024 * 1024; // 1 MiB
 pub fn rdma_provider_info() -> String {
     let mut entries: Vec<String> = Vec::new();
 
-    #[cfg(feature = "cuobj")]
+    #[cfg(feature = "cuobj-client")]
     {
         let status = if cuobj_available() { "available" } else { "unavailable" };
         entries.push(format!("cuobj ({status})"));
@@ -94,7 +95,7 @@ pub fn rdma_provider_info() -> String {
 ///
 /// `provider` must be one of:
 /// - `"mock"`  → [`MockRdmaProvider`]
-/// - `"cuobj"` → [`CuObjProvider`] (requires the `cuobj` feature)
+/// - `"cuobj"` → [`CuObjClientProvider`] (requires the `cuobj-client` feature)
 ///
 /// Returns [`RdmaError::ProviderUnavailable`] if the name is unrecognised,
 /// the required feature is not compiled in, or the underlying SDK fails to
@@ -109,12 +110,12 @@ pub fn create_provider(provider: &str, debug: bool) -> Result<Arc<dyn RdmaProvid
         }
         "cuobj" => {
             let result: Result<Arc<dyn RdmaProvider>, RdmaError>;
-            #[cfg(feature = "cuobj")]
+            #[cfg(feature = "cuobj-client")]
             {
-                result = match CuObjProvider::new() {
+                result = match CuObjClientProvider::new() {
                     Ok(p) => {
                         if debug {
-                            eprintln!("[rdma] Using CuObjProvider");
+                            eprintln!("[rdma] Using CuObjClientProvider");
                         }
                         Ok(Arc::new(p))
                     }
@@ -124,11 +125,11 @@ pub fn create_provider(provider: &str, debug: bool) -> Result<Arc<dyn RdmaProvid
                     }),
                 };
             }
-            #[cfg(not(feature = "cuobj"))]
+            #[cfg(not(feature = "cuobj-client"))]
             {
                 result = Err(RdmaError::ProviderUnavailable {
                     provider: provider.to_owned(),
-                    reason: "compiled without the `cuobj` feature".to_owned(),
+                    reason: "compiled without the `cuobj-client` feature".to_owned(),
                 });
             }
             result

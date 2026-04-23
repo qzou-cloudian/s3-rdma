@@ -1,17 +1,17 @@
-//! NVIDIA cuObject RDMA provider via lazy runtime loading.
+//! NVIDIA cuObject RDMA client provider via lazy runtime loading.
 //!
-//! Enabled by the `cuobj` Cargo feature.  At runtime `hsc` searches for the
-//! provider plugin (`libs3_rdma_cuobj.so`) and loads it on demand.  The main
-//! `hsc` binary therefore has **no compile-time or ELF-level dependency** on
-//! `libcuobjclient.so` – the library is pulled in transitively when the plugin
-//! is dlopened.
+//! Enabled by the `cuobj-client` Cargo feature.  At runtime `hsc` searches for
+//! the provider plugin (`libs3_rdma_cuobj_client.so`) and loads it on demand.
+//! The main `hsc` binary therefore has **no compile-time or ELF-level
+//! dependency** on `libcuobjclient.so` — the library is pulled in transitively
+//! when the plugin is dlopened.
 //!
-//! Search order for `libs3_rdma_cuobj.so`:
+//! Search order for `libs3_rdma_cuobj_client.so`:
 //! 1. Standard dynamic-linker paths (`LD_LIBRARY_PATH`, RPATH, ldconfig cache).
 //! 2. Directory containing the current executable.
 //! 3. `/lib64/`, `/usr/lib64/` (common CUDA/cuObject install locations).
 
-#[cfg(feature = "cuobj")]
+#[cfg(feature = "cuobj-client")]
 mod real {
     use std::ffi::c_void;
 
@@ -23,7 +23,7 @@ mod real {
 
     // ── Library search ────────────────────────────────────────────────────────
 
-    const LIB_NAME: &str = "libs3_rdma_cuobj.so";
+    const LIB_NAME: &str = "libs3_rdma_cuobj_client.so";
 
     fn try_load(path: impl AsRef<std::ffi::OsStr>) -> Option<Library> {
         unsafe { Library::new(path) }.ok()
@@ -71,11 +71,11 @@ mod real {
         cb(RdmaCompletionResult { error_code, reply_token: token });
     }
 
-    // ── CuObjProvider ─────────────────────────────────────────────────────
+    // ── CuObjClientProvider ───────────────────────────────────────────────────
 
-    /// RDMA provider that loads `libs3_rdma_cuobj.so` at runtime and calls
-    /// through the exported [`RdmaProviderVtable`].
-    pub struct CuObjProvider {
+    /// RDMA client provider that loads `libs3_rdma_cuobj_client.so` at runtime
+    /// and calls through the exported [`RdmaProviderVtable`].
+    pub struct CuObjClientProvider {
         // Order matters: ctx/vtable must be dropped (logically) before _lib
         // unloads, so cleanup() is called in Drop::drop() before _lib drops.
         vtable: *const RdmaProviderVtable,
@@ -83,16 +83,16 @@ mod real {
         _lib:   Library,  // keep the .so mapped; drops last
     }
 
-    unsafe impl Send for CuObjProvider {}
-    unsafe impl Sync for CuObjProvider {}
+    unsafe impl Send for CuObjClientProvider {}
+    unsafe impl Sync for CuObjClientProvider {}
 
-    impl std::fmt::Debug for CuObjProvider {
+    impl std::fmt::Debug for CuObjClientProvider {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "CuObjProvider(vtable)")
+            write!(f, "CuObjClientProvider(vtable)")
         }
     }
 
-    impl CuObjProvider {
+    impl CuObjClientProvider {
         /// Try to load the provider plugin and initialise it.
         ///
         /// Returns `Err` if the plugin is not found, fails to load (e.g.
@@ -137,7 +137,7 @@ mod real {
         }
     }
 
-    impl Drop for CuObjProvider {
+    impl Drop for CuObjClientProvider {
         fn drop(&mut self) {
             // Call cleanup before `_lib` drops and unloads the .so.
             if let Some(cleanup) = self.vtable().cleanup {
@@ -148,8 +148,8 @@ mod real {
 
     // ── RdmaProvider impl ─────────────────────────────────────────────────────
 
-    impl RdmaProvider for CuObjProvider {
-        fn name(&self)    -> &str { "CuObjProvider" }
+    impl RdmaProvider for CuObjClientProvider {
+        fn name(&self)    -> &str { "CuObjClientProvider" }
         fn version(&self) -> u32  { unsafe { (*self.vtable).provider_version } }
 
         fn is_memory_suitable(&self, ptr: *const u8, size: usize) -> bool {
@@ -302,15 +302,15 @@ mod real {
 
     // ── Availability probe ────────────────────────────────────────────────────
 
-    /// Returns `true` if the cuObject provider plugin can be loaded
-    /// (i.e., `libs3_rdma_cuobj.so` and `libcuobjclient.so` are installed).
+    /// Returns `true` if the cuObject client provider plugin can be loaded
+    /// (i.e., `libs3_rdma_cuobj_client.so` and `libcuobjclient.so` are installed).
     pub fn is_available() -> bool {
-        CuObjProvider::new().is_ok()
+        CuObjClientProvider::new().is_ok()
     }
 }
 
-#[cfg(feature = "cuobj")]
-pub use real::CuObjProvider;
-#[cfg(feature = "cuobj")]
+#[cfg(feature = "cuobj-client")]
+pub use real::CuObjClientProvider;
+#[cfg(feature = "cuobj-client")]
 pub use real::is_available as cuobj_available;
 
