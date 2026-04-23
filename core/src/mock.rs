@@ -196,7 +196,10 @@ impl RdmaProvider for MockRdmaProvider {
                 size,
             );
             // Flush to page cache so the relay's read() syscall sees the data.
-            libc::msync(entry.shm_ptr, size, libc::MS_SYNC);
+            if libc::msync(entry.shm_ptr, size, libc::MS_SYNC) != 0 {
+                let err = std::io::Error::last_os_error();
+                self.dbg(&format!("prepare_put_token: msync failed: {err}"));
+            }
         }
 
         let token = format!("RDMA_PUT_{}_{}_{}_key_{}", entry.name, size, offset, key)
@@ -244,18 +247,26 @@ impl RdmaProvider for MockRdmaProvider {
     ) -> Result<(), RdmaError> {
         self.dbg(&format!("process_rdma_reply status={rdma_status} transferred={transferred}"));
 
-        if !(200..300).contains(&rdma_status) {
+        if !(200..300).contains(&rdma_status) || rdma_status == 0 {
             callback(RdmaCompletionResult { error_code: rdma_status as i32, reply_token: vec![] });
             return Ok(());
         }
 
         // Parse the original request token to find the shm entry.
-        let token_str = std::str::from_utf8(request_token).unwrap_or("");
+        let token_str = match std::str::from_utf8(request_token) {
+            Ok(s) => s,
+            Err(_) => {
+                callback(RdmaCompletionResult { error_code: -1, reply_token: vec![] });
+                return Err(RdmaError::ReplyTokenProcessingFailed("token is not valid UTF-8".into()));
+            }
+        };
         let parts: Vec<&str> = token_str.splitn(7, '_').collect();
         let entry_to_drop: Option<ShmEntry> = if parts.len() >= 5 && parts[0] == "RDMA" {
             let op = parts[1];
             let shm_name = parts[2];
-            let offset: usize = parts[4].parse().unwrap_or(0);
+            // token_offset is the base position in the shm region where the
+            // server wrote the first chunk (matches `offset` embedded in the token).
+            let token_offset: usize = parts[4].parse().unwrap_or(0);
 
             let mut registered = self.registered.lock().unwrap();
             let found_ptr = registered.iter()
@@ -265,18 +276,20 @@ impl RdmaProvider for MockRdmaProvider {
             found_ptr.and_then(|ptr| {
                 let entry = registered.remove(&ptr)?;
                 if op == "GET" && transferred > 0 {
-                    // Relay wrote `transferred` bytes to the shm file; copy into
-                    // the client's buffer via the existing MAP_SHARED mapping.
-                    let available = entry.size.saturating_sub(offset);
+                    // Relay wrote `transferred` bytes to the shm file starting at
+                    // `token_offset`.  Copy into the client's buffer at the same
+                    // relative position via the existing MAP_SHARED mapping.
+                    let available = entry.size.saturating_sub(token_offset);
                     let copy_len = transferred.min(available);
                     if copy_len > 0 {
                         // SAFETY: shm_ptr is a valid MAP_SHARED mapping of entry.size
-                        // bytes; buf_ptr+offset..+copy_len is within the registered
-                        // region (enforced by the min above).
+                        // bytes.  Both src (shm_ptr+token_offset) and dst
+                        // (buf_ptr+token_offset) are within the registered
+                        // region (enforced by the saturating_sub + min above).
                         unsafe {
                             std::ptr::copy_nonoverlapping(
-                                entry.shm_ptr as *const u8,
-                                entry.buf_ptr.add(offset),
+                                (entry.shm_ptr as *const u8).add(token_offset),
+                                entry.buf_ptr.add(token_offset),
                                 copy_len,
                             );
                         }
@@ -332,7 +345,7 @@ impl RdmaProvider for MockRdmaProvider {
                     if copy_len > 0 {
                         unsafe {
                             std::ptr::copy_nonoverlapping(
-                                entry.shm_ptr as *const u8,
+                                (entry.shm_ptr as *const u8).add(offset),
                                 entry.buf_ptr.add(offset),
                                 copy_len,
                             );
@@ -349,7 +362,7 @@ impl RdmaProvider for MockRdmaProvider {
             unsafe { entry.cleanup(); }
         }
 
-        callback(RdmaCompletionResult { error_code: 0, reply_token: reply_token.to_vec() });
+        callback(RdmaCompletionResult { error_code: 0, reply_token: vec![] });
         Ok(())
     }
 
@@ -449,14 +462,6 @@ impl RdmaServerProvider for MockRdmaServerProvider {
         Ok(file_bytes[start..end].to_vec())
     }
 
-    /// RDMA GET: write `data` into `/dev/shm/{shm-name}` so the client can
-    /// copy it to its buffer via [`MockRdmaProvider::process_rdma_reply`].
-    ///
-    /// Clips the write to the client's buffer capacity (encoded in the token)
-    /// so the shm file is never overfilled.  Returns `written` — the number
-    /// of bytes actually transferred (≤ `data.len()`).  The HTTP handler sets
-    /// `x-amz-rdma-reply: 200` (full) or `206` (partial), plus
-    /// `x-amz-rdma-bytes: <written>` or `<written>/<total>`.
     /// RDMA GET: write `data` into `/dev/shm/{shm-name}` at `token_base + offset`.
     ///
     /// `offset` is the caller-supplied byte position within the client's buffer

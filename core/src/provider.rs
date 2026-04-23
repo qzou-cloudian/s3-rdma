@@ -8,7 +8,7 @@ pub struct RdmaCompletionResult {
     /// 0 on success; non-zero error code on failure.
     pub error_code: i32,
     /// Reply token echoed back from the server (may be empty).
-    #[allow(dead_code)]
+    /// Used by JNI and C-ABI bindings; otherwise typically empty.
     pub reply_token: Vec<u8>,
 }
 
@@ -19,7 +19,6 @@ pub type RdmaCompletionCallback = Box<dyn FnOnce(RdmaCompletionResult) + Send + 
 
 pub const RDMA_TOKEN_HEADER: &str = "x-amz-rdma-token";
 pub const RDMA_REPLY_HEADER: &str = "x-amz-rdma-reply";
-#[allow(dead_code)]
 pub const RDMA_BYTES_HEADER: &str = "x-amz-rdma-bytes";
 
 // ── RdmaProvider trait ───────────────────────────────────────────────────────
@@ -35,7 +34,6 @@ pub trait RdmaProvider: Send + Sync {
     fn name(&self) -> &str;
 
     /// Numeric provider version.
-    #[allow(dead_code)]
     fn version(&self) -> u32;
 
     /// Returns `true` if the memory region at `ptr` with `size` bytes is
@@ -53,7 +51,6 @@ pub trait RdmaProvider: Send + Sync {
 
     /// Maximum single-transfer size for the given buffer.
     /// Default: `usize::MAX` (no limit).  Override when the provider imposes a cap.
-    #[allow(dead_code)]
     fn get_max_transfer_size(&self, _ptr: *const u8) -> usize {
         usize::MAX
     }
@@ -97,7 +94,8 @@ pub trait RdmaProvider: Send + Sync {
         _transferred: usize,
         callback: RdmaCompletionCallback,
     ) -> Result<(), RdmaError> {
-        let error_code = if (200..300).contains(&rdma_status) { 0 } else { rdma_status as i32 };
+        // rdma_status == 0 means the reply header was absent — treat as an error.
+        let error_code = if rdma_status != 0 && (200..300).contains(&rdma_status) { 0 } else { rdma_status as i32 };
         callback(RdmaCompletionResult { error_code, reply_token: vec![] });
         Ok(())
     }
@@ -115,7 +113,7 @@ pub trait RdmaProvider: Send + Sync {
     ) -> Result<(), RdmaError> {
         // Legacy default: treat as success.
         let _ = reply_token;
-        callback(RdmaCompletionResult { error_code: 0, reply_token: reply_token.to_vec() });
+        callback(RdmaCompletionResult { error_code: 0, reply_token: vec![] });
         Ok(())
     }
 
@@ -132,7 +130,6 @@ pub trait RdmaProvider: Send + Sync {
     }
 
     /// Header name for the RDMA byte-count (default: `x-amz-rdma-bytes`).
-    #[allow(dead_code)]
     fn rdma_bytes_header_name(&self) -> &[u8] {
         RDMA_BYTES_HEADER.as_bytes()
     }
@@ -153,6 +150,7 @@ pub trait RdmaProvider: Send + Sync {
 /// | `listen_port` | –    | ✓     |
 /// | `pool_count`  | –    | ✓     |
 /// | `buf_size`    | –    | ✓     |
+#[derive(Debug, Clone)]
 pub struct RdmaServerConfig {
     /// Directory used for POSIX shared-memory files (mock provider).
     /// Defaults to `"/dev/shm"`.

@@ -67,7 +67,7 @@ mod real {
         pub fn new(cfg: &RdmaServerConfig) -> Result<Self, RdmaError> {
             let lib = find_library().ok_or_else(|| {
                 RdmaError::CuObjConnectionFailed(
-                    format!("{LIB_NAME} not found (searched LD_LIBRARY_PATH, exe dir, /lib64)")
+                    format!("{LIB_NAME} not found (searched LD_LIBRARY_PATH, exe dir, /lib64, /usr/lib64)")
                 )
             })?;
 
@@ -120,7 +120,17 @@ mod real {
     }
 
     impl RdmaServerProvider for CuObjServerProvider {
-        fn name(&self) -> &str { "CuObjServerProvider" }
+        fn name(&self) -> &str {
+            // Read the provider name from the vtable's static C string.
+            // Falls back to the compile-time constant if the pointer is null.
+            let ptr = self.vtable().provider_name;
+            if ptr.is_null() {
+                return "CuObjServerProvider";
+            }
+            unsafe { std::ffi::CStr::from_ptr(ptr) }
+                .to_str()
+                .unwrap_or("CuObjServerProvider")
+        }
 
         fn buf_size(&self) -> usize { self.buf_size }
 

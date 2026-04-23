@@ -1,12 +1,13 @@
 use std::fmt;
 
 /// Errors from RDMA provider operations.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub enum RdmaError {
     /// Memory registration failed.
+    #[allow(dead_code)]
     MemoryRegistrationFailed { ptr: usize, size: usize, reason: String },
     /// Memory deregistration failed.
+    #[allow(dead_code)]
     MemoryDeregistrationFailed { ptr: usize, reason: String },
     /// Memory is not suitable for RDMA.
     MemoryNotSuitable { ptr: usize, size: usize },
@@ -30,9 +31,10 @@ pub enum RdmaError {
 
 impl RdmaError {
     /// Returns `true` for errors where falling back to plain (non-RDMA) HTTP
-    /// is safe — e.g. memory not suitable, token failure, library unavailable.
+    /// is safe — e.g. memory not suitable, token failure, library unavailable,
+    /// or the server buffer was too small for the requested transfer.
     ///
-    /// Returns `false` for hard I/O or deregistration errors where the caller
+    /// Returns `false` for hard I/O or transfer errors where the caller
     /// should propagate the failure.
     pub fn is_fallback_eligible(&self) -> bool {
         matches!(
@@ -40,6 +42,8 @@ impl RdmaError {
             RdmaError::MemoryNotSuitable { .. }
                 | RdmaError::TokenGenerationFailed { .. }
                 | RdmaError::CuObjConnectionFailed(_)
+                | RdmaError::ProviderUnavailable { .. }
+                | RdmaError::BufferTooSmall { .. }
         )
     }
 }
@@ -74,7 +78,7 @@ impl fmt::Display for RdmaError {
             RdmaError::BufferTooSmall { server_capacity, requested } => {
                 write!(
                     f,
-                    "server buffer too small: capacity={server_capacity}, client requested={requested}"
+                    "server buffer too small: capacity={server_capacity}, transfer_size={requested}"
                 )
             }
             RdmaError::Io(e) => write!(f, "I/O error: {e}"),
