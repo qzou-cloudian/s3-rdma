@@ -126,7 +126,15 @@ pub trait RdmaProvider: Send + Sync {
         callback: RdmaCompletionCallback,
     ) -> Result<(), RdmaError> {
         // rdma_status == 0 means the reply header was absent — treat as an error.
-        let error_code = if rdma_status != 0 && (200..300).contains(&rdma_status) { 0 } else { rdma_status as i32 };
+        // Cast to i32 first: 0u16 as i32 == 0 which callers would wrongly interpret
+        // as success, so map the "absent header" case to -1 explicitly.
+        let error_code = if rdma_status != 0 && (200..300).contains(&rdma_status) {
+            0i32
+        } else if rdma_status == 0 {
+            -1i32 // missing reply header
+        } else {
+            rdma_status as i32
+        };
         callback(RdmaCompletionResult { error_code, reply_token: vec![] });
         Ok(())
     }

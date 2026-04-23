@@ -247,8 +247,11 @@ impl RdmaProvider for MockRdmaProvider {
     ) -> Result<(), RdmaError> {
         self.dbg(&format!("process_rdma_reply status={rdma_status} transferred={transferred}"));
 
-        if !(200..300).contains(&rdma_status) || rdma_status == 0 {
-            callback(RdmaCompletionResult { error_code: rdma_status as i32, reply_token: vec![] });
+        if rdma_status == 0 || !(200..300).contains(&rdma_status) {
+            // rdma_status == 0 means the reply header was absent; 0 as i32 == 0
+            // would be wrongly interpreted as success, so map it to -1.
+            let error_code = if rdma_status == 0 { -1i32 } else { rdma_status as i32 };
+            callback(RdmaCompletionResult { error_code, reply_token: vec![] });
             return Ok(());
         }
 
@@ -276,20 +279,22 @@ impl RdmaProvider for MockRdmaProvider {
             found_ptr.and_then(|ptr| {
                 let entry = registered.remove(&ptr)?;
                 if op == "GET" && transferred > 0 {
-                    // Relay wrote `transferred` bytes to the shm file starting at
-                    // `token_offset`.  Copy into the client's buffer at the same
-                    // relative position via the existing MAP_SHARED mapping.
+                    // `handle_get` wrote `transferred` bytes into the shm file starting
+                    // at `token_offset` (the base offset from `prepare_get_token`).
+                    // Copy the data back to the START of the client's registered buffer
+                    // (`buf_ptr + 0`), not to `buf_ptr + token_offset`, because callers
+                    // (including the relay) always read from the buffer base after the
+                    // transfer completes.
                     let available = entry.size.saturating_sub(token_offset);
                     let copy_len = transferred.min(available);
                     if copy_len > 0 {
                         // SAFETY: shm_ptr is a valid MAP_SHARED mapping of entry.size
-                        // bytes.  Both src (shm_ptr+token_offset) and dst
-                        // (buf_ptr+token_offset) are within the registered
-                        // region (enforced by the saturating_sub + min above).
+                        // bytes; buf_ptr points to the registered client buffer of at
+                        // least entry.size bytes.  copy_len <= available <= entry.size.
                         unsafe {
                             std::ptr::copy_nonoverlapping(
                                 (entry.shm_ptr as *const u8).add(token_offset),
-                                entry.buf_ptr.add(token_offset),
+                                entry.buf_ptr, // always write to the buffer base
                                 copy_len,
                             );
                         }
