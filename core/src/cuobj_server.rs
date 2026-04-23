@@ -10,20 +10,43 @@
 //! 2. Directory containing the current executable.
 //! 3. `/lib64/`, `/usr/lib64/` (common CUDA/cuObject install locations).
 
-/// Configuration passed to the cuObj server plugin during initialisation.
+/// Unified configuration for any RDMA **server** provider.
 ///
-/// Always defined so callers don't need `#[cfg(feature = "cuobj-server")]`
-/// around the config-building code.  The `CuObjServerProvider` loader itself
-/// is feature-gated.
-pub struct CuObjServerConfig {
-    /// RDMA listen address (e.g. `"192.168.1.1"`).
+/// Always defined (no feature gate) so callers can build the config without
+/// conditional compilation.  Fields that are irrelevant for a given provider
+/// are silently ignored:
+///
+/// | Field         | mock | cuobj |
+/// |---------------|------|-------|
+/// | `shm_path`    | ✓    | –     |
+/// | `listen_addr` | –    | ✓     |
+/// | `listen_port` | –    | ✓     |
+/// | `pool_count`  | –    | ✓     |
+/// | `buf_size`    | –    | ✓     |
+pub struct RdmaServerConfig {
+    /// Directory used for POSIX shared-memory files (mock provider).
+    /// Defaults to `"/dev/shm"`.
+    pub shm_path: String,
+    /// RDMA listen address for the cuObj provider (e.g. `"192.168.1.1"`).
     pub listen_addr: String,
-    /// RDMA listen port.
+    /// RDMA listen port for the cuObj provider.
     pub listen_port: u16,
-    /// Number of pre-allocated buffer slots.
-    pub pool_count:  usize,
-    /// Size in bytes of each buffer slot.
-    pub buf_size:    usize,
+    /// Number of pre-allocated buffer slots (cuObj provider).
+    pub pool_count: usize,
+    /// Size in bytes of each buffer slot (cuObj provider).
+    pub buf_size: usize,
+}
+
+impl Default for RdmaServerConfig {
+    fn default() -> Self {
+        Self {
+            shm_path:    "/dev/shm".to_owned(),
+            listen_addr: String::new(),
+            listen_port: 0,
+            pool_count:  4,
+            buf_size:    128 * 1024 * 1024,
+        }
+    }
 }
 
 #[cfg(feature = "cuobj-server")]
@@ -33,7 +56,7 @@ mod real {
     use crate::error::RdmaError;
     use crate::ffi::{ByteCursor, GetServerVtableFn, RdmaServerInitParams, RdmaServerVtable};
     use crate::provider::RdmaServerProvider;
-    use super::CuObjServerConfig;
+    use super::RdmaServerConfig;
 
     const LIB_NAME: &str = "libs3_rdma_cuobj_server.so";
 
@@ -77,7 +100,7 @@ mod real {
 
     impl CuObjServerProvider {
         /// Load the plugin and initialise it with the given config.
-        pub fn new(cfg: &CuObjServerConfig) -> Result<Self, RdmaError> {
+        pub fn new(cfg: &RdmaServerConfig) -> Result<Self, RdmaError> {
             let lib = find_library().ok_or_else(|| {
                 RdmaError::CuObjConnectionFailed(
                     format!("{LIB_NAME} not found (searched LD_LIBRARY_PATH, exe dir, /lib64)")

@@ -66,7 +66,7 @@ pub use cuobj::cuobj_available;
 
 #[cfg(feature = "cuobj-server")]
 pub use cuobj_server::CuObjServerProvider;
-pub use cuobj_server::CuObjServerConfig;
+pub use cuobj_server::RdmaServerConfig;
 
 use std::sync::Arc;
 
@@ -145,33 +145,30 @@ pub fn create_provider(provider: &str, debug: bool) -> Result<Arc<dyn RdmaProvid
 /// Build an `Arc<dyn RdmaServerProvider>` for the named server-side provider.
 ///
 /// `provider` must be one of:
-/// - `"mock"`  → [`MockRdmaServerProvider`] (reads/writes `/dev/shm` files)
+/// - `"mock"`  → [`MockRdmaServerProvider`] — reads/writes files under
+///               `cfg.shm_path` (default `/dev/shm`)
 /// - `"cuobj"` → [`CuObjServerProvider`] loaded from `libs3_rdma_cuobj_server.so`
 ///              at runtime; requires the `cuobj-server` feature and a non-empty
-///              `cuobj_cfg` (listen addr/port + pool config).
+///              `cfg.listen_addr`.
 ///
 /// Returns [`RdmaError::ProviderUnavailable`] if the name is unrecognised,
 /// the required feature is not compiled in, or the plugin fails to initialise.
 pub fn create_server_provider(
     provider: &str,
     debug: bool,
-    cuobj_cfg: Option<&CuObjServerConfig>,
+    cfg: &RdmaServerConfig,
 ) -> Result<Arc<dyn RdmaServerProvider>, RdmaError> {
     match provider {
         "mock" => {
             if debug {
-                eprintln!("[rdma] Using MockRdmaServerProvider");
+                eprintln!("[rdma] Using MockRdmaServerProvider (shm: {})", cfg.shm_path);
             }
-            Ok(Arc::new(MockRdmaServerProvider::new(debug)))
+            Ok(Arc::new(MockRdmaServerProvider::new(debug, &cfg.shm_path)))
         }
         "cuobj" => {
             let result: Result<Arc<dyn RdmaServerProvider>, RdmaError>;
             #[cfg(feature = "cuobj-server")]
             {
-                let cfg = cuobj_cfg.ok_or_else(|| RdmaError::ProviderUnavailable {
-                    provider: provider.to_owned(),
-                    reason: "cuobj server requires a CuObjServerConfig".to_owned(),
-                })?;
                 result = match CuObjServerProvider::new(cfg) {
                     Ok(p) => {
                         if debug {
@@ -187,7 +184,7 @@ pub fn create_server_provider(
             }
             #[cfg(not(feature = "cuobj-server"))]
             {
-                let _ = cuobj_cfg;
+                let _ = cfg;
                 result = Err(RdmaError::ProviderUnavailable {
                     provider: provider.to_owned(),
                     reason: "compiled without the `cuobj-server` feature".to_owned(),

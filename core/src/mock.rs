@@ -363,16 +363,17 @@ impl RdmaProvider for MockRdmaProvider {
 
 /// Server-side counterpart to [`MockRdmaProvider`].
 ///
-/// Both sides must share the same `/dev/shm` directory (e.g. via Docker
+/// Both sides must share the same shared-memory directory (e.g. via Docker
 /// `ipc: host`).  The server reads from / writes to the file that the client
 /// created in [`MockRdmaProvider::register_memory`].
 pub struct MockRdmaServerProvider {
-    debug: bool,
+    debug:    bool,
+    shm_path: String,
 }
 
 impl MockRdmaServerProvider {
-    pub fn new(debug: bool) -> Self {
-        Self { debug }
+    pub fn new(debug: bool, shm_path: impl Into<String>) -> Self {
+        Self { debug, shm_path: shm_path.into() }
     }
 
     fn dbg(&self, msg: &str) {
@@ -425,7 +426,7 @@ impl RdmaServerProvider for MockRdmaServerProvider {
             )));
         }
         let read_size = if size > 0 { size } else { token_size };
-        let path = format!("{SHM_DIR}/{shm_name}");
+        let path = format!("{}/{shm_name}", self.shm_path);
         self.dbg(&format!("handle_put shm={shm_name} size={read_size} offset={offset}"));
 
         let file_bytes = std::fs::read(&path).map_err(|e| {
@@ -459,7 +460,7 @@ impl RdmaServerProvider for MockRdmaServerProvider {
         }
         // Clip to client buffer capacity to avoid overfilling the shm file.
         let write_len = data.len().min(capacity);
-        let path = format!("{SHM_DIR}/{shm_name}");
+        let path = format!("{}/{shm_name}", self.shm_path);
         self.dbg(&format!(
             "handle_get shm={shm_name} write={write_len}/{} offset={offset}",
             data.len()
