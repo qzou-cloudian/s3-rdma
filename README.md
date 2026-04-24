@@ -23,9 +23,11 @@ This project exposes that capability through a uniform `RdmaProvider` interface 
 
 ```
 s3-rdma/
-├── core/                    # RdmaProvider trait, MockRdmaProvider, CuObjProvider
+├── core/                    # RdmaProvider / RdmaServerProvider traits, Mock providers, loaders
 ├── providers/
-│   └── cuobj/               # cdylib plugin — wraps NVIDIA cuObject SDK
+│   ├── cuobj/               # Combined cdylib plugin → libs3rdmacuobj.so  ← primary
+│   ├── cuobj-client/        # Legacy client-only plugin  (kept for compatibility)
+│   └── cuobj-server/        # Legacy server-only plugin  (kept for compatibility)
 └── bindings/
     ├── java/                # JNI Rust crate + Maven project (io.s3rdma)
     └── python/              # PyO3 / maturin extension (s3_rdma)
@@ -37,7 +39,9 @@ s3-rdma/
 
 ## Provider model
 
-The core abstraction is the `RdmaProvider` trait:
+### Client side (`RdmaProvider`)
+
+The client-side abstraction used by S3 clients and relay nodes:
 
 ```
 client                        S3 server
@@ -61,17 +65,41 @@ client                        S3 server
 
 HTTP header names are provider-configurable (`x-amz-rdma-token`, `x-amz-rdma-reply`).
 
+### Server side (`RdmaServerProvider`)
+
+The server-side abstraction used by the S3 gateway:
+
+| Method | Description |
+|--------|-------------|
+| `handle_put(key, token, offset, size)` | RDMA_READ from client buffer; returns transferred bytes |
+| `handle_get(key, data, token, offset)` | Copy `data` into pool slot and RDMA_WRITE to client buffer |
+
+The server provider owns a `BufferPool` of pinned DMA slots. Each `handle_*` call acquires a slot, performs the RDMA transfer, and releases the slot back to the pool.
+
 ---
 
 ## Providers
 
-### MockRdmaProvider
+### MockRdmaProvider / MockRdmaServerProvider
 
-Built into `core`. Accepts any non-null buffer, generates deterministic ASCII tokens, and invokes the completion callback synchronously. No hardware or SDK required.
+Built into `core`. Accepts any non-null buffer, generates deterministic ASCII tokens, and invokes the completion callback synchronously. No hardware or SDK required. Uses `/dev/shm` files as the transfer medium so client and server can run in separate processes on the same host (or in Docker containers sharing `ipc: host`).
 
-### CuObjProvider
+### CuObjProvider (combined plugin)
 
-Runtime-loaded from `providers/cuobj/` (`libs3_rdma_cuobj.so`). Delegates to the NVIDIA cuObject SDK for real GPU-Direct RDMA. Enabled by the `cuobj` Cargo feature on the `core` crate; the plugin `.so` is loaded at runtime via `libloading` — no compile-time SDK dependency.
+Loaded at runtime from `providers/cuobj/` — builds a single shared library `libs3rdmacuobj.so` that exports **both** the client and server vtables:
+
+| C symbol | Direction | Description |
+|----------|-----------|-------------|
+| `s3_rdma_provider_get_vtable()` | Client | `RdmaProviderVtable` — used by relay/client nodes |
+| `s3_rdma_server_provider_get_vtable()` | Server | `RdmaServerVtable` — used by the gateway |
+
+The plugin is loaded at runtime via `libloading` — no compile-time SDK dependency. `CuObjClientProvider` and `CuObjServerProvider` in `core` search for the plugin in this order:
+
+1. Standard dynamic-linker paths (`LD_LIBRARY_PATH`, RPATH, ldconfig cache)
+2. Directory alongside the running executable
+3. `/lib64/`, `/usr/lib64/`
+
+The legacy split plugins (`libs3_rdma_cuobj_client.so` / `libs3_rdma_cuobj_server.so` from `providers/cuobj-client` and `providers/cuobj-server`) are searched as fallbacks if the combined plugin is not found.
 
 ---
 
@@ -204,8 +232,13 @@ java -Djava.library.path=target/debug \
 ## Building
 
 ```sh
-# Workspace (core + providers + Java JNI)
+# Core library + all providers + Java JNI
 cargo build --workspace
+
+# Combined cuObject plugin only (requires CUDA SDK)
+export CUOBJ_ROOT_DIR=/usr/local/cuda-13.2
+cargo build -p s3-rdma-cuobj --release
+# → target/release/libs3rdmacuobj.so
 
 # Python extension (from bindings/python/)
 source ~/.venv/bin/activate
@@ -215,4 +248,7 @@ cd bindings/python && python3 -m maturin develop
 mvn compile -f bindings/java/pom.xml
 ```
 
+Place `libs3rdmacuobj.so` alongside the gateway binary or on `LD_LIBRARY_PATH` before starting either the client or server process.
+
 Minimum Rust edition: **2021**.  No `unsafe` in `core` beyond raw pointer forwarding to the provider implementation.
+
