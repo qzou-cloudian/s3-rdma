@@ -78,6 +78,96 @@ The server provider owns a `BufferPool` of pinned DMA slots. Each `handle_*` cal
 
 ---
 
+## HTTP/2 streaming token delivery protocol
+
+The S3 gateway and relay support two RDMA token delivery modes between a relay node and the
+upstream gateway.  The mode is negotiated via an HTTP header on the request.
+
+### Header mode (default)
+
+All RDMA buffer descriptors are encoded into a single `x-amz-rdma-token` request header,
+pipe-separated for multi-chunk transfers.  The server reads data from each buffer and returns
+a single `x-amz-rdma-reply` header on the response:
+
+```
+Client PUT:
+  x-amz-rdma-token: <token1>|<token2>|…
+  Content-Length: 0
+  (no body)
+
+Server response:
+  x-amz-rdma-reply: 200     ← 200 = success, 501 = fallback to plain HTTP
+  x-amz-rdma-bytes: <written>/<total>
+```
+
+### Stream mode (`x-amz-rdma-stream: true`)
+
+Token lines are delivered as a newline-delimited request body.  The server sends per-token
+ACK lines back in the response body.  Requires HTTP/2 (no head-of-line blocking; server can
+begin RDMA_READs while later tokens are still arriving).
+
+**PUT direction (client → server):**
+
+```
+Client PUT:
+  x-amz-rdma-stream: true
+  Content-Length: <token-body-size>
+
+  <token1>\n
+  <token2>\n
+  …
+
+Server response (200 OK):
+  x-amz-rdma-reply: 200
+  (standard S3 PutObject/UploadPart response body)
+```
+
+**GET direction (server → client):**
+
+```
+Client GET:
+  x-amz-rdma-stream: true
+  Content-Length: <token-body-size>
+
+  <token1>\n
+  <token2>\n
+  …
+
+Server response (200 OK):
+  x-amz-rdma-reply: 200
+
+  <written1>/<total>\n    ← one ACK line per token
+  <written2>/<total>\n
+  …
+```
+
+Where `<written>` is the byte count transferred into that buffer and `<total>` is the full
+object size.  If `<written> < <total>` the client buffer was smaller than the object
+(partial transfer, `x-amz-rdma-reply: 206`).
+
+### Mock token format
+
+The `MockRdmaProvider` generates tokens in this ASCII format — useful for integration tests
+and debugging:
+
+```
+RDMA_{PUT|GET}_{shm_filename}_{size}_{offset}[_key_{s3_key}]
+```
+
+Rules:
+- `shm_filename` — filename only, **no `/dev/shm/` prefix** (the mock prepends it)
+- `shm_filename` must **not contain underscores** (used as field separator with `splitn(7, '_')`)
+- Typical safe names: `rdma-buf-0`, `my-object` (hyphens are fine)
+- The `_key_{s3_key}` suffix is optional — used by the server-side mock to verify the key
+
+Examples:
+```
+RDMA_PUT_rdma-buf-0_8192_0
+RDMA_GET_rdma-buf-0_8192_0_key_my-bucket/my-object.bin
+```
+
+---
+
 ## Providers
 
 ### MockRdmaProvider / MockRdmaServerProvider
