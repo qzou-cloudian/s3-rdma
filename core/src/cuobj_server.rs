@@ -134,6 +134,11 @@ mod real {
 
         fn buf_size(&self) -> usize { self.buf_size }
 
+        /// Delegates to the plugin's `handle_put` vtable entry.
+        ///
+        /// The plugin performs a cuObject `RDMA_READ` from the client's buffer,
+        /// copies the transferred bytes into a pool slot, and returns them as a
+        /// heap-allocated `ByteCursor`.  This wrapper reclaims that allocation.
         fn handle_put(
             &self,
             s3_key: &[u8],
@@ -165,6 +170,11 @@ mod real {
             Ok(data)
         }
 
+        /// Delegates to the plugin's `handle_get` vtable entry.
+        ///
+        /// Copies `data` into a pool slot and performs a cuObject `RDMA_WRITE`
+        /// into the client's registered buffer via `token`.  Returns the number
+        /// of bytes successfully written.
         fn handle_get(
             &self,
             s3_key: &[u8],

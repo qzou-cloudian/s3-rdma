@@ -39,6 +39,8 @@ fn get_provider() -> Option<&'static ServerProvider> {
 // C-ABI shims
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Initialise the singleton `CuObjServer` and allocate the `BufferPool`.
+/// Returns 0 on success, -1 on error or if called more than once.
 unsafe extern "C" fn c_init(params: *const RdmaServerInitParams, _ctx: *mut *mut c_void) -> i32 {
     if params.is_null() {
         eprintln!("[s3-rdma-cuobj-server] c_init: null params");
@@ -98,6 +100,12 @@ unsafe extern "C" fn c_cleanup(_ctx: *mut c_void) {
     // shutting down so the pool will be dropped via normal destructors.
 }
 
+/// RDMA PUT: perform a cuObject `RDMA_READ` from the client's registered buffer
+/// into a pool slot, then return the transferred bytes to the Rust layer.
+///
+/// `*out_data` is set to a heap-allocated slice on success; the caller must
+/// free it via `ByteCursor::free` (or `Box::from_raw`).
+/// Returns 0 on success, -1 on error (buffer too small, RDMA failure, etc.).
 unsafe extern "C" fn c_handle_put(
     _ctx:     *mut c_void,
     s3_key:   *const ByteCursor,
@@ -131,9 +139,10 @@ unsafe extern "C" fn c_handle_put(
 
     match guard.server_handle_put(key_str, offset, n, token_str) {
         Ok(transferred) => {
-            let data = guard.as_slice()[..transferred].to_vec();
-            let len  = data.len();
-            let ptr  = Box::into_raw(data.into_boxed_slice()) as *const u8;
+            // Allocate directly as Box<[u8]> — avoids the intermediate Vec.
+            let boxed: Box<[u8]> = guard.as_slice()[..transferred].into();
+            let len = boxed.len();
+            let ptr = Box::into_raw(boxed) as *const u8;
             unsafe { *out_data = ByteCursor { ptr, len }; }
             0
         }
@@ -144,6 +153,11 @@ unsafe extern "C" fn c_handle_put(
     }
 }
 
+/// RDMA GET: perform a cuObject `RDMA_WRITE` of `data` into the client's
+/// registered buffer via the pool slot identified by `token`.
+///
+/// `*out_written` is set to the number of bytes actually written.
+/// Returns 0 on success, -1 on error.
 unsafe extern "C" fn c_handle_get(
     _ctx:        *mut c_void,
     s3_key:      *const ByteCursor,
