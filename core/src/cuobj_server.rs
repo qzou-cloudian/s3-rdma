@@ -21,6 +21,7 @@ mod real {
     use crate::provider::RdmaServerProvider;
     use super::RdmaServerConfig;
 
+    const LIB_NAME_COMBINED: &str = "libs3rdmacuobj.so";
     const LIB_NAME: &str = "libs3_rdma_cuobj_server.so";
 
     fn try_load(path: impl AsRef<std::ffi::OsStr>) -> Option<Library> {
@@ -28,19 +29,21 @@ mod real {
     }
 
     fn find_library() -> Option<Library> {
-        if let Some(lib) = try_load(LIB_NAME) {
-            return Some(lib);
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                if let Some(lib) = try_load(dir.join(LIB_NAME)) {
-                    return Some(lib);
+        for name in &[LIB_NAME_COMBINED, LIB_NAME] {
+            if let Some(lib) = try_load(name) {
+                return Some(lib);
+            }
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(dir) = exe.parent() {
+                    if let Some(lib) = try_load(dir.join(name)) {
+                        return Some(lib);
+                    }
                 }
             }
-        }
-        for dir in &["/lib64", "/usr/lib64"] {
-            if let Some(lib) = try_load(format!("{dir}/{LIB_NAME}")) {
-                return Some(lib);
+            for dir in &["/lib64", "/usr/lib64"] {
+                if let Some(lib) = try_load(format!("{dir}/{name}")) {
+                    return Some(lib);
+                }
             }
         }
         None
@@ -67,7 +70,8 @@ mod real {
         pub fn new(cfg: &RdmaServerConfig) -> Result<Self, RdmaError> {
             let lib = find_library().ok_or_else(|| {
                 RdmaError::CuObjConnectionFailed(
-                    format!("{LIB_NAME} not found (searched LD_LIBRARY_PATH, exe dir, /lib64, /usr/lib64)")
+                    format!("{LIB_NAME_COMBINED} (or {LIB_NAME}) not found \
+                             (searched LD_LIBRARY_PATH, exe dir, /lib64, /usr/lib64)")
                 )
             })?;
 

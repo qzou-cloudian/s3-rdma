@@ -23,6 +23,9 @@ mod real {
 
     // ── Library search ────────────────────────────────────────────────────────
 
+    /// Combined single-file provider (preferred).
+    const LIB_NAME_COMBINED: &str = "libs3rdmacuobj.so";
+    /// Legacy split client-only plugin (fallback).
     const LIB_NAME: &str = "libs3_rdma_cuobj_client.so";
 
     fn try_load(path: impl AsRef<std::ffi::OsStr>) -> Option<Library> {
@@ -30,22 +33,26 @@ mod real {
     }
 
     fn find_library() -> Option<Library> {
-        // 1. Standard linker search (LD_LIBRARY_PATH, RPATH, ldconfig)
-        if let Some(lib) = try_load(LIB_NAME) {
-            return Some(lib);
-        }
-        // 2. Alongside the running executable
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                if let Some(lib) = try_load(dir.join(LIB_NAME)) {
-                    return Some(lib);
+        // Prefer the combined provider, fall back to the legacy client-only plugin.
+        // For each candidate name, search:
+        //   1. Standard linker paths (LD_LIBRARY_PATH, RPATH, ldconfig)
+        //   2. Directory alongside the running executable
+        //   3. Common CUDA/cuObject install locations
+        for name in &[LIB_NAME_COMBINED, LIB_NAME] {
+            if let Some(lib) = try_load(name) {
+                return Some(lib);
+            }
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(dir) = exe.parent() {
+                    if let Some(lib) = try_load(dir.join(name)) {
+                        return Some(lib);
+                    }
                 }
             }
-        }
-        // 3. Common CUDA/cuObject install directories
-        for dir in &["/lib64", "/usr/lib64"] {
-            if let Some(lib) = try_load(format!("{dir}/{LIB_NAME}")) {
-                return Some(lib);
+            for dir in &["/lib64", "/usr/lib64"] {
+                if let Some(lib) = try_load(format!("{dir}/{name}")) {
+                    return Some(lib);
+                }
             }
         }
         None
@@ -100,7 +107,8 @@ mod real {
         pub fn new() -> Result<Self, RdmaError> {
             let lib = find_library().ok_or_else(|| {
                 RdmaError::CuObjConnectionFailed(
-                    format!("{LIB_NAME} not found (searched LD_LIBRARY_PATH, exe dir, /lib64)")
+                    format!("{LIB_NAME_COMBINED} (or {LIB_NAME}) not found \
+                             (searched LD_LIBRARY_PATH, exe dir, /lib64)")
                 )
             })?;
 
