@@ -9,8 +9,8 @@ use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyteArray, jlong, JNI_TRUE};
 use jni::JNIEnv;
 
-use s3_rdma::mock::MockRdmaProvider;
-use s3_rdma::provider::{RdmaCompletionCallback, RdmaCompletionResult, RdmaProvider};
+use s3_rdma::mock::{MockRdmaProvider, MockRdmaServerProvider};
+use s3_rdma::provider::{RdmaCompletionCallback, RdmaCompletionResult, RdmaProvider, RdmaServerProvider};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -223,5 +223,126 @@ pub extern "system" fn Java_io_s3rdma_MockRdmaProvider_nativeProcessReplyToken(
 
     if let Err(e) = unsafe { provider_ref(handle) }.process_reply_token(&reply_bytes, cb) {
         throw(&mut env, &e.to_string());
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// MockRdmaServerProvider JNI
+// ═════════════════════════════════════════════════════════════════════════════
+
+unsafe fn server_ref(handle: jlong) -> &'static MockRdmaServerProvider {
+    unsafe { &*(handle as *const MockRdmaServerProvider) }
+}
+
+/// `MockRdmaServerProvider.nativeCreate(boolean debug, String shmPath, long bufSize) -> long`
+#[no_mangle]
+pub extern "system" fn Java_io_s3rdma_MockRdmaServerProvider_nativeCreate(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    debug: jboolean,
+    shm_path: JString<'_>,
+    buf_size: jlong,
+) -> jlong {
+    let path: String = match env.get_string(&shm_path) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            let _ = env.throw_new("io/s3rdma/RdmaException", e.to_string());
+            return 0;
+        }
+    };
+    let provider = MockRdmaServerProvider::new(debug == JNI_TRUE, path, buf_size as usize);
+    Box::into_raw(Box::new(provider)) as jlong
+}
+
+/// `MockRdmaServerProvider.nativeDestroy(long handle)`
+#[no_mangle]
+pub extern "system" fn Java_io_s3rdma_MockRdmaServerProvider_nativeDestroy(
+    _env: JNIEnv<'_>,
+    _obj: JObject<'_>,
+    handle: jlong,
+) {
+    if handle != 0 {
+        let _ = unsafe { Box::from_raw(handle as *mut MockRdmaServerProvider) };
+    }
+}
+
+/// `MockRdmaServerProvider.nativeName(long handle) -> String`
+#[no_mangle]
+pub extern "system" fn Java_io_s3rdma_MockRdmaServerProvider_nativeName<'a>(
+    env: JNIEnv<'a>,
+    _obj: JObject<'a>,
+    handle: jlong,
+) -> JString<'a> {
+    let name = unsafe { server_ref(handle) }.name();
+    env.new_string(name).unwrap_or_else(|_| JString::default())
+}
+
+/// `MockRdmaServerProvider.nativeBufSize(long handle) -> long`
+#[no_mangle]
+pub extern "system" fn Java_io_s3rdma_MockRdmaServerProvider_nativeBufSize(
+    _env: JNIEnv<'_>,
+    _obj: JObject<'_>,
+    handle: jlong,
+) -> jlong {
+    unsafe { server_ref(handle) }.buf_size() as jlong
+}
+
+/// `MockRdmaServerProvider.nativeHandlePut(long, byte[] s3Key, byte[] token, long offset, long size) -> byte[]`
+#[no_mangle]
+pub extern "system" fn Java_io_s3rdma_MockRdmaServerProvider_nativeHandlePut(
+    mut env: JNIEnv<'_>,
+    _obj: JObject<'_>,
+    handle: jlong,
+    s3_key: JByteArray<'_>,
+    token: JByteArray<'_>,
+    offset: jlong,
+    size: jlong,
+) -> jbyteArray {
+    let key_bytes = match env.convert_byte_array(&s3_key) {
+        Ok(b) => b,
+        Err(e) => { throw(&mut env, &e.to_string()); return std::ptr::null_mut(); }
+    };
+    let token_bytes = match env.convert_byte_array(&token) {
+        Ok(b) => b,
+        Err(e) => { throw(&mut env, &e.to_string()); return std::ptr::null_mut(); }
+    };
+    match unsafe { server_ref(handle) }.handle_put(
+        &key_bytes, &token_bytes, offset as usize, size as usize,
+    ) {
+        Ok(data) => env.byte_array_from_slice(&data)
+            .map(|a| a.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        Err(e) => { throw(&mut env, &e.to_string()); std::ptr::null_mut() }
+    }
+}
+
+/// `MockRdmaServerProvider.nativeHandleGet(long, byte[] s3Key, byte[] data, byte[] token, long offset) -> long`
+#[no_mangle]
+pub extern "system" fn Java_io_s3rdma_MockRdmaServerProvider_nativeHandleGet(
+    mut env: JNIEnv<'_>,
+    _obj: JObject<'_>,
+    handle: jlong,
+    s3_key: JByteArray<'_>,
+    data: JByteArray<'_>,
+    token: JByteArray<'_>,
+    offset: jlong,
+) -> jlong {
+    let key_bytes = match env.convert_byte_array(&s3_key) {
+        Ok(b) => b,
+        Err(e) => { throw(&mut env, &e.to_string()); return -1; }
+    };
+    let data_bytes = match env.convert_byte_array(&data) {
+        Ok(b) => b,
+        Err(e) => { throw(&mut env, &e.to_string()); return -1; }
+    };
+    let token_bytes = match env.convert_byte_array(&token) {
+        Ok(b) => b,
+        Err(e) => { throw(&mut env, &e.to_string()); return -1; }
+    };
+    match unsafe { server_ref(handle) }.handle_get(
+        &key_bytes, &data_bytes, &token_bytes, offset as usize,
+    ) {
+        Ok(written) => written as jlong,
+        Err(e) => { throw(&mut env, &e.to_string()); -1 }
     }
 }
