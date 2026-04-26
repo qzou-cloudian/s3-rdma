@@ -1,6 +1,20 @@
 use crate::error::RdmaError;
 
-// ── Completion callback ──────────────────────────────────────────────────────
+/// Convert the `x-amz-rdma-reply` numeric status to a callback `error_code`.
+///
+/// - `0`         → `-1` (absent header — treated as error, avoids `0` == success confusion)
+/// - `200..300`  → `0`  (RDMA success)
+/// - other       → status cast to `i32` (e.g. `501` for RDMA fallback)
+pub fn rdma_status_to_error_code(rdma_status: u16) -> i32 {
+    if rdma_status != 0 && (200..300).contains(&rdma_status) {
+        0
+    } else if rdma_status == 0 {
+        -1
+    } else {
+        rdma_status as i32
+    }
+}
+
 
 /// Result delivered when an RDMA operation completes.
 #[derive(Debug)]
@@ -125,17 +139,10 @@ pub trait RdmaProvider: Send + Sync {
         _transferred: usize,
         callback: RdmaCompletionCallback,
     ) -> Result<(), RdmaError> {
-        // rdma_status == 0 means the reply header was absent — treat as an error.
-        // Cast to i32 first: 0u16 as i32 == 0 which callers would wrongly interpret
-        // as success, so map the "absent header" case to -1 explicitly.
-        let error_code = if rdma_status != 0 && (200..300).contains(&rdma_status) {
-            0i32
-        } else if rdma_status == 0 {
-            -1i32 // missing reply header
-        } else {
-            rdma_status as i32
-        };
-        callback(RdmaCompletionResult { error_code, reply_token: vec![] });
+        callback(RdmaCompletionResult {
+            error_code: rdma_status_to_error_code(rdma_status),
+            reply_token: vec![],
+        });
         Ok(())
     }
 

@@ -39,6 +39,8 @@ const SHM_DIR: &str = "/dev/shm";
 
 fn env_or(var: &str, default: &'static str) -> &'static str {
     match std::env::var(var) {
+        // Box::leak is intentional: the value is read once at startup and lives
+        // for the process lifetime — equivalent cost to a static string.
         Ok(v) if !v.is_empty() => Box::leak(v.into_boxed_str()),
         _ => default,
     }

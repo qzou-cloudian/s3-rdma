@@ -190,9 +190,7 @@ unsafe extern "C" fn c_prepare_put_token(
             0
         }
         Err(e) => {
-            let key = if s3_key.is_null() { b"?" as &[u8] } else {
-                unsafe { (*s3_key).as_slice() }
-            };
+            let key = unsafe { (*s3_key).as_slice() };
             eprintln!("[s3-rdma-cuobj] prepare_put_token({}): {e:?}",
                       String::from_utf8_lossy(key));
             -1
@@ -218,9 +216,7 @@ unsafe extern "C" fn c_prepare_get_token(
             0
         }
         Err(e) => {
-            let key = if s3_key.is_null() { b"?" as &[u8] } else {
-                unsafe { (*s3_key).as_slice() }
-            };
+            let key = unsafe { (*s3_key).as_slice() };
             eprintln!("[s3-rdma-cuobj] prepare_get_token({}): {e:?}",
                       String::from_utf8_lossy(key));
             -1

@@ -66,7 +66,7 @@ pub type RdmaCompletionFn = unsafe extern "C" fn(
 ///
 /// A plugin `cdylib` must export:
 /// ```c
-/// const RdmaProviderVtable *hsc_rdma_provider_get_vtable(void);
+/// const RdmaProviderVtable *s3_rdma_provider_get_vtable(void);
 /// ```
 ///
 /// Function pointers may be `None`/null if the operation is not supported.
@@ -128,7 +128,7 @@ unsafe impl Sync for RdmaProviderVtable {}
 ///
 /// Every RDMA provider `.so` must export:
 /// ```c
-/// const RdmaProviderVtable *hsc_rdma_provider_get_vtable(void);
+/// const RdmaProviderVtable *s3_rdma_provider_get_vtable(void);
 /// ```
 pub type GetVtableFn = unsafe extern "C" fn() -> *const RdmaProviderVtable;
 

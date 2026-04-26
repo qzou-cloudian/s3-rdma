@@ -99,6 +99,7 @@ unsafe extern "C" fn c_prepare_get_token(
     }
 }
 
+#[allow(deprecated)]
 unsafe extern "C" fn c_process_reply_token(
     _: *mut c_void, reply: *const ByteCursor,
     user_data: *mut c_void, callback: Option<RdmaCompletionFn>,

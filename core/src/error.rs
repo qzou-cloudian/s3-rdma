@@ -4,10 +4,8 @@ use std::fmt;
 #[derive(Debug)]
 pub enum RdmaError {
     /// Memory registration failed.
-    #[allow(dead_code)]
     MemoryRegistrationFailed { ptr: usize, size: usize, reason: String },
     /// Memory deregistration failed.
-    #[allow(dead_code)]
     MemoryDeregistrationFailed { ptr: usize, reason: String },
     /// Memory is not suitable for RDMA.
     MemoryNotSuitable { ptr: usize, size: usize },

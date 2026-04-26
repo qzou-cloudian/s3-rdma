@@ -20,7 +20,6 @@ mod real {
     use crate::ffi::{ByteCursor, GetServerVtableFn, RdmaServerInitParams, RdmaServerVtable};
     use crate::provider::RdmaServerProvider;
     use super::RdmaServerConfig;
-    use libc;
 
     const LIB_NAME_COMBINED: &str = "libs3rdmacuobj.so";
     const LIB_NAME: &str = "libs3_rdma_cuobj_server.so";

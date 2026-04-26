@@ -73,10 +73,6 @@ use std::sync::Arc;
 
 pub use error::RdmaError;
 
-/// Minimum buffer size (bytes) considered suitable for RDMA by the mock provider.
-#[allow(dead_code)]
-pub const RDMA_MIN_BUFFER_SIZE: usize = 1024 * 1024; // 1 MiB
-
 /// Returns a one-line summary of compiled-in RDMA providers and their runtime
 /// availability, e.g. `"RDMA providers: cuobj (available), mock"`.
 pub fn rdma_provider_info() -> String {
