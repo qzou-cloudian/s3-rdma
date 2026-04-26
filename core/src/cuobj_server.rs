@@ -159,7 +159,7 @@ mod real {
             let mut transferred: usize = 0;
             let rc = unsafe {
                 f(self.ctx, &key_cursor, &token_cursor,
-                  buf.as_mut_ptr(), buf.len(), offset, size, &mut transferred)
+                  buf.as_mut_ptr(), offset, size, &mut transferred)
             };
             if rc != 0 {
                 return Err(RdmaError::TransferFailed(

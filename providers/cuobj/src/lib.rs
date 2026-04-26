@@ -304,7 +304,6 @@ unsafe extern "C" fn sv_handle_put(
     s3_key:          *const ByteCursor,
     token:           *const ByteCursor,
     buf:             *mut u8,
-    buf_cap:         usize,
     offset:          usize,
     size:            usize,
     out_transferred: *mut usize,
@@ -334,10 +333,11 @@ unsafe extern "C" fn sv_handle_put(
 
     match guard.server_handle_put(key_str, offset, n, token_str) {
         Ok(transferred) => {
-            let copy_n = transferred.min(buf_cap);
+            // SAFETY: caller guarantees buf has capacity >= guard.len() >= transferred
+            // (both pools are configured to the same rdma_buffer_size).
             unsafe {
-                std::ptr::copy_nonoverlapping(guard.as_slice().as_ptr(), buf, copy_n);
-                *out_transferred = copy_n;
+                std::ptr::copy_nonoverlapping(guard.as_slice().as_ptr(), buf, transferred);
+                *out_transferred = transferred;
             }
             0
         }

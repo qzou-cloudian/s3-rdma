@@ -183,15 +183,18 @@ pub struct RdmaServerVtable {
     ///
     /// `offset=0, size=0` means "read the full buffer as described by the token".
     ///
-    /// On success copies the received bytes into the caller-provided buffer
-    /// `buf[..buf_cap]` and writes the byte count into `*out_transferred`.
+    /// On success copies the received bytes into the caller-provided buffer `buf`
+    /// and writes the byte count into `*out_transferred`.
+    ///
+    /// The plugin guarantees `*out_transferred <= plugin_pool_slot_size`.  The
+    /// caller must ensure `buf` is at least `plugin_pool_slot_size` bytes (i.e.
+    /// both pools are configured to the same `rdma_buffer_size`).
     /// Returns 0 on success, non-zero on failure.
     pub handle_put: Option<unsafe extern "C" fn(
         ctx:             *mut c_void,
         s3_key:          *const ByteCursor,
         token:           *const ByteCursor,
         buf:             *mut u8,
-        buf_cap:         usize,
         offset:          usize,
         size:            usize,
         out_transferred: *mut usize,
