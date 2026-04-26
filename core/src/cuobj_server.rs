@@ -140,38 +140,33 @@ mod real {
 
         /// Delegates to the plugin's `handle_put` vtable entry.
         ///
-        /// The plugin performs a cuObject `RDMA_READ` from the client's buffer,
-        /// copies the transferred bytes into a pool slot, and returns them as a
-        /// heap-allocated `ByteCursor`.  This wrapper reclaims that allocation.
+        /// The plugin performs a cuObject `RDMA_READ` from the client's buffer
+        /// into its internal pool slot, then copies the transferred bytes into
+        /// the caller-provided `buf`.  Returns the number of bytes written.
         fn handle_put(
             &self,
             s3_key: &[u8],
             token: &[u8],
+            buf: &mut [u8],
             offset: usize,
             size: usize,
-        ) -> Result<Vec<u8>, RdmaError> {
+        ) -> Result<usize, RdmaError> {
             let f = self.vtable().handle_put.ok_or_else(|| {
                 RdmaError::TransferFailed("handle_put not implemented in plugin".into())
             })?;
             let key_cursor   = ByteCursor::from_slice(s3_key);
             let token_cursor = ByteCursor::from_slice(token);
-            let mut out      = ByteCursor::null();
-            let rc = unsafe { f(self.ctx, &key_cursor, &token_cursor, offset, size, &mut out) };
+            let mut transferred: usize = 0;
+            let rc = unsafe {
+                f(self.ctx, &key_cursor, &token_cursor,
+                  buf.as_mut_ptr(), buf.len(), offset, size, &mut transferred)
+            };
             if rc != 0 {
                 return Err(RdmaError::TransferFailed(
                     format!("cuobj server handle_put returned {rc}")
                 ));
             }
-            // SAFETY: plugin is a cdylib and allocates via glibc malloc (not
-            // mimalloc).  Using Box::from_raw here would cause an allocator
-            // mismatch and SIGSEGV.  Use libc::free instead.
-            let data = unsafe {
-                let slice = std::slice::from_raw_parts(out.ptr, out.len);
-                let v = slice.to_vec();
-                libc::free(out.ptr as *mut libc::c_void);
-                v
-            };
-            Ok(data)
+            Ok(transferred)
         }
 
         /// Delegates to the plugin's `handle_get` vtable entry.

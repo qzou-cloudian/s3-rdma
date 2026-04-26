@@ -306,12 +306,19 @@ pub extern "system" fn Java_io_s3rdma_MockRdmaServerProvider_nativeHandlePut(
         Ok(b) => b,
         Err(e) => { throw(&mut env, &e.to_string()); return std::ptr::null_mut(); }
     };
+    let buf_cap = if size > 0 { size as usize } else {
+        unsafe { server_ref(handle) }.buf_size().min(128 * 1024 * 1024)
+    };
+    let mut buf = vec![0u8; buf_cap];
     match unsafe { server_ref(handle) }.handle_put(
-        &key_bytes, &token_bytes, offset as usize, size as usize,
+        &key_bytes, &token_bytes, &mut buf, offset as usize, size as usize,
     ) {
-        Ok(data) => env.byte_array_from_slice(&data)
-            .map(|a| a.into_raw())
-            .unwrap_or(std::ptr::null_mut()),
+        Ok(n) => {
+            buf.truncate(n);
+            env.byte_array_from_slice(&buf)
+                .map(|a| a.into_raw())
+                .unwrap_or(std::ptr::null_mut())
+        }
         Err(e) => { throw(&mut env, &e.to_string()); std::ptr::null_mut() }
     }
 }

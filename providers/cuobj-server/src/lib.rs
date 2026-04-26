@@ -101,22 +101,22 @@ unsafe extern "C" fn c_cleanup(_ctx: *mut c_void) {
 }
 
 /// RDMA PUT: perform a cuObject `RDMA_READ` from the client's registered buffer
-/// into a pool slot, then return the transferred bytes to the Rust layer.
+/// into a pool slot, then copy the transferred bytes into the caller-provided buffer.
 ///
-/// `*out_data` is set to a heap-allocated slice on success.  The caller must
-/// free it via `libc::free` — **not** `Box::from_raw` — because this cdylib
-/// uses the system allocator (glibc malloc) while the caller may use a
-/// different Rust global allocator (e.g. mimalloc).
-/// Returns 0 on success, -1 on error (buffer too small, RDMA failure, etc.).
+/// `buf[..buf_cap]` is supplied by the caller (hsg's pre-allocated pool slot).
+/// `*out_transferred` is set to the number of bytes copied on success.
+/// Returns 0 on success, -1 on error.
 unsafe extern "C" fn c_handle_put(
-    _ctx:     *mut c_void,
-    s3_key:   *const ByteCursor,
-    token:    *const ByteCursor,
-    offset:   usize,
-    size:     usize,
-    out_data: *mut ByteCursor,
+    _ctx:            *mut c_void,
+    s3_key:          *const ByteCursor,
+    token:           *const ByteCursor,
+    buf:             *mut u8,
+    buf_cap:         usize,
+    offset:          usize,
+    size:            usize,
+    out_transferred: *mut usize,
 ) -> i32 {
-    if s3_key.is_null() || token.is_null() || out_data.is_null() { return -1; }
+    if s3_key.is_null() || token.is_null() || buf.is_null() || out_transferred.is_null() { return -1; }
     let Some(p) = get_provider() else { return -1; };
 
     let key_bytes   = unsafe { (*s3_key).as_slice() };
@@ -141,11 +141,11 @@ unsafe extern "C" fn c_handle_put(
 
     match guard.server_handle_put(key_str, offset, n, token_str) {
         Ok(transferred) => {
-            // Allocate directly as Box<[u8]> — avoids the intermediate Vec.
-            let boxed: Box<[u8]> = guard.as_slice()[..transferred].into();
-            let len = boxed.len();
-            let ptr = Box::into_raw(boxed) as *const u8;
-            unsafe { *out_data = ByteCursor { ptr, len }; }
+            let copy_n = transferred.min(buf_cap);
+            unsafe {
+                std::ptr::copy_nonoverlapping(guard.as_slice().as_ptr(), buf, copy_n);
+                *out_transferred = copy_n;
+            }
             0
         }
         Err(e) => {

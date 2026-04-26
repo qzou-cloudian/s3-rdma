@@ -257,20 +257,21 @@ pub trait RdmaServerProvider: Send + Sync {
     /// within that buffer (semantics: RDMA_READ).
     ///
     /// `s3_key` is the object path; `token` is the raw value of the
-    /// `x-amz-rdma-token` request header; `offset` is the start position
-    /// within the client's buffer; `size` is the number of bytes to read
-    /// (0 = read the full buffer as described by the token, only valid when
-    /// `offset == 0`).
+    /// `x-amz-rdma-token` request header; `buf` is the caller-provided buffer
+    /// to write the received data into; `offset` is the start position within
+    /// the client's buffer; `size` is the number of bytes to read (0 = read
+    /// the full buffer as described by the token, only valid when `offset == 0`).
     ///
-    /// Returns the received `data` for this chunk.  The HTTP handler drives
+    /// Returns the number of bytes written into `buf`.  The HTTP handler drives
     /// the loop and feeds each chunk to the storage backend directly.
     fn handle_put(
         &self,
         s3_key: &[u8],
         token: &[u8],
+        buf: &mut [u8],
         offset: usize,
         size: usize,
-    ) -> Result<Vec<u8>, crate::RdmaError>;
+    ) -> Result<usize, crate::RdmaError>;
 
     /// Handle an RDMA GET from a client: write `data` into the client's
     /// registered buffer identified by `token`, starting at byte `offset`

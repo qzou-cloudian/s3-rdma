@@ -183,16 +183,18 @@ pub struct RdmaServerVtable {
     ///
     /// `offset=0, size=0` means "read the full buffer as described by the token".
     ///
-    /// On success writes the received bytes into `*out_data` (plugin allocates
-    /// with `Box::into_raw`; caller frees with `Box::from_raw`).
+    /// On success copies the received bytes into the caller-provided buffer
+    /// `buf[..buf_cap]` and writes the byte count into `*out_transferred`.
     /// Returns 0 on success, non-zero on failure.
     pub handle_put: Option<unsafe extern "C" fn(
-        ctx:      *mut c_void,
-        s3_key:   *const ByteCursor,
-        token:    *const ByteCursor,
-        offset:   usize,
-        size:     usize,
-        out_data: *mut ByteCursor,
+        ctx:             *mut c_void,
+        s3_key:          *const ByteCursor,
+        token:           *const ByteCursor,
+        buf:             *mut u8,
+        buf_cap:         usize,
+        offset:          usize,
+        size:            usize,
+        out_transferred: *mut usize,
     ) -> i32>,
 
     /// Handle an RDMA GET: the server RDMA_WRITEs `data` into the client

@@ -300,14 +300,16 @@ unsafe extern "C" fn sv_init(params: *const RdmaServerInitParams, _ctx: *mut *mu
 unsafe extern "C" fn sv_cleanup(_ctx: *mut c_void) {}
 
 unsafe extern "C" fn sv_handle_put(
-    _ctx:     *mut c_void,
-    s3_key:   *const ByteCursor,
-    token:    *const ByteCursor,
-    offset:   usize,
-    size:     usize,
-    out_data: *mut ByteCursor,
+    _ctx:            *mut c_void,
+    s3_key:          *const ByteCursor,
+    token:           *const ByteCursor,
+    buf:             *mut u8,
+    buf_cap:         usize,
+    offset:          usize,
+    size:            usize,
+    out_transferred: *mut usize,
 ) -> i32 {
-    if s3_key.is_null() || token.is_null() || out_data.is_null() { return -1; }
+    if s3_key.is_null() || token.is_null() || buf.is_null() || out_transferred.is_null() { return -1; }
     let Some(p) = get_server() else { return -1; };
 
     let key_bytes   = unsafe { (*s3_key).as_slice() };
@@ -332,10 +334,11 @@ unsafe extern "C" fn sv_handle_put(
 
     match guard.server_handle_put(key_str, offset, n, token_str) {
         Ok(transferred) => {
-            let boxed: Box<[u8]> = guard.as_slice()[..transferred].into();
-            let len = boxed.len();
-            let ptr = Box::into_raw(boxed) as *const u8;
-            unsafe { *out_data = ByteCursor { ptr, len }; }
+            let copy_n = transferred.min(buf_cap);
+            unsafe {
+                std::ptr::copy_nonoverlapping(guard.as_slice().as_ptr(), buf, copy_n);
+                *out_transferred = copy_n;
+            }
             0
         }
         Err(e) => {

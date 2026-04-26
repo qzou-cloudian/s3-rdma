@@ -447,9 +447,10 @@ impl RdmaServerProvider for MockRdmaServerProvider {
         &self,
         _s3_key: &[u8],
         token: &[u8],
+        buf: &mut [u8],
         offset: usize,
         size: usize,
-    ) -> Result<Vec<u8>, RdmaError> {
+    ) -> Result<usize, RdmaError> {
         let (op, shm_name, token_size, _token_offset) = Self::parse_token(token)?;
         if op != "PUT" {
             return Err(RdmaError::TransferFailed(format!(
@@ -466,7 +467,10 @@ impl RdmaServerProvider for MockRdmaServerProvider {
 
         let start = offset.min(file_bytes.len());
         let end = (offset + read_size).min(file_bytes.len());
-        Ok(file_bytes[start..end].to_vec())
+        let slice = &file_bytes[start..end];
+        let n = slice.len().min(buf.len());
+        buf[..n].copy_from_slice(&slice[..n]);
+        Ok(n)
     }
 
     /// RDMA GET: write `data` into `/dev/shm/{shm-name}` at `token_base + offset`.
