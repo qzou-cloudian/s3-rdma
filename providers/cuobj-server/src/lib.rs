@@ -103,8 +103,10 @@ unsafe extern "C" fn c_cleanup(_ctx: *mut c_void) {
 /// RDMA PUT: perform a cuObject `RDMA_READ` from the client's registered buffer
 /// into a pool slot, then return the transferred bytes to the Rust layer.
 ///
-/// `*out_data` is set to a heap-allocated slice on success; the caller must
-/// free it via `ByteCursor::free` (or `Box::from_raw`).
+/// `*out_data` is set to a heap-allocated slice on success.  The caller must
+/// free it via `libc::free` — **not** `Box::from_raw` — because this cdylib
+/// uses the system allocator (glibc malloc) while the caller may use a
+/// different Rust global allocator (e.g. mimalloc).
 /// Returns 0 on success, -1 on error (buffer too small, RDMA failure, etc.).
 unsafe extern "C" fn c_handle_put(
     _ctx:     *mut c_void,

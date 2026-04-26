@@ -257,6 +257,43 @@ mod real {
             Ok(token)
         }
 
+        /// Override the default `process_rdma_reply` to deregister the MR via
+        /// `c_process_reply_token(request_token)` on RDMA success (2xx).
+        ///
+        /// The default trait implementation only uses `rdma_status` to decide
+        /// success/failure; it never touches the C vtable's `process_reply_token`
+        /// function, so the cuobj pending map entry (keyed by the token bytes)
+        /// would never be removed.  This override passes the **request** token
+        /// (not the reply header value) to `c_process_reply_token` so the
+        /// `RegisteredBuffer` RAII guard is dropped and the MR is deregistered
+        /// between multipart parts.
+        fn process_rdma_reply(
+            &self,
+            rdma_status: u16,
+            request_token: &[u8],
+            _transferred: usize,
+            callback: RdmaCompletionCallback,
+        ) -> Result<(), RdmaError> {
+            // Deregister the MR when the server confirms RDMA success.
+            if (200..300).contains(&rdma_status) {
+                if let Some(f) = self.vtable().process_reply_token {
+                    let cursor = ByteCursor::from_slice(request_token);
+                    // Pass null user_data and no callback — we only need the cleanup.
+                    unsafe { f(self.ctx, &cursor, std::ptr::null_mut(), None); }
+                }
+            }
+            let error_code = if rdma_status != 0 && (200..300).contains(&rdma_status) {
+                0i32
+            } else if rdma_status == 0 {
+                -1i32 // absent reply header
+            } else {
+                rdma_status as i32
+            };
+            callback(RdmaCompletionResult { error_code, reply_token: vec![] });
+            Ok(())
+        }
+
+        #[allow(deprecated)]
         fn process_reply_token(
             &self, reply_token: &[u8], callback: RdmaCompletionCallback,
         ) -> Result<(), RdmaError> {

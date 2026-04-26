@@ -20,6 +20,7 @@ mod real {
     use crate::ffi::{ByteCursor, GetServerVtableFn, RdmaServerInitParams, RdmaServerVtable};
     use crate::provider::RdmaServerProvider;
     use super::RdmaServerConfig;
+    use libc;
 
     const LIB_NAME_COMBINED: &str = "libs3rdmacuobj.so";
     const LIB_NAME: &str = "libs3_rdma_cuobj_server.so";
@@ -162,13 +163,13 @@ mod real {
                     format!("cuobj server handle_put returned {rc}")
                 ));
             }
-            // SAFETY: plugin allocates via Box::into_raw; we reclaim it here.
+            // SAFETY: plugin is a cdylib and allocates via glibc malloc (not
+            // mimalloc).  Using Box::from_raw here would cause an allocator
+            // mismatch and SIGSEGV.  Use libc::free instead.
             let data = unsafe {
                 let slice = std::slice::from_raw_parts(out.ptr, out.len);
                 let v = slice.to_vec();
-                drop(Box::from_raw(
-                    std::ptr::slice_from_raw_parts_mut(out.ptr as *mut u8, out.len)
-                ));
+                libc::free(out.ptr as *mut libc::c_void);
                 v
             };
             Ok(data)
