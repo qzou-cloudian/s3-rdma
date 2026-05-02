@@ -18,7 +18,6 @@ mod real {
     use libloading::{Library, Symbol};
     use crate::error::RdmaError;
     use crate::ffi::{ByteCursor, GetServerVtableFn, RdmaServerInitParams, RdmaServerVtable};
-    use crate::provider::RdmaServerProvider;
     use super::RdmaServerConfig;
 
     const LIB_NAME_COMBINED: &str = "libs3rdmacuobj.so";
@@ -123,10 +122,8 @@ mod real {
         }
     }
 
-    impl RdmaServerProvider for CuObjServerProvider {
-        fn name(&self) -> &str {
-            // Read the provider name from the vtable's static C string.
-            // Falls back to the compile-time constant if the pointer is null.
+    impl CuObjServerProvider {
+        pub fn name(&self) -> &str {
             let ptr = self.vtable().provider_name;
             if ptr.is_null() {
                 return "CuObjServerProvider";
@@ -136,14 +133,14 @@ mod real {
                 .unwrap_or("CuObjServerProvider")
         }
 
-        fn buf_size(&self) -> usize { self.buf_size }
+        pub fn buf_size(&self) -> usize { self.buf_size }
 
         /// Delegates to the plugin's `handle_put` vtable entry.
         ///
         /// The plugin performs a cuObject `RDMA_READ` from the client's buffer
         /// into its internal pool slot, then copies the transferred bytes into
         /// the caller-provided `buf`.  Returns the number of bytes written.
-        fn handle_put(
+        pub fn handle_put(
             &self,
             s3_key: &[u8],
             token: &[u8],
@@ -174,7 +171,7 @@ mod real {
         /// Copies `data` into a pool slot and performs a cuObject `RDMA_WRITE`
         /// into the client's registered buffer via `token`.  Returns the number
         /// of bytes successfully written.
-        fn handle_get(
+        pub fn handle_get(
             &self,
             s3_key: &[u8],
             data: &[u8],

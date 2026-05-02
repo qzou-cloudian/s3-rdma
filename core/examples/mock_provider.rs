@@ -1,16 +1,15 @@
-//! Example: s3-rdma provider API using MockRdmaProvider (no hardware required).
+//! Example: s3-rdma endpoint API using MockRdmaEndpoint (no hardware required).
 //!
 //! Run with:
 //!   cargo run --example mock_provider --manifest-path s3-rdma/Cargo.toml
 
-use s3_rdma::{rdma_provider_info, MockRdmaProvider, RdmaProvider};
+use s3_rdma::{rdma_provider_info, MockRdmaEndpoint, RdmaEndpoint};
 
 fn main() {
     println!("=== s3-rdma Rust example ===\n");
 
-    let provider = MockRdmaProvider::new(true);
+    let provider = MockRdmaEndpoint::new(true, "/dev/shm", 0);
     println!("Provider : {}", provider.name());
-    println!("Version  : {}", provider.version());
 
     // Allocate a buffer to act as the RDMA-registered memory region.
     let mut data = vec![42u8; 1024 * 1024]; // 1 MiB
@@ -34,10 +33,12 @@ fn main() {
         .unwrap();
     println!("  token: {}", String::from_utf8_lossy(&get_token));
 
-    println!("\n[process_reply_token]");
+    println!("\n[process_rdma_reply]");
     provider
-        .process_reply_token(
-            b"mock-server-reply-ok",
+        .process_rdma_reply(
+            200,
+            &put_token,
+            data.len(),
             Box::new(|result| {
                 println!(
                     "  callback: error_code={}, reply={}",
@@ -50,6 +51,9 @@ fn main() {
 
     println!("\n[deregister_memory]");
     provider.deregister_memory(data.as_mut_ptr()).unwrap();
+
+    // Clean up the GET token's shm entry (no server to handle it).
+    let _ = get_token;
 
     println!("\nProvider info: {}", rdma_provider_info());
     println!("\nDone.");

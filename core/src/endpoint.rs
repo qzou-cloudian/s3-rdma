@@ -23,8 +23,6 @@
 //! - [`CuObjEndpoint`](crate::cuobj_client::CuObjEndpoint) – real NVIDIA cuObject;
 //!   each role requires the corresponding plugin to be loadable at runtime.
 //!
-//! [`RdmaProvider`]: crate::provider::RdmaProvider
-//! [`RdmaServerProvider`]: crate::provider::RdmaServerProvider
 //! [`supports_client`]: RdmaEndpoint::supports_client
 //! [`supports_server`]: RdmaEndpoint::supports_server
 

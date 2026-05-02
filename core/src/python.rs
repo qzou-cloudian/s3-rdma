@@ -1,6 +1,6 @@
 //! Python bindings for `s3-rdma` via PyO3.
 //!
-//! Exposes [`MockRdmaProvider`] as `s3_rdma.MockRdmaProvider` to Python.
+//! Exposes [`MockRdmaEndpoint`] as `s3_rdma.MockRdmaEndpoint` to Python.
 //! Build with maturin from the `python/` directory:
 //!
 //! ```sh
@@ -11,12 +11,12 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use crate::mock::MockRdmaProvider;
-use crate::provider::RdmaProvider;
+use crate::mock::MockRdmaEndpoint;
+use crate::endpoint::RdmaEndpoint;
 
-// ── MockRdmaProvider Python class ─────────────────────────────────────────────
+// ── MockRdmaEndpoint Python class ─────────────────────────────────────────────
 
-/// Mock RDMA provider — no NVIDIA hardware required.
+/// Mock RDMA endpoint — no NVIDIA hardware required.
 ///
 /// Generates deterministic token strings suitable for testing the S3 RDMA
 /// upload/download path end-to-end without physical RDMA hardware.
@@ -24,33 +24,28 @@ use crate::provider::RdmaProvider;
 /// Example::
 ///
 ///     import s3_rdma
-///     p = s3_rdma.MockRdmaProvider(debug=True)
+///     p = s3_rdma.MockRdmaEndpoint(debug=True)
 ///     token = p.prepare_put_token(data, 0, len(data), b"bucket/key")
-///     p.process_reply_token(b"server-reply", lambda code, reply: print(code))
-#[pyclass(name = "MockRdmaProvider")]
-pub struct PyMockRdmaProvider {
-    inner: MockRdmaProvider,
+///     p.process_rdma_reply(200, token, len(data), lambda code, reply: print(code))
+#[pyclass(name = "MockRdmaEndpoint")]
+pub struct PyMockRdmaEndpoint {
+    inner: MockRdmaEndpoint,
 }
 
 #[pymethods]
-impl PyMockRdmaProvider {
-    /// Create a new MockRdmaProvider.
+impl PyMockRdmaEndpoint {
+    /// Create a new MockRdmaEndpoint.
     ///
     /// :param debug: if ``True``, print trace lines to stderr.
     #[new]
     #[pyo3(signature = (debug = false))]
     fn new(debug: bool) -> Self {
-        Self { inner: MockRdmaProvider::new(debug) }
+        Self { inner: MockRdmaEndpoint::new(debug, "/dev/shm", 0) }
     }
 
-    /// Human-readable provider name.
+    /// Human-readable endpoint name.
     fn name(&self) -> &str {
         self.inner.name()
-    }
-
-    /// Numeric provider version.
-    fn version(&self) -> u32 {
-        self.inner.version()
     }
 
     /// Returns ``True`` if the buffer at ``ptr`` of ``size`` bytes is RDMA-eligible.
@@ -125,26 +120,29 @@ impl PyMockRdmaProvider {
         Ok(PyBytes::new_bound(py, &token))
     }
 
-    /// Process the ``x-amz-rdma-reply`` token returned by the S3 server.
+    /// Process the ``x-amz-rdma-reply`` status returned by the S3 server.
     ///
     /// Calls ``callback(error_code: int, reply_token: bytes)`` synchronously.
     ///
-    /// :param reply_token: the reply bytes from the response header.
-    /// :param callback:    callable invoked with ``(error_code, reply_token)``.
-    fn process_reply_token(
+    /// :param rdma_status:    numeric status from the response header (200/204/206 = success, 501 = fallback).
+    /// :param request_token:  the original request token bytes.
+    /// :param transferred:    number of bytes transferred (from ``x-amz-rdma-bytes``).
+    /// :param callback:       callable invoked with ``(error_code, reply_token)``.
+    fn process_rdma_reply(
         &self,
-        reply_token: &[u8],
+        rdma_status: u16,
+        request_token: &[u8],
+        transferred: usize,
         callback: PyObject,
     ) -> PyResult<()> {
         self.inner
-            .process_reply_token(
-                reply_token,
+            .process_rdma_reply(
+                rdma_status,
+                request_token,
+                transferred,
                 Box::new(move |result| {
                     Python::with_gil(|py| {
-                        let _ = callback.call1(
-                            py,
-                            (result.error_code, result.reply_token.as_slice()),
-                        );
+                        let _ = callback.call1(py, (result.error_code, result.reply_token.as_slice()));
                     });
                 }),
             )
@@ -152,7 +150,7 @@ impl PyMockRdmaProvider {
     }
 
     fn __repr__(&self) -> String {
-        format!("MockRdmaProvider(name={})", self.inner.name())
+        format!("MockRdmaEndpoint(name={})", self.inner.name())
     }
 }
 
@@ -166,7 +164,7 @@ fn rdma_provider_info() -> String {
 
 #[pymodule]
 fn s3_rdma(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PyMockRdmaProvider>()?;
+    m.add_class::<PyMockRdmaEndpoint>()?;
     m.add_function(wrap_pyfunction!(rdma_provider_info, m)?)?;
     Ok(())
 }

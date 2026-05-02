@@ -20,7 +20,7 @@ mod real {
     use crate::error::RdmaError;
     use crate::ffi::{ByteCursor, GetVtableFn, RdmaCompletionFn, RdmaProviderVtable};
     use crate::provider::{
-        RdmaCompletionCallback, RdmaCompletionResult, RdmaProvider,
+        RdmaCompletionCallback, RdmaCompletionResult,
         rdma_status_to_error_code,
     };
 
@@ -157,18 +157,18 @@ mod real {
         }
     }
 
-    // ── RdmaProvider impl ─────────────────────────────────────────────────────
+    // ── Direct methods ────────────────────────────────────────────────────────
 
-    impl RdmaProvider for CuObjClientProvider {
-        fn name(&self)    -> &str { "CuObjClientProvider" }
-        fn version(&self) -> u32  { unsafe { (*self.vtable).provider_version } }
+    impl CuObjClientProvider {
+        pub fn name(&self)    -> &str { "CuObjClientProvider" }
+        pub fn version(&self) -> u32  { unsafe { (*self.vtable).provider_version } }
 
-        fn is_memory_suitable(&self, ptr: *const u8, size: usize) -> bool {
+        pub fn is_memory_suitable(&self, ptr: *const u8, size: usize) -> bool {
             let Some(f) = self.vtable().is_memory_suitable else { return false; };
             unsafe { f(self.ctx, ptr as *const c_void, size) }
         }
 
-        fn register_memory(&self, ptr: *mut u8, size: usize) -> Result<(), RdmaError> {
+        pub fn register_memory(&self, ptr: *mut u8, size: usize) -> Result<(), RdmaError> {
             let Some(f) = self.vtable().register_memory else { return Ok(()); };
             let rc = unsafe { f(self.ctx, ptr as *mut c_void, size) };
             if rc != 0 {
@@ -179,7 +179,7 @@ mod real {
             } else { Ok(()) }
         }
 
-        fn deregister_memory(&self, ptr: *mut u8) -> Result<(), RdmaError> {
+        pub fn deregister_memory(&self, ptr: *mut u8) -> Result<(), RdmaError> {
             let Some(f) = self.vtable().deregister_memory else { return Ok(()); };
             let rc = unsafe { f(self.ctx, ptr as *mut c_void) };
             if rc != 0 {
@@ -190,13 +190,13 @@ mod real {
             } else { Ok(()) }
         }
 
-        fn get_max_transfer_size(&self, ptr: *const u8) -> usize {
+        pub fn get_max_transfer_size(&self, ptr: *const u8) -> usize {
             let Some(f) = self.vtable().get_max_transfer_size else { return usize::MAX; };
             let v = unsafe { f(self.ctx, ptr as *const c_void) };
             if v == 0 { usize::MAX } else { v }
         }
 
-        fn prepare_put_token(
+        pub fn prepare_put_token(
             &self, s3_key: &[u8], buffer: *const u8, size: usize, offset: usize,
         ) -> Result<Vec<u8>, RdmaError> {
             let Some(f) = self.vtable().prepare_put_token else {
@@ -229,7 +229,7 @@ mod real {
             Ok(token)
         }
 
-        fn prepare_get_token(
+        pub fn prepare_get_token(
             &self, s3_key: &[u8], buffer: *mut u8, size: usize, offset: usize,
         ) -> Result<Vec<u8>, RdmaError> {
             let Some(f) = self.vtable().prepare_get_token else {
@@ -260,17 +260,12 @@ mod real {
             Ok(token)
         }
 
-        /// Override the default `process_rdma_reply` to deregister the MR via
-        /// `c_process_reply_token(request_token)` regardless of RDMA status.
+        /// Process the `x-amz-rdma-reply` status code returned by the S3 server.
         ///
-        /// The default trait implementation only uses `rdma_status` to decide
-        /// success/failure; it never touches the C vtable's `process_reply_token`
-        /// function, so the cuobj pending map entry (keyed by the token bytes)
-        /// would never be removed.  This override passes the **request** token
-        /// (not the reply header value) to `c_process_reply_token` so the
-        /// `RegisteredBuffer` RAII guard is dropped and the MR is deregistered
-        /// when the server replies — whether successfully or with an error.
-        fn process_rdma_reply(
+        /// Always deregisters the MR via `c_process_reply_token(request_token)`
+        /// regardless of RDMA status, so the cuobj pending map entry is removed
+        /// when the server replies.
+        pub fn process_rdma_reply(
             &self,
             rdma_status: u16,
             request_token: &[u8],
@@ -290,35 +285,7 @@ mod real {
             Ok(())
         }
 
-        #[allow(deprecated)]
-        fn process_reply_token(
-            &self, reply_token: &[u8], callback: RdmaCompletionCallback,
-        ) -> Result<(), RdmaError> {
-            let Some(f) = self.vtable().process_reply_token else {
-                // No-op: just fire the callback with success.
-                callback(RdmaCompletionResult { error_code: 0, reply_token: reply_token.to_vec() });
-                return Ok(());
-            };
-            // Box the callback and pass it as user_data to the trampoline.
-            // The trampoline reclaims the Box; if rc != 0 we reclaim it here.
-            let cb_ptr = Box::into_raw(Box::new(callback));
-            let reply_cursor = ByteCursor::from_slice(reply_token);
-            let rc = unsafe {
-                f(self.ctx, &reply_cursor, cb_ptr as *mut c_void,
-                  Some(completion_trampoline as RdmaCompletionFn))
-            };
-            if rc != 0 {
-                // Callback was not invoked; reclaim the box.
-                unsafe { drop(Box::from_raw(cb_ptr)); }
-                Err(RdmaError::ReplyTokenProcessingFailed(
-                    format!("vtable process_reply_token returned {rc}")
-                ))
-            } else {
-                Ok(())
-            }
-        }
-
-        fn rdma_token_header_name(&self) -> &[u8] {
+        pub fn rdma_token_header_name(&self) -> &[u8] {
             let Some(f) = self.vtable().rdma_token_header_name else {
                 return crate::provider::RDMA_TOKEN_HEADER.as_bytes();
             };
@@ -330,7 +297,7 @@ mod real {
             unsafe { std::slice::from_raw_parts(cursor.ptr, cursor.len) }
         }
 
-        fn rdma_reply_header_name(&self) -> &[u8] {
+        pub fn rdma_reply_header_name(&self) -> &[u8] {
             let Some(f) = self.vtable().rdma_reply_header_name else {
                 return crate::provider::RDMA_REPLY_HEADER.as_bytes();
             };
@@ -472,7 +439,6 @@ impl crate::endpoint::RdmaEndpoint for CuObjEndpoint {
     fn is_memory_suitable(&self, ptr: *const u8, size: usize) -> bool {
         #[cfg(feature = "cuobj-client")]
         if let Some(c) = &self.client {
-            use crate::provider::RdmaProvider;
             return c.is_memory_suitable(ptr, size);
         }
         let _ = (ptr, size);
@@ -482,7 +448,6 @@ impl crate::endpoint::RdmaEndpoint for CuObjEndpoint {
     fn register_memory(&self, ptr: *mut u8, size: usize) -> Result<(), crate::RdmaError> {
         #[cfg(feature = "cuobj-client")]
         if let Some(c) = &self.client {
-            use crate::provider::RdmaProvider;
             return c.register_memory(ptr, size);
         }
         let _ = (ptr, size);
@@ -492,7 +457,6 @@ impl crate::endpoint::RdmaEndpoint for CuObjEndpoint {
     fn deregister_memory(&self, ptr: *mut u8) -> Result<(), crate::RdmaError> {
         #[cfg(feature = "cuobj-client")]
         if let Some(c) = &self.client {
-            use crate::provider::RdmaProvider;
             return c.deregister_memory(ptr);
         }
         let _ = ptr;
@@ -502,7 +466,6 @@ impl crate::endpoint::RdmaEndpoint for CuObjEndpoint {
     fn get_max_transfer_size(&self, ptr: *const u8) -> usize {
         #[cfg(feature = "cuobj-client")]
         if let Some(c) = &self.client {
-            use crate::provider::RdmaProvider;
             return c.get_max_transfer_size(ptr);
         }
         let _ = ptr;
@@ -518,7 +481,6 @@ impl crate::endpoint::RdmaEndpoint for CuObjEndpoint {
     ) -> Result<Vec<u8>, crate::RdmaError> {
         #[cfg(feature = "cuobj-client")]
         if let Some(c) = &self.client {
-            use crate::provider::RdmaProvider;
             return c.prepare_put_token(s3_key, buffer, size, offset);
         }
         let _ = (s3_key, buffer, size, offset);
@@ -534,7 +496,6 @@ impl crate::endpoint::RdmaEndpoint for CuObjEndpoint {
     ) -> Result<Vec<u8>, crate::RdmaError> {
         #[cfg(feature = "cuobj-client")]
         if let Some(c) = &self.client {
-            use crate::provider::RdmaProvider;
             return c.prepare_get_token(s3_key, buffer, size, offset);
         }
         let _ = (s3_key, buffer, size, offset);
@@ -550,7 +511,6 @@ impl crate::endpoint::RdmaEndpoint for CuObjEndpoint {
     ) -> Result<(), crate::RdmaError> {
         #[cfg(feature = "cuobj-client")]
         if let Some(c) = &self.client {
-            use crate::provider::RdmaProvider;
             return c.process_rdma_reply(rdma_status, request_token, transferred, callback);
         }
         let _ = (rdma_status, request_token, transferred);
@@ -566,7 +526,6 @@ impl crate::endpoint::RdmaEndpoint for CuObjEndpoint {
     fn rdma_token_header_name(&self) -> &[u8] {
         #[cfg(feature = "cuobj-client")]
         if let Some(c) = &self.client {
-            use crate::provider::RdmaProvider;
             return c.rdma_token_header_name();
         }
         crate::provider::RDMA_TOKEN_HEADER.as_bytes()
@@ -575,7 +534,6 @@ impl crate::endpoint::RdmaEndpoint for CuObjEndpoint {
     fn rdma_reply_header_name(&self) -> &[u8] {
         #[cfg(feature = "cuobj-client")]
         if let Some(c) = &self.client {
-            use crate::provider::RdmaProvider;
             return c.rdma_reply_header_name();
         }
         crate::provider::RDMA_REPLY_HEADER.as_bytes()
@@ -597,7 +555,6 @@ impl crate::endpoint::RdmaEndpoint for CuObjEndpoint {
     ) -> Result<usize, crate::RdmaError> {
         #[cfg(feature = "cuobj-server")]
         if let Some(s) = &self.server {
-            use crate::provider::RdmaServerProvider;
             return s.handle_put(s3_key, token, buf, offset, size);
         }
         let _ = (s3_key, token, buf, offset, size);
@@ -613,7 +570,6 @@ impl crate::endpoint::RdmaEndpoint for CuObjEndpoint {
     ) -> Result<usize, crate::RdmaError> {
         #[cfg(feature = "cuobj-server")]
         if let Some(s) = &self.server {
-            use crate::provider::RdmaServerProvider;
             return s.handle_get(s3_key, data, token, offset);
         }
         let _ = (s3_key, data, token, offset);
