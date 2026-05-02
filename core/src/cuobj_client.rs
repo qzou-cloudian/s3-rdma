@@ -1,12 +1,12 @@
 //! NVIDIA cuObject RDMA client provider via lazy runtime loading.
 //!
 //! Enabled by the `cuobj-client` Cargo feature.  At runtime `hsc` searches for
-//! the provider plugin (`libs3_rdma_cuobj_client.so`) and loads it on demand.
+//! the provider plugin (`libs3rdmacuobjclient.so`) and loads it on demand.
 //! The main `hsc` binary therefore has **no compile-time or ELF-level
 //! dependency** on `libcuobjclient.so` — the library is pulled in transitively
 //! when the plugin is dlopened.
 //!
-//! Search order for `libs3_rdma_cuobj_client.so`:
+//! Search order for `libs3rdmacuobjclient.so`:
 //! 1. Standard dynamic-linker paths (`LD_LIBRARY_PATH`, RPATH, ldconfig cache).
 //! 2. Directory containing the current executable.
 //! 3. `/lib64/`, `/usr/lib64/` (common CUDA/cuObject install locations).
@@ -26,36 +26,30 @@ mod real {
 
     // ── Library search ────────────────────────────────────────────────────────
 
-    /// Combined single-file provider (preferred).
-    const LIB_NAME_COMBINED: &str = "libs3rdmacuobj.so";
-    /// Legacy split client-only plugin (fallback).
-    const LIB_NAME: &str = "libs3_rdma_cuobj_client.so";
+    const LIB_NAME: &str = "libs3rdmacuobjclient.so";
 
     fn try_load(path: impl AsRef<std::ffi::OsStr>) -> Option<Library> {
         unsafe { Library::new(path) }.ok()
     }
 
     fn find_library() -> Option<Library> {
-        // Prefer the combined provider, fall back to the legacy client-only plugin.
-        // For each candidate name, search:
+        // Search order:
         //   1. Standard linker paths (LD_LIBRARY_PATH, RPATH, ldconfig)
         //   2. Directory alongside the running executable
         //   3. Common CUDA/cuObject install locations
-        for name in &[LIB_NAME_COMBINED, LIB_NAME] {
-            if let Some(lib) = try_load(name) {
-                return Some(lib);
-            }
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(dir) = exe.parent() {
-                    if let Some(lib) = try_load(dir.join(name)) {
-                        return Some(lib);
-                    }
-                }
-            }
-            for dir in &["/lib64", "/usr/lib64"] {
-                if let Some(lib) = try_load(format!("{dir}/{name}")) {
+        if let Some(lib) = try_load(LIB_NAME) {
+            return Some(lib);
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                if let Some(lib) = try_load(dir.join(LIB_NAME)) {
                     return Some(lib);
                 }
+            }
+        }
+        for dir in &["/lib64", "/usr/lib64"] {
+            if let Some(lib) = try_load(format!("{dir}/{LIB_NAME}")) {
+                return Some(lib);
             }
         }
         None
@@ -83,7 +77,7 @@ mod real {
 
     // ── CuObjClientProvider ───────────────────────────────────────────────────
 
-    /// RDMA client provider that loads `libs3_rdma_cuobj_client.so` at runtime
+    /// RDMA client provider that loads `libs3rdmacuobjclient.so` at runtime
     /// and calls through the exported [`RdmaProviderVtable`].
     pub struct CuObjClientProvider {
         // Order matters: ctx/vtable must be dropped (logically) before _lib
@@ -110,7 +104,7 @@ mod real {
         pub fn new() -> Result<Self, RdmaError> {
             let lib = find_library().ok_or_else(|| {
                 RdmaError::CuObjConnectionFailed(
-                    format!("{LIB_NAME_COMBINED} (or {LIB_NAME}) not found \
+                    format!("{LIB_NAME} not found \
                              (searched LD_LIBRARY_PATH, exe dir, /lib64)")
                 )
             })?;
@@ -312,7 +306,7 @@ mod real {
     // ── Availability probe ────────────────────────────────────────────────────
 
     /// Returns `true` if the cuObject client provider plugin can be loaded
-    /// (i.e., `libs3_rdma_cuobj_client.so` and `libcuobjclient.so` are installed).
+    /// (i.e., `libs3rdmacuobjclient.so` and `libcuobjclient.so` are installed).
     pub fn is_available() -> bool {
         CuObjClientProvider::new().is_ok()
     }
@@ -328,9 +322,9 @@ pub use real::is_available as cuobj_available;
 /// Unified cuObject RDMA endpoint that may carry both client and server roles.
 ///
 /// Each role is loaded on demand from the corresponding plugin:
-/// - Client: `libs3rdmacuobj.so` / `libs3_rdma_cuobj_client.so`  
+/// - Client: `libs3rdmacuobjclient.so`  
 ///   (requires `cuobj-client` feature)
-/// - Server: `libs3rdmacuobj.so` / `libs3_rdma_cuobj_server.so`  
+/// - Server: `libs3rdmacuobjserver.so`  
 ///   (requires `cuobj-server` feature)
 ///
 /// Either or both roles may be absent (plugin not found, hardware unavailable).

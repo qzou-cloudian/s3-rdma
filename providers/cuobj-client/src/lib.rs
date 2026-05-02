@@ -1,6 +1,6 @@
 //! cuObject RDMA provider plugin — real NVIDIA SDK implementation.
 //!
-//! Builds as a `cdylib` (`libs3_rdma_cuobj.so`) and exports:
+//! Builds as a `cdylib` (`libs3rdmacuobjclient.so`) and exports:
 //! ```c
 //! const RdmaProviderVtable *s3_rdma_provider_get_vtable(void);
 //! ```

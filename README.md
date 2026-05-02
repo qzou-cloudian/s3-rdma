@@ -25,7 +25,7 @@ This project exposes that capability through a uniform `RdmaProvider` interface 
 s3-rdma/
 ├── core/                    # RdmaProvider / RdmaServerProvider traits, Mock providers, loaders
 ├── providers/
-│   ├── cuobj/               # Combined cdylib plugin → libs3rdmacuobj.so  ← primary
+│   ├── cuobj-client/        # Client cdylib plugin → libs3rdmacuobjclient.so
 │   ├── cuobj-client/        # Legacy client-only plugin  (kept for compatibility)
 │   └── cuobj-server/        # Legacy server-only plugin  (kept for compatibility)
 └── bindings/
@@ -174,22 +174,28 @@ RDMA_GET_rdma-buf-0_8192_0_key_my-bucket/my-object.bin
 
 Built into `core`. Accepts any non-null buffer, generates deterministic ASCII tokens, and invokes the completion callback synchronously. No hardware or SDK required. Uses `/dev/shm` files as the transfer medium so client and server can run in separate processes on the same host (or in Docker containers sharing `ipc: host`).
 
-### CuObjProvider (combined plugin)
+### CuObj plugins
 
-Loaded at runtime from `providers/cuobj/` — builds a single shared library `libs3rdmacuobj.so` that exports **both** the client and server vtables:
+Two separate plugins are loaded at runtime:
+
+- **`libs3rdmacuobjclient.so`** (`providers/cuobj-client/`) — exports the client vtable:
 
 | C symbol | Direction | Description |
 |----------|-----------|-------------|
 | `s3_rdma_provider_get_vtable()` | Client | `RdmaProviderVtable` — used by relay/client nodes |
+
+- **`libs3rdmacuobjserver.so`** (`providers/cuobj-server/`) — exports the server vtable:
+
+| C symbol | Direction | Description |
+|----------|-----------|-------------|
 | `s3_rdma_server_provider_get_vtable()` | Server | `RdmaServerVtable` — used by the gateway |
 
-The plugin is loaded at runtime via `libloading` — no compile-time SDK dependency. `CuObjClientProvider` and `CuObjServerProvider` in `core` search for the plugin in this order:
+Plugins are loaded at runtime via `libloading` — no compile-time SDK dependency. `CuObjClientProvider` and `CuObjServerProvider` in `core` search for the plugin in this order:
 
 1. Standard dynamic-linker paths (`LD_LIBRARY_PATH`, RPATH, ldconfig cache)
 2. Directory alongside the running executable
 3. `/lib64/`, `/usr/lib64/`
 
-The legacy split plugins (`libs3_rdma_cuobj_client.so` / `libs3_rdma_cuobj_server.so` from `providers/cuobj-client` and `providers/cuobj-server`) are searched as fallbacks if the combined plugin is not found.
 
 ---
 
@@ -338,7 +344,7 @@ cd bindings/python && python3 -m maturin develop
 mvn compile -f bindings/java/pom.xml
 ```
 
-Place `libs3rdmacuobj.so` alongside the gateway binary or on `LD_LIBRARY_PATH` before starting either the client or server process.
+Place `libs3rdmacuobjclient.so` and `libs3rdmacuobjserver.so` alongside the gateway binary or on `LD_LIBRARY_PATH` before starting either the client or server process.
 
 Minimum Rust edition: **2021**.  No `unsafe` in `core` beyond raw pointer forwarding to the provider implementation.
 

@@ -7,11 +7,11 @@ license = "MIT"
 
 [features]
 # Enable runtime loading of the cuObject RDMA client provider plugin
-# (libs3_rdma_cuobj_client.so).  Built from the s3-rdma-cuobj-client crate.
+# (libs3rdmacuobjclient.so).  Built from the s3-rdma-cuobj-client crate.
 # No compile-time dependency on the cuObject SDK is required.
 cuobj-client = ["dep:libloading"]
 # Enable runtime loading of the cuObject RDMA server provider plugin
-# (libs3_rdma_cuobj_server.so).  Built from the s3-rdma-cuobj-server crate.
+# (libs3rdmacuobjserver.so).  Built from the s3-rdma-cuobj-server crate.
 # No compile-time dependency on the cuObject SDK or hsg-io is required.
 cuobj-server = ["dep:libloading"]
 # Export C-ABI vtable entry point (for use as a cdylib plugin from C code)

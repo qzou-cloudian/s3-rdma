@@ -1,6 +1,6 @@
 //! cuObject RDMA server provider plugin.
 //!
-//! Builds as a `cdylib` (`libs3_rdma_cuobj_server.so`) and exports:
+//! Builds as a `cdylib` (`libs3rdmacuobjserver.so`) and exports:
 //! ```c
 //! const RdmaServerVtable *s3_rdma_server_provider_get_vtable(void);
 //! ```

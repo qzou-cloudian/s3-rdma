@@ -1,11 +1,11 @@
 //! cuObject RDMA **server** provider via lazy runtime loading.
 //!
 //! Enabled by the `cuobj-server` Cargo feature.  At runtime the gateway
-//! searches for the server plugin (`libs3_rdma_cuobj_server.so`) and
+//! searches for the server plugin (`libs3rdmacuobjserver.so`) and
 //! loads it on demand, so the main binary has **no compile-time dependency**
 //! on `libcuobjclient.so` or `hsg-io`.
 //!
-//! Search order for `libs3_rdma_cuobj_server.so`:
+//! Search order for `libs3rdmacuobjserver.so`:
 //! 1. Standard dynamic-linker paths (`LD_LIBRARY_PATH`, RPATH, ldconfig cache).
 //! 2. Directory containing the current executable.
 //! 3. `/lib64/`, `/usr/lib64/` (common CUDA/cuObject install locations).
@@ -20,29 +20,26 @@ mod real {
     use crate::ffi::{ByteCursor, GetServerVtableFn, RdmaServerInitParams, RdmaServerVtable};
     use super::RdmaServerConfig;
 
-    const LIB_NAME_COMBINED: &str = "libs3rdmacuobj.so";
-    const LIB_NAME: &str = "libs3_rdma_cuobj_server.so";
+    const LIB_NAME: &str = "libs3rdmacuobjserver.so";
 
     fn try_load(path: impl AsRef<std::ffi::OsStr>) -> Option<Library> {
         unsafe { Library::new(path) }.ok()
     }
 
     fn find_library() -> Option<Library> {
-        for name in &[LIB_NAME_COMBINED, LIB_NAME] {
-            if let Some(lib) = try_load(name) {
-                return Some(lib);
-            }
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(dir) = exe.parent() {
-                    if let Some(lib) = try_load(dir.join(name)) {
-                        return Some(lib);
-                    }
-                }
-            }
-            for dir in &["/lib64", "/usr/lib64"] {
-                if let Some(lib) = try_load(format!("{dir}/{name}")) {
+        if let Some(lib) = try_load(LIB_NAME) {
+            return Some(lib);
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                if let Some(lib) = try_load(dir.join(LIB_NAME)) {
                     return Some(lib);
                 }
+            }
+        }
+        for dir in &["/lib64", "/usr/lib64"] {
+            if let Some(lib) = try_load(format!("{dir}/{LIB_NAME}")) {
+                return Some(lib);
             }
         }
         None
@@ -50,7 +47,7 @@ mod real {
 
     // ── CuObjServerProvider ───────────────────────────────────────────────────
 
-    /// RDMA server provider that loads `libs3_rdma_cuobj_server.so` at runtime.
+    /// RDMA server provider that loads `libs3rdmacuobjserver.so` at runtime.
     ///
     /// Wraps a `CuObjServer` + `BufferPool` internally (inside the plugin);
     /// the gateway has no compile-time dependency on either.
@@ -69,7 +66,7 @@ mod real {
         pub fn new(cfg: &RdmaServerConfig) -> Result<Self, RdmaError> {
             let lib = find_library().ok_or_else(|| {
                 RdmaError::CuObjConnectionFailed(
-                    format!("{LIB_NAME_COMBINED} (or {LIB_NAME}) not found \
+                    format!("{LIB_NAME} not found \
                              (searched LD_LIBRARY_PATH, exe dir, /lib64, /usr/lib64)")
                 )
             })?;

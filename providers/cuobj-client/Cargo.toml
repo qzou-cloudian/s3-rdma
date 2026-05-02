@@ -6,7 +6,7 @@ description = "cuObject RDMA client provider plugin for S3 clients (cdylib)"
 license     = "MIT"
 
 [lib]
-name       = "s3_rdma_cuobj_client"
+name       = "s3rdmacuobjclient"
 crate-type = ["cdylib"]
 
 [dependencies]
