@@ -25,6 +25,9 @@ pub enum RdmaError {
     BufferTooSmall { server_capacity: usize, requested: usize },
     /// I/O error.
     Io(std::io::Error),
+    /// The called method is not supported by this endpoint in its current role
+    /// (e.g. calling `handle_put` on a client-only endpoint).
+    OperationNotSupported(String),
 }
 
 impl RdmaError {
@@ -80,6 +83,7 @@ impl fmt::Display for RdmaError {
                 )
             }
             RdmaError::Io(e) => write!(f, "I/O error: {e}"),
+            RdmaError::OperationNotSupported(msg) => write!(f, "Operation not supported: {msg}"),
         }
     }
 }

@@ -356,3 +356,267 @@ pub use real::CuObjClientProvider;
 #[cfg(feature = "cuobj-client")]
 pub use real::is_available as cuobj_available;
 
+// ── CuObjEndpoint ─────────────────────────────────────────────────────────────
+
+/// Unified cuObject RDMA endpoint that may carry both client and server roles.
+///
+/// Each role is loaded on demand from the corresponding plugin:
+/// - Client: `libs3rdmacuobj.so` / `libs3_rdma_cuobj_client.so`  
+///   (requires `cuobj-client` feature)
+/// - Server: `libs3rdmacuobj.so` / `libs3_rdma_cuobj_server.so`  
+///   (requires `cuobj-server` feature)
+///
+/// Either or both roles may be absent (plugin not found, hardware unavailable).
+pub struct CuObjEndpoint {
+    #[cfg(feature = "cuobj-client")]
+    client: Option<real::CuObjClientProvider>,
+    #[cfg(feature = "cuobj-server")]
+    server: Option<crate::cuobj_server::CuObjServerProvider>,
+    buf_size: usize,
+}
+
+unsafe impl Send for CuObjEndpoint {}
+unsafe impl Sync for CuObjEndpoint {}
+
+impl std::fmt::Debug for CuObjEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CuObjEndpoint")
+            .field("buf_size", &self.buf_size)
+            .finish()
+    }
+}
+
+impl CuObjEndpoint {
+    /// Create a client-only endpoint.
+    ///
+    /// Returns `Err` if the `cuobj-client` feature is not compiled in or the
+    /// plugin cannot be loaded.
+    pub fn new_client() -> Result<Self, crate::RdmaError> {
+        #[cfg(feature = "cuobj-client")]
+        {
+            let client = real::CuObjClientProvider::new()?;
+            Ok(Self {
+                client: Some(client),
+                #[cfg(feature = "cuobj-server")]
+                server: None,
+                buf_size: 0,
+            })
+        }
+        #[cfg(not(feature = "cuobj-client"))]
+        {
+            Err(crate::RdmaError::ProviderUnavailable {
+                provider: "cuobj".into(),
+                reason: "compiled without the `cuobj-client` feature".into(),
+            })
+        }
+    }
+
+    /// Create a server-only endpoint.
+    pub fn new_server(cfg: &crate::provider::RdmaServerConfig) -> Result<Self, crate::RdmaError> {
+        #[cfg(feature = "cuobj-server")]
+        {
+            let server = crate::cuobj_server::real::CuObjServerProvider::new(cfg)?;
+            Ok(Self {
+                #[cfg(feature = "cuobj-client")]
+                client: None,
+                server: Some(server),
+                buf_size: cfg.buf_size,
+            })
+        }
+        #[cfg(not(feature = "cuobj-server"))]
+        {
+            let _ = cfg;
+            Err(crate::RdmaError::ProviderUnavailable {
+                provider: "cuobj".into(),
+                reason: "compiled without the `cuobj-server` feature".into(),
+            })
+        }
+    }
+
+    /// Create an endpoint carrying both client and server roles.
+    ///
+    /// If the client plugin fails to load, `supports_client()` will return
+    /// `false` (not a hard error); the server role is still available.
+    /// If the server plugin fails, `Err` is returned.
+    pub fn new_both(cfg: &crate::provider::RdmaServerConfig) -> Result<Self, crate::RdmaError> {
+        let mut ep = Self::new_server(cfg)?;
+        #[cfg(feature = "cuobj-client")]
+        {
+            ep.client = real::CuObjClientProvider::new().ok();
+        }
+        Ok(ep)
+    }
+}
+
+impl crate::endpoint::RdmaEndpoint for CuObjEndpoint {
+    fn name(&self) -> &str { "CuObjEndpoint" }
+    fn protocol(&self) -> &str { "cuobj" }
+
+    fn supports_client(&self) -> bool {
+        #[cfg(feature = "cuobj-client")]
+        { self.client.is_some() }
+        #[cfg(not(feature = "cuobj-client"))]
+        { false }
+    }
+
+    fn supports_server(&self) -> bool {
+        #[cfg(feature = "cuobj-server")]
+        { self.server.is_some() }
+        #[cfg(not(feature = "cuobj-server"))]
+        { false }
+    }
+
+    // ── Client methods — delegate to inner CuObjClientProvider ─────────────
+
+    fn is_memory_suitable(&self, ptr: *const u8, size: usize) -> bool {
+        #[cfg(feature = "cuobj-client")]
+        if let Some(c) = &self.client {
+            use crate::provider::RdmaProvider;
+            return c.is_memory_suitable(ptr, size);
+        }
+        let _ = (ptr, size);
+        false
+    }
+
+    fn register_memory(&self, ptr: *mut u8, size: usize) -> Result<(), crate::RdmaError> {
+        #[cfg(feature = "cuobj-client")]
+        if let Some(c) = &self.client {
+            use crate::provider::RdmaProvider;
+            return c.register_memory(ptr, size);
+        }
+        let _ = (ptr, size);
+        Err(crate::RdmaError::OperationNotSupported("cuobj client not loaded".into()))
+    }
+
+    fn deregister_memory(&self, ptr: *mut u8) -> Result<(), crate::RdmaError> {
+        #[cfg(feature = "cuobj-client")]
+        if let Some(c) = &self.client {
+            use crate::provider::RdmaProvider;
+            return c.deregister_memory(ptr);
+        }
+        let _ = ptr;
+        Err(crate::RdmaError::OperationNotSupported("cuobj client not loaded".into()))
+    }
+
+    fn get_max_transfer_size(&self, ptr: *const u8) -> usize {
+        #[cfg(feature = "cuobj-client")]
+        if let Some(c) = &self.client {
+            use crate::provider::RdmaProvider;
+            return c.get_max_transfer_size(ptr);
+        }
+        let _ = ptr;
+        usize::MAX
+    }
+
+    fn prepare_put_token(
+        &self,
+        s3_key: &[u8],
+        buffer: *const u8,
+        size: usize,
+        offset: usize,
+    ) -> Result<Vec<u8>, crate::RdmaError> {
+        #[cfg(feature = "cuobj-client")]
+        if let Some(c) = &self.client {
+            use crate::provider::RdmaProvider;
+            return c.prepare_put_token(s3_key, buffer, size, offset);
+        }
+        let _ = (s3_key, buffer, size, offset);
+        Err(crate::RdmaError::OperationNotSupported("cuobj client not loaded".into()))
+    }
+
+    fn prepare_get_token(
+        &self,
+        s3_key: &[u8],
+        buffer: *mut u8,
+        size: usize,
+        offset: usize,
+    ) -> Result<Vec<u8>, crate::RdmaError> {
+        #[cfg(feature = "cuobj-client")]
+        if let Some(c) = &self.client {
+            use crate::provider::RdmaProvider;
+            return c.prepare_get_token(s3_key, buffer, size, offset);
+        }
+        let _ = (s3_key, buffer, size, offset);
+        Err(crate::RdmaError::OperationNotSupported("cuobj client not loaded".into()))
+    }
+
+    fn process_rdma_reply(
+        &self,
+        rdma_status: u16,
+        request_token: &[u8],
+        transferred: usize,
+        callback: crate::provider::RdmaCompletionCallback,
+    ) -> Result<(), crate::RdmaError> {
+        #[cfg(feature = "cuobj-client")]
+        if let Some(c) = &self.client {
+            use crate::provider::RdmaProvider;
+            return c.process_rdma_reply(rdma_status, request_token, transferred, callback);
+        }
+        let _ = (rdma_status, request_token, transferred);
+        // Fallback: fire callback based on status
+        use crate::provider::{RdmaCompletionResult, rdma_status_to_error_code};
+        callback(RdmaCompletionResult {
+            error_code: rdma_status_to_error_code(rdma_status),
+            reply_token: vec![],
+        });
+        Ok(())
+    }
+
+    fn rdma_token_header_name(&self) -> &[u8] {
+        #[cfg(feature = "cuobj-client")]
+        if let Some(c) = &self.client {
+            use crate::provider::RdmaProvider;
+            return c.rdma_token_header_name();
+        }
+        crate::provider::RDMA_TOKEN_HEADER.as_bytes()
+    }
+
+    fn rdma_reply_header_name(&self) -> &[u8] {
+        #[cfg(feature = "cuobj-client")]
+        if let Some(c) = &self.client {
+            use crate::provider::RdmaProvider;
+            return c.rdma_reply_header_name();
+        }
+        crate::provider::RDMA_REPLY_HEADER.as_bytes()
+    }
+
+    // ── Server methods — delegate to inner CuObjServerProvider ─────────────
+
+    fn buf_size(&self) -> usize {
+        self.buf_size
+    }
+
+    fn handle_put(
+        &self,
+        s3_key: &[u8],
+        token: &[u8],
+        buf: &mut [u8],
+        offset: usize,
+        size: usize,
+    ) -> Result<usize, crate::RdmaError> {
+        #[cfg(feature = "cuobj-server")]
+        if let Some(s) = &self.server {
+            use crate::provider::RdmaServerProvider;
+            return s.handle_put(s3_key, token, buf, offset, size);
+        }
+        let _ = (s3_key, token, buf, offset, size);
+        Err(crate::RdmaError::OperationNotSupported("cuobj server not loaded".into()))
+    }
+
+    fn handle_get(
+        &self,
+        s3_key: &[u8],
+        data: &[u8],
+        token: &[u8],
+        offset: usize,
+    ) -> Result<usize, crate::RdmaError> {
+        #[cfg(feature = "cuobj-server")]
+        if let Some(s) = &self.server {
+            use crate::provider::RdmaServerProvider;
+            return s.handle_get(s3_key, data, token, offset);
+        }
+        let _ = (s3_key, data, token, offset);
+        Err(crate::RdmaError::OperationNotSupported("cuobj server not loaded".into()))
+    }
+}
+
