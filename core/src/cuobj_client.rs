@@ -439,6 +439,7 @@ impl CuObjEndpoint {
     /// `false` (not a hard error); the server role is still available.
     /// If the server plugin fails, `Err` is returned.
     pub fn new_both(cfg: &crate::provider::RdmaServerConfig) -> Result<Self, crate::RdmaError> {
+        #[allow(unused_mut)]
         let mut ep = Self::new_server(cfg)?;
         #[cfg(feature = "cuobj-client")]
         {
