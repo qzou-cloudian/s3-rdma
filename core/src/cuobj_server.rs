@@ -3,7 +3,7 @@
 //! Enabled by the `cuobj-server` Cargo feature.  At runtime the gateway
 //! searches for the server plugin (`libs3rdmacuobjserver.so`) and
 //! loads it on demand, so the main binary has **no compile-time dependency**
-//! on `libcuobjclient.so` or `hsg-io`.
+//! on `libcuobjserver.so` or any cuObject SDK symbols.
 //!
 //! Search order for `libs3rdmacuobjserver.so`:
 //! 1. Standard dynamic-linker paths (`LD_LIBRARY_PATH`, RPATH, ldconfig cache).

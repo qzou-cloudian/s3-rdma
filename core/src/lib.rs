@@ -65,7 +65,7 @@ pub use endpoint::{EndpointRole, RdmaEndpoint, RdmaEndpointConfig};
 pub use mock::MockRdmaEndpoint;
 pub use cuobj_client::CuObjEndpoint;
 
-// ── Legacy types (deprecated — use RdmaEndpoint instead) ─────────────────────
+// ── Supporting types ──────────────────────────────────────────────────────────
 
 pub use provider::RdmaServerConfig;
 pub use token::RdmaToken;

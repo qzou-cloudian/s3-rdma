@@ -15,7 +15,7 @@ GPU-Direct RDMA PUT:
                        (CPU not in the data path)
 ```
 
-This project exposes that capability through a uniform `RdmaProvider` interface implemented in Rust and wrapped for Python and Java. No NVIDIA hardware is required for development — a `MockRdmaProvider` exercises the full API path without touching any hardware.
+This project exposes that capability through a uniform `RdmaEndpoint` interface implemented in Rust and wrapped for Python and Java. No NVIDIA hardware is required for development — a `MockRdmaEndpoint` exercises the full API path without touching any hardware.
 
 ---
 
@@ -23,23 +23,22 @@ This project exposes that capability through a uniform `RdmaProvider` interface 
 
 ```
 s3-rdma/
-├── core/                    # RdmaProvider / RdmaServerProvider traits, Mock providers, loaders
+├── core/                    # RdmaEndpoint trait, MockRdmaEndpoint, CuObjEndpoint, BufferPool
 ├── providers/
 │   ├── cuobj-client/        # Client cdylib plugin → libs3rdmacuobjclient.so
-│   ├── cuobj-client/        # Legacy client-only plugin  (kept for compatibility)
-│   └── cuobj-server/        # Legacy server-only plugin  (kept for compatibility)
+│   └── cuobj-server/        # Server cdylib plugin → libs3rdmacuobjserver.so
 └── bindings/
     ├── java/                # JNI Rust crate + Maven project (io.s3rdma)
     └── python/              # PyO3 / maturin extension (s3_rdma)
 ```
 
-`~/work/cuobj/` is a separate standalone crate that wraps the low-level cuObject SDK C++ API. It is a dependency of `providers/cuobj`.
+`~/work/cuobj/` is a separate standalone crate that wraps the low-level cuObject SDK C++ API. It is a dependency of `providers/cuobj-client` and `providers/cuobj-server`.
 
 ---
 
 ## Provider model
 
-### Client side (`RdmaProvider`)
+### Client side (`RdmaEndpoint` — client role)
 
 The client-side abstraction used by S3 clients and relay nodes:
 
@@ -50,7 +49,7 @@ client                        S3 server
   │  prepare_put_token(key, buf) ─┼─► x-amz-rdma-token header on PUT request
   │                               │      server sets up RDMA READ
   │◄─ x-amz-rdma-reply header ───┤
-  │  process_reply_token(reply)   │
+  │  process_rdma_reply(status)   │
   │      RDMA transfer completes  │
 ```
 
@@ -60,12 +59,12 @@ client                        S3 server
 | 2 | `register_memory(ptr, size)` | Pin the buffer with the RDMA subsystem |
 | 3 | `prepare_put_token(key, buf, size, offset)` | Generate upload descriptor (PUT) |
 | 4 | `prepare_get_token(key, buf, size, offset)` | Generate download descriptor (GET) |
-| 5 | `process_reply_token(reply, callback)` | Confirm transfer; fires completion callback |
+| 5 | `process_rdma_reply(status, token, transferred, cb)` | Confirm transfer; fires completion callback |
 | 6 | `deregister_memory(ptr)` | Unpin the buffer |
 
-HTTP header names are provider-configurable (`x-amz-rdma-token`, `x-amz-rdma-reply`).
+Header names are provider-configurable (`x-amz-rdma-token`, `x-amz-rdma-reply`).
 
-### Server side (`RdmaServerProvider`)
+### Server side (`RdmaEndpoint` — server role)
 
 The server-side abstraction used by the S3 gateway:
 
@@ -170,9 +169,9 @@ RDMA_GET_rdma-buf-0_8192_0_key_my-bucket/my-object.bin
 
 ## Providers
 
-### MockRdmaProvider / MockRdmaServerProvider
+### MockRdmaEndpoint
 
-Built into `core`. Accepts any non-null buffer, generates deterministic ASCII tokens, and invokes the completion callback synchronously. No hardware or SDK required. Uses `/dev/shm` files as the transfer medium so client and server can run in separate processes on the same host (or in Docker containers sharing `ipc: host`).
+Built into `core`. Accepts any non-null buffer, generates deterministic ASCII tokens, and invokes the completion callback synchronously. No hardware or SDK required. Uses `/dev/shm` files as the transfer medium so client and server can run in separate processes on the same host (or in Docker containers sharing `ipc: host`). Supports both client and server roles from a single instance.
 
 ### CuObj plugins
 
@@ -211,23 +210,23 @@ s3-rdma = { path = "core" }
 ```
 
 ```rust
-use s3_rdma::{MockRdmaProvider, RdmaProvider};
+use s3_rdma::{MockRdmaEndpoint, endpoint::RdmaEndpoint};
 
-let provider = MockRdmaProvider::new(false);
+let ep = MockRdmaEndpoint::with_debug(false);
 let mut buf = vec![0u8; 4 * 1024 * 1024];
 let key = b"my-bucket/my-object.bin";
 
-provider.register_memory(buf.as_mut_ptr(), buf.len())?;
+ep.register_memory(buf.as_mut_ptr(), buf.len())?;
 
 // S3 PUT: attach the returned token as the x-amz-rdma-token request header
-let token = provider.prepare_put_token(key, buf.as_ptr(), buf.len(), 0)?;
+let token = ep.prepare_put_token(key, buf.as_ptr(), buf.len(), 0)?;
 
 // After the server responds with x-amz-rdma-reply, confirm the transfer:
-provider.process_reply_token(&reply, Box::new(|result| {
+ep.process_rdma_reply(200, &token, buf.len(), Box::new(|result| {
     assert_eq!(result.error_code, 0);
 }))?;
 
-provider.deregister_memory(buf.as_mut_ptr())?;
+ep.deregister_memory(buf.as_mut_ptr())?;
 ```
 
 Run the full example:
@@ -316,12 +315,16 @@ java -Djava.library.path=target/debug \
 | `MemoryNotSuitable` | Buffer not usable for RDMA | ✅ fall back to plain HTTP |
 | `TokenGenerationFailed` | Could not build descriptor | ✅ fall back to plain HTTP |
 | `CuObjConnectionFailed` | SDK unavailable at runtime | ✅ fall back to plain HTTP |
+| `ProviderUnavailable` | Named provider unknown or init failed | ✅ fall back to plain HTTP |
+| `BufferTooSmall` | Server slot smaller than requested transfer | ✅ fall back to plain HTTP |
 | `MemoryRegistrationFailed` | RDMA registration error | ❌ propagate |
 | `MemoryDeregistrationFailed` | RDMA deregistration error | ❌ propagate |
 | `ReplyTokenProcessingFailed` | Server reply invalid | ❌ propagate |
+| `TransferFailed` | RDMA data movement error | ❌ propagate |
 | `Io` | Underlying I/O error | ❌ propagate |
+| `OperationNotSupported` | Method not available for endpoint's role | ❌ propagate |
 
-`RdmaError::is_fallback_eligible()` returns `true` for the first three — safe to silently downgrade to non-RDMA transfers.
+`RdmaError::is_fallback_eligible()` returns `true` for the first five variants — safe to silently downgrade to non-RDMA transfers.
 
 ---
 
@@ -331,10 +334,14 @@ java -Djava.library.path=target/debug \
 # Core library + all providers + Java JNI
 cargo build --workspace
 
-# Combined cuObject plugin only (requires CUDA SDK)
+# cuObject client plugin (requires CUDA SDK)
 export CUOBJ_ROOT_DIR=/usr/local/cuda-13.2
-cargo build -p s3-rdma-cuobj --release
-# → target/release/libs3rdmacuobj.so
+cargo build -p s3-rdma-cuobj-client --release
+# → target/release/libs3rdmacuobjclient.so
+
+# cuObject server plugin (requires CUDA SDK)
+cargo build -p s3-rdma-cuobj-server --release
+# → target/release/libs3rdmacuobjserver.so
 
 # Python extension (from bindings/python/)
 source ~/.venv/bin/activate
@@ -346,5 +353,5 @@ mvn compile -f bindings/java/pom.xml
 
 Place `libs3rdmacuobjclient.so` and `libs3rdmacuobjserver.so` alongside the gateway binary or on `LD_LIBRARY_PATH` before starting either the client or server process.
 
-Minimum Rust edition: **2021**.  No `unsafe` in `core` beyond raw pointer forwarding to the provider implementation.
+Minimum Rust edition: **2021**.  `unsafe` in `core` is limited to raw pointer forwarding to provider implementations and POSIX SHM operations in `MockRdmaEndpoint`.
 

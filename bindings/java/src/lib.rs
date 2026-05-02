@@ -15,6 +15,10 @@ use s3_rdma::provider::{RdmaCompletionCallback, RdmaCompletionResult};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// # Safety
+/// `handle` must be a non-null `jlong` obtained from `nativeCreate` and not yet
+/// passed to `nativeDestroy`.  The caller must not call `nativeDestroy` while
+/// any reference produced by this function is still live.
 unsafe fn endpoint_ref(handle: jlong) -> &'static MockRdmaEndpoint {
     unsafe { &*(handle as *const MockRdmaEndpoint) }
 }
@@ -53,7 +57,7 @@ pub extern "system" fn Java_io_s3rdma_MockRdmaProvider_nativeDestroy(
 /// `MockRdmaProvider.nativeName(long handle) -> String`
 #[no_mangle]
 pub extern "system" fn Java_io_s3rdma_MockRdmaProvider_nativeName<'a>(
-    mut env: JNIEnv<'a>,
+    env: JNIEnv<'a>,
     _obj: JObject<'a>,
     handle: jlong,
 ) -> JString<'a> {
@@ -64,7 +68,7 @@ pub extern "system" fn Java_io_s3rdma_MockRdmaProvider_nativeName<'a>(
 /// `MockRdmaProvider.nativeVersion(long handle) -> String`
 #[no_mangle]
 pub extern "system" fn Java_io_s3rdma_MockRdmaProvider_nativeVersion<'a>(
-    mut env: JNIEnv<'a>,
+    env: JNIEnv<'a>,
     _obj: JObject<'a>,
     _handle: jlong,
 ) -> JString<'a> {

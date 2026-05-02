@@ -1,4 +1,4 @@
-//! C-ABI export – makes `s3-rdma` loadable as a plugin from C code.
+//! C-ABI export – makes `s3-rdma` loadable as a mock provider plugin from C.
 //!
 //! When `s3-rdma` is compiled as a `cdylib` (with the `c-abi` feature), the
 //! resulting `.so` exports:
@@ -6,11 +6,12 @@
 //! const RdmaProviderVtable *s3_rdma_provider_get_vtable(void);
 //! ```
 //!
-//! The vtable is wired to the best available [`RdmaEndpoint`]:
-//! `CuObjEndpoint` when the `cuobj` feature is also enabled,
-//! otherwise [`MockRdmaEndpoint`].
+//! The vtable is always backed by [`MockRdmaEndpoint`] — this is intentional:
+//! the `c-abi` feature targets test environments and tooling that need a
+//! drop-in mock without NVIDIA hardware.  For real cuObject RDMA, load
+//! `libs3rdmacuobjclient.so` (from `providers/cuobj-client`) instead.
 //!
-//! [`RdmaEndpoint`]: crate::endpoint::RdmaEndpoint
+//! [`MockRdmaEndpoint`]: crate::mock::MockRdmaEndpoint
 
 use std::ffi::c_void;
 use std::os::raw::c_char;
@@ -115,6 +116,8 @@ unsafe extern "C" fn c_process_reply_token(
         }
     });
 
+    // The C ABI c_process_reply_token is only called after a confirmed RDMA
+    // transfer (status=200); error cases fire the callback directly in the caller.
     match get_endpoint().process_rdma_reply(200, &token, 0, cb) {
         Ok(()) => 0,
         Err(e) => { eprintln!("[s3-rdma] process_reply_token: {e}"); -1 }
