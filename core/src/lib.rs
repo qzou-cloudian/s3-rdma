@@ -40,6 +40,8 @@ pub mod cuobj_server;
 pub mod error;
 pub mod ffi;
 pub mod mock;
+#[cfg(feature = "buffer-pool")]
+pub mod pool;
 pub mod provider;
 pub mod token;
 #[cfg(feature = "c-abi")]
@@ -60,6 +62,9 @@ pub use mock::MockRdmaProvider;
 pub use mock::MockRdmaServerProvider;
 pub use provider::{RdmaProvider, RdmaServerProvider, RdmaServerConfig};
 pub use token::RdmaToken;
+
+#[cfg(feature = "buffer-pool")]
+pub use pool::{BufferPool, BufferPoolBuilder, BufferPoolError, OwnedBufferGuard};
 
 #[cfg(feature = "cuobj-client")]
 pub use cuobj_client::CuObjClientProvider;
