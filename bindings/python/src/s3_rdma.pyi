@@ -16,7 +16,7 @@ from typing import Callable
 
 class RdmaProvider:
     """
-    Unified RDMA endpoint supporting client, server, or both roles.
+    Unified RDMA provider supporting client, server, or both roles.
 
     Wraps the Rust ``RdmaProvider`` trait and supports all provider types
     (``"mock"``, ``"cuobj"``, ``"auto"``) and roles (``"client"``,
@@ -51,7 +51,7 @@ class RdmaProvider:
         buf_size: int = 134217728,
     ) -> None:
         """
-        Create an RDMA endpoint.
+        Create an RDMA provider.
 
         :param provider: ``"mock"`` (default), ``"cuobj"``, or ``"auto"``
                          (tries cuobj first, falls back to mock).
@@ -77,11 +77,11 @@ class RdmaProvider:
         ...
 
     def supports_client(self) -> bool:
-        """``True`` if this endpoint supports client-side operations."""
+        """``True`` if this provider supports client-side operations."""
         ...
 
     def supports_server(self) -> bool:
-        """``True`` if this endpoint supports server-side operations."""
+        """``True`` if this provider supports server-side operations."""
         ...
 
     def buf_size(self) -> int:
@@ -194,7 +194,7 @@ class RdmaProvider:
         :param size:   bytes to transfer (0 = use full token capacity, up to 128 MiB).
         :param offset: byte offset into the object (default 0).
         :returns: the bytes received from the client.
-        :raises RuntimeError: if the transfer fails or the endpoint is client-only.
+        :raises RuntimeError: if the transfer fails or the provider is client-only.
         """
         ...
 
@@ -214,7 +214,7 @@ class RdmaProvider:
         :param token:  the RDMA descriptor token from ``x-amz-rdma-token``.
         :param offset: byte offset into the client buffer (default 0).
         :returns: number of bytes written to the client buffer.
-        :raises RuntimeError: if the transfer fails or the endpoint is client-only.
+        :raises RuntimeError: if the transfer fails or the provider is client-only.
         """
         ...
 
@@ -223,7 +223,7 @@ class RdmaProvider:
 
 class MockRdmaProvider(RdmaProvider):
     """
-    Mock RDMA endpoint — no NVIDIA hardware required.
+    Mock RDMA provider — no NVIDIA hardware required.
 
     Equivalent to ``RdmaProvider(provider="mock", role="both")`` with a
     simpler constructor.  Both client and server roles are active.
@@ -239,7 +239,7 @@ class MockRdmaProvider(RdmaProvider):
 
     def __init__(self, debug: bool = False) -> None:
         """
-        Create a mock endpoint.
+        Create a mock provider.
 
         :param debug: if ``True``, print trace lines to stderr.
         """
@@ -248,7 +248,7 @@ class MockRdmaProvider(RdmaProvider):
 
 class CuObjProvider(RdmaProvider):
     """
-    CuObj RDMA endpoint — requires NVIDIA hardware and the cuObject SDK plugin.
+    CuObj RDMA provider — requires NVIDIA hardware and the cuObject SDK plugin.
 
     Equivalent to ``RdmaProvider(provider="cuobj", role=role)`` with a
     simpler constructor.  Raises ``RuntimeError`` if the cuObj plugin
@@ -282,7 +282,7 @@ class CuObjProvider(RdmaProvider):
         buf_size: int = 134217728,
     ) -> None:
         """
-        Create a cuObj RDMA endpoint.
+        Create a cuObj RDMA provider.
 
         :param role: ``"both"`` (default), ``"client"``, or ``"server"``.
         :param debug: emit trace lines to stderr (default ``False``).

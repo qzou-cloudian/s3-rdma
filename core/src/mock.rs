@@ -1,4 +1,4 @@
-//! Mock RDMA endpoint – no NVIDIA hardware required.
+//! Mock RDMA provider – no NVIDIA hardware required.
 //!
 //! Uses POSIX shared memory (`/dev/shm`) so that the client and an out-of-process
 //! relay server on the **same host** can exchange object data without copying
@@ -32,8 +32,7 @@ use std::os::unix::io::AsRawFd;
 use std::sync::Mutex;
 
 use crate::error::RdmaError;
-use crate::endpoint::RdmaProvider;
-use crate::provider::{RdmaCompletionCallback, RdmaCompletionResult};
+use crate::provider::{RdmaCompletionCallback, RdmaCompletionResult, RdmaProvider};
 
 /// Base directory for shared-memory files.
 const SHM_DIR: &str = "/dev/shm";
@@ -78,7 +77,7 @@ impl ShmEntry {
 // MockRdmaProvider  (unified client + server)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Unified mock RDMA endpoint that supports both client and server roles.
+/// Unified mock RDMA provider that supports both client and server roles.
 ///
 /// Replaces the separate [`MockRdmaProvider`] (client) and
 /// [`MockRdmaServerProvider`] (server) with a single instance that can be
@@ -107,7 +106,7 @@ impl std::fmt::Debug for MockRdmaProvider {
 }
 
 impl MockRdmaProvider {
-    /// Create a new endpoint.
+    /// Create a new provider.
     ///
     /// - `debug` — emit trace lines to stderr.
     /// - `shm_dir` — directory for shared-memory files (typically `"/dev/shm"`).

@@ -37,7 +37,6 @@
 
 pub mod cuobj_client;
 pub mod cuobj_server;
-pub mod endpoint;
 pub mod error;
 pub mod ffi;
 pub mod mock;
@@ -61,7 +60,7 @@ pub fn get_vtable_ptr() -> *const ffi::RdmaProviderVtable {
 
 // ── Primary public API ────────────────────────────────────────────────────────
 
-pub use endpoint::{RdmaRole, RdmaProvider, RdmaProviderConfig};
+pub use provider::{RdmaRole, RdmaProvider, RdmaProviderConfig};
 pub use mock::MockRdmaProvider;
 pub use cuobj_client::CuObjProvider;
 

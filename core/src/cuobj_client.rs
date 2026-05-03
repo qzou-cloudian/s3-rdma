@@ -319,7 +319,7 @@ pub use real::is_available as cuobj_available;
 
 // ── CuObjProvider ─────────────────────────────────────────────────────────────
 
-/// Unified cuObject RDMA endpoint that may carry both client and server roles.
+/// Unified cuObject RDMA provider that may carry both client and server roles.
 ///
 /// Each role is loaded on demand from the corresponding plugin:
 /// - Client: `libs3rdmacuobjclient.so`  
@@ -348,7 +348,7 @@ impl std::fmt::Debug for CuObjProvider {
 }
 
 impl CuObjProvider {
-    /// Create a client-only endpoint.
+    /// Create a client-only provider.
     ///
     /// Returns `Err` if the `cuobj-client` feature is not compiled in or the
     /// plugin cannot be loaded.
@@ -372,7 +372,7 @@ impl CuObjProvider {
         }
     }
 
-    /// Create a server-only endpoint.
+    /// Create a server-only provider.
     pub fn new_server(cfg: &crate::provider::RdmaServerConfig) -> Result<Self, crate::RdmaError> {
         #[cfg(feature = "cuobj-server")]
         {
@@ -394,7 +394,7 @@ impl CuObjProvider {
         }
     }
 
-    /// Create an endpoint carrying both client and server roles.
+    /// Create a provider carrying both client and server roles.
     ///
     /// If the client plugin fails to load, `supports_client()` will return
     /// `false` (not a hard error); the server role is still available.
@@ -410,7 +410,7 @@ impl CuObjProvider {
     }
 }
 
-impl crate::endpoint::RdmaProvider for CuObjProvider {
+impl crate::provider::RdmaProvider for CuObjProvider {
     fn name(&self) -> &str { "CuObjProvider" }
     fn protocol(&self) -> &str { "cuobj" }
 

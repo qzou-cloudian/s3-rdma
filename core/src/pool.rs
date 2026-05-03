@@ -35,7 +35,7 @@ use crossbeam_queue::ArrayQueue;
 use tokio::sync::Semaphore;
 
 use crate::error::RdmaError;
-use crate::endpoint::RdmaProvider;
+use crate::provider::RdmaProvider;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error type
@@ -348,7 +348,7 @@ impl BufferPoolBuilder {
     /// Size of each buffer slot in bytes.
     pub fn size(mut self, bytes: usize) -> Self { self.size = bytes; self }
 
-    /// Attach an RDMA endpoint.  All slots are registered with it at build
+    /// Attach an RDMA provider.  All slots are registered with it at build
     /// time so per-transfer `register_memory`/`deregister_memory` is avoided.
     ///
     /// Accepts any `Arc<dyn RdmaProvider>`:

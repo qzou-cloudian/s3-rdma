@@ -17,7 +17,7 @@ use std::ffi::c_void;
 use std::os::raw::c_char;
 use std::sync::OnceLock;
 
-use crate::endpoint::RdmaProvider;
+use crate::provider::RdmaProvider;
 use crate::ffi::{ByteCursor, RdmaCompletionFn, RdmaProviderVtable};
 use crate::provider::RdmaCompletionCallback;
 

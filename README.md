@@ -322,7 +322,7 @@ java -Djava.library.path=target/debug \
 | `ReplyTokenProcessingFailed` | Server reply invalid | ❌ propagate |
 | `TransferFailed` | RDMA data movement error | ❌ propagate |
 | `Io` | Underlying I/O error | ❌ propagate |
-| `OperationNotSupported` | Method not available for endpoint's role | ❌ propagate |
+| `OperationNotSupported` | Method not available for provider's role | ❌ propagate |
 
 `RdmaError::is_fallback_eligible()` returns `true` for the first five variants — safe to silently downgrade to non-RDMA transfers.
 

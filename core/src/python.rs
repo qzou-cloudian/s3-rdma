@@ -14,8 +14,8 @@ use pyo3::prelude::*;
 use pyo3::PyClassInitializer;
 use pyo3::types::PyBytes;
 
-use crate::endpoint::RdmaProvider;
-use crate::endpoint::RdmaRole;
+use crate::provider::RdmaProvider;
+use crate::provider::RdmaRole;
 use crate::provider::{RdmaServerConfig, RdmaCompletionCallback};
 
 fn parse_role(role: &str) -> PyResult<RdmaRole> {
@@ -31,7 +31,7 @@ fn parse_role(role: &str) -> PyResult<RdmaRole> {
 
 // ── RdmaProvider Python class ─────────────────────────────────────────────────
 
-/// Unified RDMA endpoint supporting client, server, or both roles.
+/// Unified RDMA provider supporting client, server, or both roles.
 ///
 /// Wraps the Rust ``RdmaProvider`` trait and supports all provider types
 /// (``"mock"``, ``"cuobj"``, ``"auto"``) and roles (``"client"``,
@@ -58,7 +58,7 @@ pub struct PyRdmaProvider {
 
 #[pymethods]
 impl PyRdmaProvider {
-    /// Create an RDMA endpoint.
+    /// Create an RDMA provider.
     ///
     /// :param provider: ``"mock"`` (default), ``"cuobj"``, or ``"auto"``.
     /// :param role: ``"both"`` (default), ``"client"``, or ``"server"``.
@@ -112,10 +112,10 @@ impl PyRdmaProvider {
     /// Transport protocol: ``"mock"`` or ``"cuobj"``.
     fn protocol(&self) -> &str { self.inner.protocol() }
 
-    /// ``True`` if this endpoint supports client-side operations.
+    /// ``True`` if this provider supports client-side operations.
     fn supports_client(&self) -> bool { self.inner.supports_client() }
 
-    /// ``True`` if this endpoint supports server-side operations.
+    /// ``True`` if this provider supports server-side operations.
     fn supports_server(&self) -> bool { self.inner.supports_server() }
 
     /// Capacity in bytes of the server's per-slot transfer buffer.
@@ -289,7 +289,7 @@ impl PyRdmaProvider {
 
 // ── MockRdmaProvider — convenience subclass with a simpler constructor ─────────
 
-/// Mock RDMA endpoint — no NVIDIA hardware required.
+/// Mock RDMA provider — no NVIDIA hardware required.
 ///
 /// Equivalent to ``RdmaProvider(provider="mock", role="both")`` with a
 /// simpler constructor.  Both client and server roles are active.
@@ -306,7 +306,7 @@ pub struct PyMockRdmaProvider;
 
 #[pymethods]
 impl PyMockRdmaProvider {
-    /// Create a mock endpoint.
+    /// Create a mock provider.
     ///
     /// :param debug: if ``True``, print trace lines to stderr.
     #[new]
@@ -319,7 +319,7 @@ impl PyMockRdmaProvider {
 
 // ── CuObjProvider — convenience subclass for the cuObject RDMA provider ───────
 
-/// CuObj RDMA endpoint — requires NVIDIA hardware and the cuObject SDK plugin.
+/// CuObj RDMA provider — requires NVIDIA hardware and the cuObject SDK plugin.
 ///
 /// Equivalent to ``RdmaProvider(provider="cuobj", role=role)`` with a
 /// simpler constructor.  Raises ``RuntimeError`` if the cuObj plugin
@@ -345,7 +345,7 @@ pub struct PyCuObjProvider;
 
 #[pymethods]
 impl PyCuObjProvider {
-    /// Create a cuObj RDMA endpoint.
+    /// Create a cuObj RDMA provider.
     ///
     /// :param role: ``"both"`` (default), ``"client"``, or ``"server"``.
     /// :param debug: emit trace lines to stderr (default ``False``).

@@ -18,7 +18,7 @@ use jni::sys::{jboolean, jbyteArray, jlong, JNI_TRUE};
 use jni::JNIEnv;
 
 use s3_rdma::MockRdmaProvider;
-use s3_rdma::endpoint::{RdmaRole, RdmaProvider};
+use s3_rdma::provider::{RdmaRole, RdmaProvider};
 use s3_rdma::provider::{RdmaCompletionCallback, RdmaCompletionResult, RdmaServerConfig};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -27,7 +27,7 @@ use s3_rdma::provider::{RdmaCompletionCallback, RdmaCompletionResult, RdmaServer
 /// `handle` must be a non-null `jlong` obtained from `nativeCreate` and not yet
 /// passed to `nativeDestroy`.  The caller must not call `nativeDestroy` while
 /// any reference produced by this function is still live.
-unsafe fn endpoint_ref(handle: jlong) -> &'static MockRdmaProvider {
+unsafe fn provider_ref(handle: jlong) -> &'static MockRdmaProvider {
     unsafe { &*(handle as *const MockRdmaProvider) }
 }
 
@@ -69,7 +69,7 @@ pub extern "system" fn Java_io_s3rdma_MockRdmaProvider_nativeName<'a>(
     _obj: JObject<'a>,
     handle: jlong,
 ) -> JString<'a> {
-    let name = unsafe { endpoint_ref(handle) }.name();
+    let name = unsafe { provider_ref(handle) }.name();
     env.new_string(name).unwrap_or_else(|_| JString::default())
 }
 
@@ -92,7 +92,7 @@ pub extern "system" fn Java_io_s3rdma_MockRdmaProvider_nativeIsMemorySuitable(
     ptr: jlong,
     size: jlong,
 ) -> jboolean {
-    let suitable = unsafe { endpoint_ref(handle) }
+    let suitable = unsafe { provider_ref(handle) }
         .is_memory_suitable(ptr as *const u8, size as usize);
     suitable as jboolean
 }
@@ -107,7 +107,7 @@ pub extern "system" fn Java_io_s3rdma_MockRdmaProvider_nativeRegisterMemory(
 ) {
     let len = env.get_array_length(&buf).unwrap_or(0) as usize;
     let base_ptr = buf.as_raw() as *mut u8;
-    if let Err(e) = unsafe { endpoint_ref(handle) }.register_memory(base_ptr, len) {
+    if let Err(e) = unsafe { provider_ref(handle) }.register_memory(base_ptr, len) {
         throw(&mut env, &e.to_string());
     }
 }
@@ -121,7 +121,7 @@ pub extern "system" fn Java_io_s3rdma_MockRdmaProvider_nativeDeregisterMemory(
     buf: JByteArray<'_>,
 ) {
     let base_ptr = buf.as_raw() as *mut u8;
-    if let Err(e) = unsafe { endpoint_ref(handle) }.deregister_memory(base_ptr) {
+    if let Err(e) = unsafe { provider_ref(handle) }.deregister_memory(base_ptr) {
         throw(&mut env, &e.to_string());
     }
 }
@@ -142,7 +142,7 @@ pub extern "system" fn Java_io_s3rdma_MockRdmaProvider_nativePreparePutToken(
         Err(e) => { throw(&mut env, &e.to_string()); return std::ptr::null_mut(); }
     };
     let buf_ptr = buf.as_raw() as *const u8;
-    match unsafe { endpoint_ref(handle) }.prepare_put_token(
+    match unsafe { provider_ref(handle) }.prepare_put_token(
         &key_bytes, buf_ptr, size as usize, offset as usize,
     ) {
         Ok(token) => env.byte_array_from_slice(&token)
@@ -168,7 +168,7 @@ pub extern "system" fn Java_io_s3rdma_MockRdmaProvider_nativePrepareGetToken(
         Err(e) => { throw(&mut env, &e.to_string()); return std::ptr::null_mut(); }
     };
     let buf_ptr = buf.as_raw() as *mut u8;
-    match unsafe { endpoint_ref(handle) }.prepare_get_token(
+    match unsafe { provider_ref(handle) }.prepare_get_token(
         &key_bytes, buf_ptr, size as usize, offset as usize,
     ) {
         Ok(token) => env.byte_array_from_slice(&token)
@@ -216,7 +216,7 @@ pub extern "system" fn Java_io_s3rdma_MockRdmaProvider_nativeProcessReplyToken(
 
     // Use process_rdma_reply with status=200 and usize::MAX transferred so the
     // mock copies all available GET data (matching old process_reply_token behavior).
-    if let Err(e) = unsafe { endpoint_ref(handle) }
+    if let Err(e) = unsafe { provider_ref(handle) }
         .process_rdma_reply(200, &reply_bytes, usize::MAX, cb)
     {
         throw(&mut env, &e.to_string());
@@ -266,7 +266,7 @@ pub extern "system" fn Java_io_s3rdma_MockRdmaServerProvider_nativeName<'a>(
     _obj: JObject<'a>,
     handle: jlong,
 ) -> JString<'a> {
-    let name = unsafe { endpoint_ref(handle) }.name();
+    let name = unsafe { provider_ref(handle) }.name();
     env.new_string(name).unwrap_or_else(|_| JString::default())
 }
 
@@ -277,7 +277,7 @@ pub extern "system" fn Java_io_s3rdma_MockRdmaServerProvider_nativeBufSize(
     _obj: JObject<'_>,
     handle: jlong,
 ) -> jlong {
-    unsafe { endpoint_ref(handle) }.buf_size() as jlong
+    unsafe { provider_ref(handle) }.buf_size() as jlong
 }
 
 /// `MockRdmaServerProvider.nativeHandlePut(long, byte[] s3Key, byte[] token, long offset, long size) -> byte[]`
@@ -299,7 +299,7 @@ pub extern "system" fn Java_io_s3rdma_MockRdmaServerProvider_nativeHandlePut(
         Ok(b) => b,
         Err(e) => { throw(&mut env, &e.to_string()); return std::ptr::null_mut(); }
     };
-    let ep = unsafe { endpoint_ref(handle) };
+    let ep = unsafe { provider_ref(handle) };
     let buf_cap = if size > 0 { size as usize } else {
         ep.buf_size().min(128 * 1024 * 1024)
     };
@@ -338,7 +338,7 @@ pub extern "system" fn Java_io_s3rdma_MockRdmaServerProvider_nativeHandleGet(
         Ok(b) => b,
         Err(e) => { throw(&mut env, &e.to_string()); return -1; }
     };
-    match unsafe { endpoint_ref(handle) }.handle_get(
+    match unsafe { provider_ref(handle) }.handle_get(
         &key_bytes, &data_bytes, &token_bytes, offset as usize,
     ) {
         Ok(written) => written as jlong,
@@ -403,7 +403,7 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeCreate(
     let shm_path_str  = jstr!(shm_path);
     let listen_str    = jstr!(listen_addr);
 
-    let endpoint_role = match parse_role(&role_str) {
+    let provider_role = match parse_role(&role_str) {
         Some(r) => r,
         None => {
             throw(&mut env, &format!(
@@ -420,7 +420,7 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeCreate(
         buf_size:    buf_size as usize,
     };
 
-    match s3_rdma::create_provider(&provider_str, debug == JNI_TRUE, endpoint_role, &cfg) {
+    match s3_rdma::create_provider(&provider_str, debug == JNI_TRUE, provider_role, &cfg) {
         Ok(arc) => Box::into_raw(Box::new(arc)) as jlong,
         Err(e)  => { throw(&mut env, &e.to_string()); 0 }
     }
