@@ -14,7 +14,7 @@ package io.s3rdma;
  * }
  * }</pre>
  */
-public final class MockRdmaProvider extends RdmaProvider {
+public final class MockRdmaProvider implements AutoCloseable {
 
     static {
         System.loadLibrary("s3_rdma_jni");
@@ -27,45 +27,36 @@ public final class MockRdmaProvider extends RdmaProvider {
         this.nativeHandle = nativeCreate(debug);
     }
 
-    // ── RdmaProvider implementation ────────────────────────────────────────
+    
 
-    @Override public String name()    { return nativeName(nativeHandle); }
-    @Override public String version() { return nativeVersion(nativeHandle); }
 
-    @Override
     public boolean isMemorySuitable(long ptr, long size) {
         return nativeIsMemorySuitable(nativeHandle, ptr, size);
     }
 
-    @Override
     public void registerMemory(byte[] buf) throws RdmaException {
         nativeRegisterMemory(nativeHandle, buf);
     }
 
-    @Override
     public void deregisterMemory(byte[] buf) throws RdmaException {
         nativeDeregisterMemory(nativeHandle, buf);
     }
 
-    @Override
     public byte[] preparePutToken(byte[] s3Key, byte[] buffer, long offset, long size)
             throws RdmaException {
         return nativePreparePutToken(nativeHandle, s3Key, buffer, offset, size);
     }
 
-    @Override
     public byte[] prepareGetToken(byte[] s3Key, byte[] buffer, long offset, long size)
             throws RdmaException {
         return nativePrepareGetToken(nativeHandle, s3Key, buffer, offset, size);
     }
 
-    @Override
     public void processReplyToken(byte[] replyToken, RdmaCompletionCallback callback)
             throws RdmaException {
         nativeProcessReplyToken(nativeHandle, replyToken, callback);
     }
 
-    @Override
     public void close() {
         nativeDestroy(nativeHandle);
     }

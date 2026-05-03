@@ -1,14 +1,14 @@
-//! Example: s3-rdma endpoint API using MockRdmaEndpoint (no hardware required).
+//! Example: s3-rdma endpoint API using MockRdmaProvider (no hardware required).
 //!
 //! Run with:
 //!   cargo run --example mock_provider --manifest-path s3-rdma/Cargo.toml
 
-use s3_rdma::{rdma_provider_info, MockRdmaEndpoint, RdmaEndpoint};
+use s3_rdma::{rdma_provider_info, MockRdmaProvider, RdmaProvider};
 
 fn main() {
     println!("=== s3-rdma Rust example ===\n");
 
-    let provider = MockRdmaEndpoint::new(true, "/dev/shm", 0);
+    let provider = MockRdmaProvider::new(true, "/dev/shm", 0);
     println!("Provider : {}", provider.name());
 
     // Allocate a buffer to act as the RDMA-registered memory region.

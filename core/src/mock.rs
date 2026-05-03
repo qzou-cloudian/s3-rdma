@@ -10,7 +10,7 @@
 //! ```
 //! `shm-name` is `rdma-{pid}-{buf_ptr_hex}` (hyphens only, no underscores).
 //!
-//! ## Client lifecycle ([`MockRdmaEndpoint`])
+//! ## Client lifecycle ([`MockRdmaProvider`])
 //! | Step | Client calls | Effect |
 //! |------|-------------|--------|
 //! | 1 | `register_memory(ptr, size)` | Creates `/dev/shm/{shm-name}`, `mmap`s it |
@@ -20,7 +20,7 @@
 //! | 4 | `process_rdma_reply(status, request_token, transferred, cb)` | For GET: copies shm → `ptr`; cleans up shm |
 //! | 5 | `deregister_memory(ptr)` | Cleans up if not already done by step 4 |
 //!
-//! ## Server lifecycle ([`MockRdmaEndpoint`])
+//! ## Server lifecycle ([`MockRdmaProvider`])
 //! | Step | Server calls | Effect |
 //! |------|-------------|--------|
 //! | 1 | `handle_put(token, size)` | Opens `/dev/shm/{shm-name}`, reads `size` bytes |
@@ -32,7 +32,7 @@ use std::os::unix::io::AsRawFd;
 use std::sync::Mutex;
 
 use crate::error::RdmaError;
-use crate::endpoint::RdmaEndpoint;
+use crate::endpoint::RdmaProvider;
 use crate::provider::{RdmaCompletionCallback, RdmaCompletionResult};
 
 /// Base directory for shared-memory files.
@@ -75,7 +75,7 @@ impl ShmEntry {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MockRdmaEndpoint  (unified client + server)
+// MockRdmaProvider  (unified client + server)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Unified mock RDMA endpoint that supports both client and server roles.
@@ -87,7 +87,7 @@ impl ShmEntry {
 /// Both roles use the same `/dev/shm` directory; the client creates SHM files
 /// keyed by buffer pointer, and the server reads or writes those files using
 /// the token embedded in the S3 request.
-pub struct MockRdmaEndpoint {
+pub struct MockRdmaProvider {
     debug:    bool,
     shm_dir:  String,
     buf_size: usize,
@@ -96,9 +96,9 @@ pub struct MockRdmaEndpoint {
     reply_header: &'static str,
 }
 
-impl std::fmt::Debug for MockRdmaEndpoint {
+impl std::fmt::Debug for MockRdmaProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MockRdmaEndpoint")
+        f.debug_struct("MockRdmaProvider")
             .field("debug", &self.debug)
             .field("shm_dir", &self.shm_dir)
             .field("buf_size", &self.buf_size)
@@ -106,7 +106,7 @@ impl std::fmt::Debug for MockRdmaEndpoint {
     }
 }
 
-impl MockRdmaEndpoint {
+impl MockRdmaProvider {
     /// Create a new endpoint.
     ///
     /// - `debug` — emit trace lines to stderr.
@@ -131,7 +131,7 @@ impl MockRdmaEndpoint {
 
     fn dbg(&self, msg: &str) {
         if self.debug {
-            eprintln!("[MockRdmaEndpoint] {msg}");
+            eprintln!("[MockRdmaProvider] {msg}");
         }
     }
 
@@ -151,8 +151,8 @@ impl MockRdmaEndpoint {
     }
 }
 
-impl RdmaEndpoint for MockRdmaEndpoint {
-    fn name(&self) -> &str { "MockRdmaEndpoint" }
+impl RdmaProvider for MockRdmaProvider {
+    fn name(&self) -> &str { "MockRdmaProvider" }
     fn protocol(&self) -> &str { "mock" }
     fn supports_client(&self) -> bool { true }
     fn supports_server(&self) -> bool { true }

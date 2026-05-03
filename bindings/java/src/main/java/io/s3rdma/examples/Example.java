@@ -1,8 +1,8 @@
 package io.s3rdma.examples;
 
-import io.s3rdma.CuObjEndpoint;
-import io.s3rdma.RdmaEndpoint;
-import io.s3rdma.RdmaEndpointConfig;
+import io.s3rdma.CuObjProvider;
+import io.s3rdma.RdmaProvider;
+import io.s3rdma.RdmaProviderConfig;
 import io.s3rdma.RdmaException;
 
 import java.nio.charset.StandardCharsets;
@@ -11,7 +11,7 @@ import java.util.Arrays;
 /**
  * s3-rdma Java binding example.
  *
- * <p>Demonstrates the unified {@link RdmaEndpoint} API with both mock and
+ * <p>Demonstrates the unified {@link RdmaProvider} API with both mock and
  * cuObj providers for client and server roles — no NVIDIA hardware required
  * for the mock provider.</p>
  *
@@ -44,7 +44,7 @@ public class Example {
     static void demoMockBothRoles() throws RdmaException {
         System.out.println("=== Mock endpoint — both roles ===\n");
 
-        try (RdmaEndpoint ep = RdmaEndpoint.create("mock", "both", RdmaEndpointConfig.defaults())) {
+        try (RdmaProvider ep = RdmaProvider.create("mock", "both", RdmaProviderConfig.defaults())) {
             System.out.println("  endpoint : " + ep);
             System.out.println("  client?  : " + ep.supportsClient());
             System.out.println("  server?  : " + ep.supportsServer());
@@ -86,7 +86,7 @@ public class Example {
     static void demoMockClientRole() throws RdmaException {
         System.out.println("=== Mock endpoint — client role only ===\n");
 
-        try (RdmaEndpoint ep = RdmaEndpoint.create("mock", "client", RdmaEndpointConfig.defaults())) {
+        try (RdmaProvider ep = RdmaProvider.create("mock", "client", RdmaProviderConfig.defaults())) {
             System.out.println("  endpoint : " + ep);
 
             byte[] data = new byte[1024];
@@ -106,8 +106,8 @@ public class Example {
     static void demoMockServerRole() throws RdmaException {
         System.out.println("=== Mock endpoint — server role only ===\n");
 
-        try (RdmaEndpoint client = RdmaEndpoint.create("mock", "client", RdmaEndpointConfig.defaults());
-             RdmaEndpoint server = RdmaEndpoint.create("mock", "server", RdmaEndpointConfig.defaults())) {
+        try (RdmaProvider client = RdmaProvider.create("mock", "client", RdmaProviderConfig.defaults());
+             RdmaProvider server = RdmaProvider.create("mock", "server", RdmaProviderConfig.defaults())) {
 
             System.out.println("  server endpoint : " + server);
 
@@ -136,19 +136,19 @@ public class Example {
     static void demoCuObjAutoFallback() throws RdmaException {
         System.out.println("=== Auto endpoint (cuobj → mock fallback) ===\n");
 
-        try (RdmaEndpoint ep = RdmaEndpoint.create("auto", "both", RdmaEndpointConfig.defaults())) {
+        try (RdmaProvider ep = RdmaProvider.create("auto", "both", RdmaProviderConfig.defaults())) {
             System.out.println("  endpoint : " + ep);
             System.out.println("  protocol : " + ep.protocol());
         }
         System.out.println();
     }
 
-    /** CuObjEndpoint convenience class: raises RdmaException when the plugin is absent. */
+    /** CuObjProvider convenience class: raises RdmaException when the plugin is absent. */
     static void demoCuObjClientExpectFailure() {
-        System.out.println("=== CuObjEndpoint (client) — expecting RdmaException without plugin ===\n");
+        System.out.println("=== CuObjProvider (client) — expecting RdmaException without plugin ===\n");
 
         try {
-            try (CuObjEndpoint ep = new CuObjEndpoint("client", RdmaEndpointConfig.defaults())) {
+            try (CuObjProvider ep = new CuObjProvider("client", RdmaProviderConfig.defaults())) {
                 System.out.println("  cuObj available: " + ep);
             }
         } catch (RdmaException e) {

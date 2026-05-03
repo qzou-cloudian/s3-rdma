@@ -15,7 +15,7 @@ GPU-Direct RDMA PUT:
                        (CPU not in the data path)
 ```
 
-This project exposes that capability through a uniform `RdmaEndpoint` interface implemented in Rust and wrapped for Python and Java. No NVIDIA hardware is required for development — a `MockRdmaEndpoint` exercises the full API path without touching any hardware.
+This project exposes that capability through a uniform `RdmaProvider` interface implemented in Rust and wrapped for Python and Java. No NVIDIA hardware is required for development — a `MockRdmaProvider` exercises the full API path without touching any hardware.
 
 ---
 
@@ -23,7 +23,7 @@ This project exposes that capability through a uniform `RdmaEndpoint` interface 
 
 ```
 s3-rdma/
-├── core/                    # RdmaEndpoint trait, MockRdmaEndpoint, CuObjEndpoint, BufferPool
+├── core/                    # RdmaProvider trait, MockRdmaProvider, CuObjProvider, BufferPool
 ├── providers/
 │   ├── cuobj-client/        # Client cdylib plugin → libs3rdmacuobjclient.so
 │   └── cuobj-server/        # Server cdylib plugin → libs3rdmacuobjserver.so
@@ -38,7 +38,7 @@ s3-rdma/
 
 ## Provider model
 
-### Client side (`RdmaEndpoint` — client role)
+### Client side (`RdmaProvider` — client role)
 
 The client-side abstraction used by S3 clients and relay nodes:
 
@@ -64,7 +64,7 @@ client                        S3 server
 
 Header names are provider-configurable (`x-amz-rdma-token`, `x-amz-rdma-reply`).
 
-### Server side (`RdmaEndpoint` — server role)
+### Server side (`RdmaProvider` — server role)
 
 The server-side abstraction used by the S3 gateway:
 
@@ -169,7 +169,7 @@ RDMA_GET_rdma-buf-0_8192_0_key_my-bucket/my-object.bin
 
 ## Providers
 
-### MockRdmaEndpoint
+### MockRdmaProvider
 
 Built into `core`. Accepts any non-null buffer, generates deterministic ASCII tokens, and invokes the completion callback synchronously. No hardware or SDK required. Uses `/dev/shm` files as the transfer medium so client and server can run in separate processes on the same host (or in Docker containers sharing `ipc: host`). Supports both client and server roles from a single instance.
 
@@ -210,9 +210,9 @@ s3-rdma = { path = "core" }
 ```
 
 ```rust
-use s3_rdma::{MockRdmaEndpoint, endpoint::RdmaEndpoint};
+use s3_rdma::{MockRdmaProvider, endpoint::RdmaProvider};
 
-let ep = MockRdmaEndpoint::with_debug(false);
+let ep = MockRdmaProvider::with_debug(false);
 let mut buf = vec![0u8; 4 * 1024 * 1024];
 let key = b"my-bucket/my-object.bin";
 
@@ -353,5 +353,5 @@ mvn compile -f bindings/java/pom.xml
 
 Place `libs3rdmacuobjclient.so` and `libs3rdmacuobjserver.so` alongside the gateway binary or on `LD_LIBRARY_PATH` before starting either the client or server process.
 
-Minimum Rust edition: **2021**.  `unsafe` in `core` is limited to raw pointer forwarding to provider implementations and POSIX SHM operations in `MockRdmaEndpoint`.
+Minimum Rust edition: **2021**.  `unsafe` in `core` is limited to raw pointer forwarding to provider implementations and POSIX SHM operations in `MockRdmaProvider`.
 

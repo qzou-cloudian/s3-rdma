@@ -6,27 +6,27 @@
 //! const RdmaProviderVtable *s3_rdma_provider_get_vtable(void);
 //! ```
 //!
-//! The vtable is always backed by [`MockRdmaEndpoint`] — this is intentional:
+//! The vtable is always backed by [`MockRdmaProvider`] — this is intentional:
 //! the `c-abi` feature targets test environments and tooling that need a
 //! drop-in mock without NVIDIA hardware.  For real cuObject RDMA, load
 //! `libs3rdmacuobjclient.so` (from `providers/cuobj-client`) instead.
 //!
-//! [`MockRdmaEndpoint`]: crate::mock::MockRdmaEndpoint
+//! [`MockRdmaProvider`]: crate::mock::MockRdmaProvider
 
 use std::ffi::c_void;
 use std::os::raw::c_char;
 use std::sync::OnceLock;
 
-use crate::endpoint::RdmaEndpoint;
+use crate::endpoint::RdmaProvider;
 use crate::ffi::{ByteCursor, RdmaCompletionFn, RdmaProviderVtable};
 use crate::provider::RdmaCompletionCallback;
 
 static PROVIDER_NAME: &[u8] = b"s3-rdma\0";
 
-fn get_endpoint() -> &'static dyn RdmaEndpoint {
-    static INSTANCE: OnceLock<Box<dyn RdmaEndpoint>> = OnceLock::new();
+fn get_provider() -> &'static dyn RdmaProvider {
+    static INSTANCE: OnceLock<Box<dyn RdmaProvider>> = OnceLock::new();
     INSTANCE.get_or_init(|| {
-        Box::new(crate::MockRdmaEndpoint::with_debug(false))
+        Box::new(crate::MockRdmaProvider::with_debug(false))
     }).as_ref()
 }
 
@@ -34,25 +34,25 @@ unsafe extern "C" fn c_init(_: *mut c_void, _: *mut *mut c_void) -> i32 { 0 }
 unsafe extern "C" fn c_cleanup(_: *mut c_void) {}
 
 unsafe extern "C" fn c_is_memory_suitable(_: *mut c_void, ptr: *const c_void, size: usize) -> bool {
-    get_endpoint().is_memory_suitable(ptr as *const u8, size)
+    get_provider().is_memory_suitable(ptr as *const u8, size)
 }
 
 unsafe extern "C" fn c_register_memory(_: *mut c_void, ptr: *mut c_void, size: usize) -> i32 {
-    match get_endpoint().register_memory(ptr as *mut u8, size) {
+    match get_provider().register_memory(ptr as *mut u8, size) {
         Ok(()) => 0,
         Err(e) => { eprintln!("[s3-rdma] register_memory: {e}"); -1 }
     }
 }
 
 unsafe extern "C" fn c_deregister_memory(_: *mut c_void, ptr: *mut c_void) -> i32 {
-    match get_endpoint().deregister_memory(ptr as *mut u8) {
+    match get_provider().deregister_memory(ptr as *mut u8) {
         Ok(()) => 0,
         Err(e) => { eprintln!("[s3-rdma] deregister_memory: {e}"); -1 }
     }
 }
 
 unsafe extern "C" fn c_get_max_transfer_size(_: *mut c_void, ptr: *const c_void) -> usize {
-    get_endpoint().get_max_transfer_size(ptr as *const u8)
+    get_provider().get_max_transfer_size(ptr as *const u8)
 }
 
 unsafe extern "C" fn c_prepare_put_token(
@@ -62,7 +62,7 @@ unsafe extern "C" fn c_prepare_put_token(
 ) -> i32 {
     if s3_key.is_null() || out.is_null() { return -1; }
     let key = unsafe { (*s3_key).as_slice() };
-    match get_endpoint().prepare_put_token(key, buffer as *const u8, size, offset) {
+    match get_provider().prepare_put_token(key, buffer as *const u8, size, offset) {
         Ok(token) => {
             let leaked = token.into_boxed_slice();
             let len = leaked.len();
@@ -81,7 +81,7 @@ unsafe extern "C" fn c_prepare_get_token(
 ) -> i32 {
     if s3_key.is_null() || out.is_null() { return -1; }
     let key = unsafe { (*s3_key).as_slice() };
-    match get_endpoint().prepare_get_token(key, buffer as *mut u8, size, offset) {
+    match get_provider().prepare_get_token(key, buffer as *mut u8, size, offset) {
         Ok(token) => {
             let leaked = token.into_boxed_slice();
             let len = leaked.len();
@@ -118,24 +118,24 @@ unsafe extern "C" fn c_process_reply_token(
 
     // The C ABI c_process_reply_token is only called after a confirmed RDMA
     // transfer (status=200); error cases fire the callback directly in the caller.
-    match get_endpoint().process_rdma_reply(200, &token, 0, cb) {
+    match get_provider().process_rdma_reply(200, &token, 0, cb) {
         Ok(()) => 0,
         Err(e) => { eprintln!("[s3-rdma] process_reply_token: {e}"); -1 }
     }
 }
 
 unsafe extern "C" fn c_rdma_token_header_name(_: *mut c_void) -> ByteCursor {
-    let s = get_endpoint().rdma_token_header_name();
+    let s = get_provider().rdma_token_header_name();
     ByteCursor { ptr: s.as_ptr(), len: s.len() }
 }
 
 unsafe extern "C" fn c_rdma_reply_header_name(_: *mut c_void) -> ByteCursor {
-    let s = get_endpoint().rdma_reply_header_name();
+    let s = get_provider().rdma_reply_header_name();
     ByteCursor { ptr: s.as_ptr(), len: s.len() }
 }
 
 unsafe extern "C" fn c_rdma_bytes_header_name(_: *mut c_void) -> ByteCursor {
-    let s = get_endpoint().rdma_bytes_header_name();
+    let s = get_provider().rdma_bytes_header_name();
     ByteCursor { ptr: s.as_ptr(), len: s.len() }
 }
 

@@ -1,6 +1,6 @@
 //! Python bindings for `s3-rdma` via PyO3.
 //!
-//! Exposes [`RdmaEndpoint`] and [`MockRdmaEndpoint`] to Python.
+//! Exposes [`RdmaProvider`] and [`MockRdmaProvider`] to Python.
 //! Build with maturin from the `bindings/python/` directory:
 //!
 //! ```sh
@@ -14,33 +14,33 @@ use pyo3::prelude::*;
 use pyo3::PyClassInitializer;
 use pyo3::types::PyBytes;
 
-use crate::endpoint::RdmaEndpoint;
-use crate::endpoint::EndpointRole;
+use crate::endpoint::RdmaProvider;
+use crate::endpoint::RdmaRole;
 use crate::provider::{RdmaServerConfig, RdmaCompletionCallback};
 
-fn parse_role(role: &str) -> PyResult<EndpointRole> {
+fn parse_role(role: &str) -> PyResult<RdmaRole> {
     match role {
-        "client" => Ok(EndpointRole::Client),
-        "server" => Ok(EndpointRole::Server),
-        "both"   => Ok(EndpointRole::Both),
+        "client" => Ok(RdmaRole::Client),
+        "server" => Ok(RdmaRole::Server),
+        "both"   => Ok(RdmaRole::Both),
         other => Err(PyRuntimeError::new_err(
             format!("unknown role '{other}' (valid: client, server, both)")
         )),
     }
 }
 
-// ── RdmaEndpoint Python class ─────────────────────────────────────────────────
+// ── RdmaProvider Python class ─────────────────────────────────────────────────
 
 /// Unified RDMA endpoint supporting client, server, or both roles.
 ///
-/// Wraps the Rust ``RdmaEndpoint`` trait and supports all provider types
+/// Wraps the Rust ``RdmaProvider`` trait and supports all provider types
 /// (``"mock"``, ``"cuobj"``, ``"auto"``) and roles (``"client"``,
 /// ``"server"``, ``"both"``).
 ///
 /// Example (client role)::
 ///
 ///     import s3_rdma
-///     ep = s3_rdma.RdmaEndpoint(provider="mock", role="client")
+///     ep = s3_rdma.RdmaProvider(provider="mock", role="client")
 ///     ep.register_memory(data)
 ///     token = ep.prepare_put_token(data, 0, len(data), b"bucket/key")
 ///     ep.process_rdma_reply(200, token, len(data), lambda code, reply: None)
@@ -48,16 +48,16 @@ fn parse_role(role: &str) -> PyResult<EndpointRole> {
 ///
 /// Example (server role)::
 ///
-///     ep = s3_rdma.RdmaEndpoint(provider="mock", role="server")
+///     ep = s3_rdma.RdmaProvider(provider="mock", role="server")
 ///     received = ep.handle_put(b"bucket/key", token, size=len(data))
 ///     written  = ep.handle_get(b"bucket/key", received, token)
-#[pyclass(name = "RdmaEndpoint", subclass)]
-pub struct PyRdmaEndpoint {
-    inner: Arc<dyn RdmaEndpoint>,
+#[pyclass(name = "RdmaProvider", subclass)]
+pub struct PyRdmaProvider {
+    inner: Arc<dyn RdmaProvider>,
 }
 
 #[pymethods]
-impl PyRdmaEndpoint {
+impl PyRdmaProvider {
     /// Create an RDMA endpoint.
     ///
     /// :param provider: ``"mock"`` (default), ``"cuobj"``, or ``"auto"``.
@@ -99,14 +99,14 @@ impl PyRdmaEndpoint {
             pool_count,
             buf_size,
         };
-        crate::create_endpoint(provider, debug, endpoint_role, &cfg)
+        crate::create_provider(provider, debug, endpoint_role, &cfg)
             .map(|inner| Self { inner })
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     // ── Info ─────────────────────────────────────────────────────────────────
 
-    /// Human-readable endpoint name (e.g. ``"MockRdmaEndpoint"``).
+    /// Human-readable endpoint name (e.g. ``"MockRdmaProvider"``).
     fn name(&self) -> &str { self.inner.name() }
 
     /// Transport protocol: ``"mock"`` or ``"cuobj"``.
@@ -278,7 +278,7 @@ impl PyRdmaEndpoint {
 
     fn __repr__(&self) -> String {
         format!(
-            "RdmaEndpoint(name={}, protocol={}, client={}, server={})",
+            "RdmaProvider(name={}, protocol={}, client={}, server={})",
             self.inner.name(),
             self.inner.protocol(),
             self.inner.supports_client(),
@@ -287,41 +287,41 @@ impl PyRdmaEndpoint {
     }
 }
 
-// ── MockRdmaEndpoint — convenience subclass with a simpler constructor ─────────
+// ── MockRdmaProvider — convenience subclass with a simpler constructor ─────────
 
 /// Mock RDMA endpoint — no NVIDIA hardware required.
 ///
-/// Equivalent to ``RdmaEndpoint(provider="mock", role="both")`` with a
+/// Equivalent to ``RdmaProvider(provider="mock", role="both")`` with a
 /// simpler constructor.  Both client and server roles are active.
 ///
 /// Example::
 ///
 ///     import s3_rdma
-///     ep = s3_rdma.MockRdmaEndpoint(debug=True)
+///     ep = s3_rdma.MockRdmaProvider(debug=True)
 ///     ep.register_memory(data)
 ///     token = ep.prepare_put_token(data, 0, len(data), b"bucket/key")
 ///     received = ep.handle_put(b"bucket/key", token, size=len(data))
-#[pyclass(name = "MockRdmaEndpoint", extends = PyRdmaEndpoint)]
-pub struct PyMockRdmaEndpoint;
+#[pyclass(name = "MockRdmaProvider", extends = PyRdmaProvider)]
+pub struct PyMockRdmaProvider;
 
 #[pymethods]
-impl PyMockRdmaEndpoint {
+impl PyMockRdmaProvider {
     /// Create a mock endpoint.
     ///
     /// :param debug: if ``True``, print trace lines to stderr.
     #[new]
     #[pyo3(signature = (debug = false))]
     fn new(debug: bool) -> PyResult<PyClassInitializer<Self>> {
-        let base = PyRdmaEndpoint::new("mock", "both", debug, "/dev/shm", "", 0, 4, 0)?;
-        Ok(PyClassInitializer::from(base).add_subclass(PyMockRdmaEndpoint))
+        let base = PyRdmaProvider::new("mock", "both", debug, "/dev/shm", "", 0, 4, 0)?;
+        Ok(PyClassInitializer::from(base).add_subclass(PyMockRdmaProvider))
     }
 }
 
-// ── CuObjEndpoint — convenience subclass for the cuObject RDMA provider ───────
+// ── CuObjProvider — convenience subclass for the cuObject RDMA provider ───────
 
 /// CuObj RDMA endpoint — requires NVIDIA hardware and the cuObject SDK plugin.
 ///
-/// Equivalent to ``RdmaEndpoint(provider="cuobj", role=role)`` with a
+/// Equivalent to ``RdmaProvider(provider="cuobj", role=role)`` with a
 /// simpler constructor.  Raises ``RuntimeError`` if the cuObj plugin
 /// (``libs3rdmacuobjclient.so`` / ``libs3rdmacuobjserver.so``) cannot be
 /// found at runtime.
@@ -329,7 +329,7 @@ impl PyMockRdmaEndpoint {
 /// Example (client role)::
 ///
 ///     import s3_rdma
-///     ep = s3_rdma.CuObjEndpoint(role="client")
+///     ep = s3_rdma.CuObjProvider(role="client")
 ///     ep.register_memory(data)
 ///     token = ep.prepare_put_token(data, 0, len(data), b"bucket/key")
 ///     ep.process_rdma_reply(200, token, len(data), lambda code, reply: None)
@@ -337,14 +337,14 @@ impl PyMockRdmaEndpoint {
 ///
 /// Example (server role)::
 ///
-///     ep = s3_rdma.CuObjEndpoint(role="server", listen_addr="192.168.1.1", listen_port=4791)
+///     ep = s3_rdma.CuObjProvider(role="server", listen_addr="192.168.1.1", listen_port=4791)
 ///     received = ep.handle_put(b"bucket/key", token, size=len(data))
 ///     written  = ep.handle_get(b"bucket/key", received, token)
-#[pyclass(name = "CuObjEndpoint", extends = PyRdmaEndpoint)]
-pub struct PyCuObjEndpoint;
+#[pyclass(name = "CuObjProvider", extends = PyRdmaProvider)]
+pub struct PyCuObjProvider;
 
 #[pymethods]
-impl PyCuObjEndpoint {
+impl PyCuObjProvider {
     /// Create a cuObj RDMA endpoint.
     ///
     /// :param role: ``"both"`` (default), ``"client"``, or ``"server"``.
@@ -372,11 +372,11 @@ impl PyCuObjEndpoint {
         pool_count:  usize,
         buf_size:    usize,
     ) -> PyResult<PyClassInitializer<Self>> {
-        let base = PyRdmaEndpoint::new(
+        let base = PyRdmaProvider::new(
             "cuobj", role, debug, "/dev/shm",
             listen_addr, listen_port, pool_count, buf_size,
         )?;
-        Ok(PyClassInitializer::from(base).add_subclass(PyCuObjEndpoint))
+        Ok(PyClassInitializer::from(base).add_subclass(PyCuObjProvider))
     }
 }
 
@@ -390,9 +390,9 @@ fn rdma_provider_info() -> String {
 
 #[pymodule]
 fn s3_rdma(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PyRdmaEndpoint>()?;
-    m.add_class::<PyMockRdmaEndpoint>()?;
-    m.add_class::<PyCuObjEndpoint>()?;
+    m.add_class::<PyRdmaProvider>()?;
+    m.add_class::<PyMockRdmaProvider>()?;
+    m.add_class::<PyCuObjProvider>()?;
     m.add_function(wrap_pyfunction!(rdma_provider_info, m)?)?;
     Ok(())
 }

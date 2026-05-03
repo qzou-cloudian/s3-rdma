@@ -18,7 +18,7 @@ package io.s3rdma;
  * }
  * }</pre>
  */
-public final class MockRdmaServerProvider extends RdmaServerProvider {
+public final class MockRdmaServerProvider implements AutoCloseable {
 
     static {
         System.loadLibrary("s3_rdma_jni");
@@ -37,24 +37,19 @@ public final class MockRdmaServerProvider extends RdmaServerProvider {
         this.nativeHandle = nativeCreate(debug, shmPath, bufSize);
     }
 
-    // ── RdmaServerProvider implementation ─────────────────────────────────
+    
 
-    @Override public String name()    { return nativeName(nativeHandle); }
-    @Override public long  bufSize()  { return nativeBufSize(nativeHandle); }
 
-    @Override
     public byte[] handlePut(byte[] s3Key, byte[] token, long offset, long size)
             throws RdmaException {
         return nativeHandlePut(nativeHandle, s3Key, token, offset, size);
     }
 
-    @Override
     public long handleGet(byte[] s3Key, byte[] data, byte[] token, long offset)
             throws RdmaException {
         return nativeHandleGet(nativeHandle, s3Key, data, token, offset);
     }
 
-    @Override
     public void close() {
         nativeDestroy(nativeHandle);
     }

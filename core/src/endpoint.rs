@@ -1,6 +1,6 @@
 //! Unified RDMA endpoint trait combining client and server roles.
 //!
-//! [`RdmaEndpoint`] replaces the separate [`RdmaProvider`] (client) and
+//! [`RdmaProvider`] replaces the separate [`RdmaProvider`] (client) and
 //! [`RdmaServerProvider`] (server) traits with a single type that a node can
 //! use for both initiating RDMA transfers (client) and accepting them (server).
 //!
@@ -18,13 +18,13 @@
 //!
 //! ## Implementations
 //!
-//! - [`MockRdmaEndpoint`](crate::mock::MockRdmaEndpoint) – `/dev/shm`-backed,
+//! - [`MockRdmaProvider`](crate::mock::MockRdmaProvider) – `/dev/shm`-backed,
 //!   same-host only; supports both client and server roles.
-//! - [`CuObjEndpoint`](crate::cuobj_client::CuObjEndpoint) – real NVIDIA cuObject;
+//! - [`CuObjProvider`](crate::cuobj_client::CuObjProvider) – real NVIDIA cuObject;
 //!   each role requires the corresponding plugin to be loadable at runtime.
 //!
-//! [`supports_client`]: RdmaEndpoint::supports_client
-//! [`supports_server`]: RdmaEndpoint::supports_server
+//! [`supports_client`]: RdmaProvider::supports_client
+//! [`supports_server`]: RdmaProvider::supports_server
 
 use crate::error::RdmaError;
 use crate::provider::{
@@ -33,11 +33,11 @@ use crate::provider::{
     rdma_status_to_error_code,
 };
 
-// ── EndpointRole ─────────────────────────────────────────────────────────────
+// ── RdmaRole ─────────────────────────────────────────────────────────────
 
 /// Requested role(s) for a new RDMA endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EndpointRole {
+pub enum RdmaRole {
     /// Client only — can initiate RDMA transfers (register memory, generate tokens).
     Client,
     /// Server only — can accept RDMA transfers (handle_put / handle_get).
@@ -46,14 +46,14 @@ pub enum EndpointRole {
     Both,
 }
 
-// ── RdmaEndpoint trait ────────────────────────────────────────────────────────
+// ── RdmaProvider trait ────────────────────────────────────────────────────────
 
 /// Unified RDMA abstraction covering both client-side token generation and
 /// server-side data movement.
 ///
 /// See the [module documentation](self) for an overview.
-pub trait RdmaEndpoint: Send + Sync {
-    /// Human-readable endpoint name (e.g. `"MockRdmaEndpoint"`).
+pub trait RdmaProvider: Send + Sync {
+    /// Human-readable endpoint name (e.g. `"MockRdmaProvider"`).
     fn name(&self) -> &str;
 
     /// Transport protocol string: `"mock"` or `"cuobj"`.
@@ -201,28 +201,28 @@ pub trait RdmaEndpoint: Send + Sync {
     }
 }
 
-// ── RdmaEndpointConfig ────────────────────────────────────────────────────────
+// ── RdmaProviderConfig ────────────────────────────────────────────────────────
 
-/// Unified configuration for constructing an [`RdmaEndpoint`].
+/// Unified configuration for constructing an [`RdmaProvider`].
 ///
 /// The `server_cfg` fields are only used when `role` includes the server role.
 #[derive(Debug, Clone)]
-pub struct RdmaEndpointConfig {
+pub struct RdmaProviderConfig {
     /// Transport protocol: `"mock"`, `"cuobj"`, or `"auto"`.
     pub provider: String,
     /// Role(s) this endpoint should support.
-    pub role: EndpointRole,
+    pub role: RdmaRole,
     /// Emit debug messages to stderr.
     pub debug: bool,
     /// Server-side configuration (used when `role` includes `Server`).
     pub server: RdmaServerConfig,
 }
 
-impl Default for RdmaEndpointConfig {
+impl Default for RdmaProviderConfig {
     fn default() -> Self {
         Self {
             provider: "mock".to_owned(),
-            role: EndpointRole::Both,
+            role: RdmaRole::Both,
             debug: false,
             server: RdmaServerConfig::default(),
         }

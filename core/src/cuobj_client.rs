@@ -317,7 +317,7 @@ pub use real::CuObjClientProvider;
 #[cfg(feature = "cuobj-client")]
 pub use real::is_available as cuobj_available;
 
-// ── CuObjEndpoint ─────────────────────────────────────────────────────────────
+// ── CuObjProvider ─────────────────────────────────────────────────────────────
 
 /// Unified cuObject RDMA endpoint that may carry both client and server roles.
 ///
@@ -328,7 +328,7 @@ pub use real::is_available as cuobj_available;
 ///   (requires `cuobj-server` feature)
 ///
 /// Either or both roles may be absent (plugin not found, hardware unavailable).
-pub struct CuObjEndpoint {
+pub struct CuObjProvider {
     #[cfg(feature = "cuobj-client")]
     client: Option<real::CuObjClientProvider>,
     #[cfg(feature = "cuobj-server")]
@@ -336,18 +336,18 @@ pub struct CuObjEndpoint {
     buf_size: usize,
 }
 
-unsafe impl Send for CuObjEndpoint {}
-unsafe impl Sync for CuObjEndpoint {}
+unsafe impl Send for CuObjProvider {}
+unsafe impl Sync for CuObjProvider {}
 
-impl std::fmt::Debug for CuObjEndpoint {
+impl std::fmt::Debug for CuObjProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CuObjEndpoint")
+        f.debug_struct("CuObjProvider")
             .field("buf_size", &self.buf_size)
             .finish()
     }
 }
 
-impl CuObjEndpoint {
+impl CuObjProvider {
     /// Create a client-only endpoint.
     ///
     /// Returns `Err` if the `cuobj-client` feature is not compiled in or the
@@ -410,8 +410,8 @@ impl CuObjEndpoint {
     }
 }
 
-impl crate::endpoint::RdmaEndpoint for CuObjEndpoint {
-    fn name(&self) -> &str { "CuObjEndpoint" }
+impl crate::endpoint::RdmaProvider for CuObjProvider {
+    fn name(&self) -> &str { "CuObjProvider" }
     fn protocol(&self) -> &str { "cuobj" }
 
     fn supports_client(&self) -> bool {

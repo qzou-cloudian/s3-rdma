@@ -1,7 +1,7 @@
 package io.s3rdma;
 
 /**
- * Configuration for constructing an {@link RdmaEndpoint}.
+ * Configuration for constructing an {@link RdmaProvider}.
  *
  * <p>Fields irrelevant to the chosen provider are silently ignored:</p>
  *
@@ -16,13 +16,13 @@ package io.s3rdma;
  *
  * <p>Obtain defaults via {@link #defaults()}:</p>
  * <pre>{@code
- * RdmaEndpointConfig cfg = RdmaEndpointConfig.defaults();
+ * RdmaProviderConfig cfg = RdmaProviderConfig.defaults();
  * cfg.listenAddr = "192.168.1.1";
  * cfg.listenPort = 4791;
- * RdmaEndpoint ep = RdmaEndpoint.create("cuobj", "server", cfg);
+ * RdmaProvider ep = RdmaProvider.create("cuobj", "server", cfg);
  * }</pre>
  */
-public final class RdmaEndpointConfig {
+public final class RdmaProviderConfig {
 
     /** Emit debug trace lines to stderr. */
     public boolean debug = false;
@@ -43,7 +43,7 @@ public final class RdmaEndpointConfig {
     public long bufSize = 128L * 1024 * 1024;
 
     /** Returns a default configuration suitable for the mock provider. */
-    public static RdmaEndpointConfig defaults() {
-        return new RdmaEndpointConfig();
+    public static RdmaProviderConfig defaults() {
+        return new RdmaProviderConfig();
     }
 }

@@ -10,10 +10,10 @@
 //!   hsc upload/download
 //!         │
 //!         ▼
-//!   Register buffer with cuObject (RdmaEndpoint::register_memory)
+//!   Register buffer with cuObject (RdmaProvider::register_memory)
 //!         │
 //!         ▼
-//!   Generate RDMA token  (RdmaEndpoint::prepare_put_token / prepare_get_token)
+//!   Generate RDMA token  (RdmaProvider::prepare_put_token / prepare_get_token)
 //!         │
 //!         ▼
 //!   aws-sdk-s3 PUT / GET  +  RdmaInterceptor
@@ -24,16 +24,16 @@
 //!   S3 server performs RDMA READ/WRITE on registered buffer
 //!         │
 //!         ▼
-//!   Deregister buffer  (RdmaEndpoint::deregister_memory)
+//!   Deregister buffer  (RdmaProvider::deregister_memory)
 //! ```
 //!
 //! ## Feature flags
 //!
 //! | Feature        | Effect                                                    |
 //! |----------------|-----------------------------------------------------------|
-//! | `cuobj-client` | Enable real [`CuObjEndpoint`] client role (loads plugin at runtime) |
-//! | `cuobj-server` | Enable real [`CuObjEndpoint`] server role (loads plugin at runtime) |
-//! | (default)      | Only [`MockRdmaEndpoint`]                                |
+//! | `cuobj-client` | Enable real [`CuObjProvider`] client role (loads plugin at runtime) |
+//! | `cuobj-server` | Enable real [`CuObjProvider`] server role (loads plugin at runtime) |
+//! | (default)      | Only [`MockRdmaProvider`]                                |
 
 pub mod cuobj_client;
 pub mod cuobj_server;
@@ -61,9 +61,9 @@ pub fn get_vtable_ptr() -> *const ffi::RdmaProviderVtable {
 
 // ── Primary public API ────────────────────────────────────────────────────────
 
-pub use endpoint::{EndpointRole, RdmaEndpoint, RdmaEndpointConfig};
-pub use mock::MockRdmaEndpoint;
-pub use cuobj_client::CuObjEndpoint;
+pub use endpoint::{RdmaRole, RdmaProvider, RdmaProviderConfig};
+pub use mock::MockRdmaProvider;
+pub use cuobj_client::CuObjProvider;
 
 // ── Supporting types ──────────────────────────────────────────────────────────
 
@@ -101,48 +101,48 @@ pub fn rdma_provider_info() -> String {
     format!("RDMA providers: {}", entries.join(", "))
 }
 
-/// Build an `Arc<dyn RdmaEndpoint>` for the named provider and role(s).
+/// Build an `Arc<dyn RdmaProvider>` for the named provider and role(s).
 ///
 /// `provider` must be one of:
-/// - `"mock"`  → [`MockRdmaEndpoint`]
-/// - `"cuobj"` → [`CuObjEndpoint`] (requires `cuobj-client`/`cuobj-server` features)
+/// - `"mock"`  → [`MockRdmaProvider`]
+/// - `"cuobj"` → [`CuObjProvider`] (requires `cuobj-client`/`cuobj-server` features)
 /// - `"auto"`  → tries `"cuobj"` first, falls back to `"mock"`
 ///
 /// `role` specifies which capabilities to initialise:
-/// - [`EndpointRole::Client`]  — client methods (register/token/reply) only
-/// - [`EndpointRole::Server`]  — server methods (handle_put/handle_get) only
-/// - [`EndpointRole::Both`]    — both (typical for a gateway node)
+/// - [`RdmaRole::Client`]  — client methods (register/token/reply) only
+/// - [`RdmaRole::Server`]  — server methods (handle_put/handle_get) only
+/// - [`RdmaRole::Both`]    — both (typical for a gateway node)
 ///
 /// Returns [`RdmaError::ProviderUnavailable`] if the name is unrecognised,
 /// the required feature is not compiled in, or the underlying SDK fails to
 /// initialise.
-pub fn create_endpoint(
+pub fn create_provider(
     provider: &str,
     debug: bool,
-    role: EndpointRole,
+    role: RdmaRole,
     cfg: &RdmaServerConfig,
-) -> Result<Arc<dyn RdmaEndpoint>, RdmaError> {
+) -> Result<Arc<dyn RdmaProvider>, RdmaError> {
     match provider {
         "mock" => {
             if debug {
-                eprintln!("[rdma] Using MockRdmaEndpoint (role={role:?})");
+                eprintln!("[rdma] Using MockRdmaProvider (role={role:?})");
             }
-            Ok(Arc::new(MockRdmaEndpoint::new(debug, &cfg.shm_path, cfg.buf_size)))
+            Ok(Arc::new(MockRdmaProvider::new(debug, &cfg.shm_path, cfg.buf_size)))
         }
         "cuobj" => {
-            let result: Result<Arc<dyn RdmaEndpoint>, RdmaError>;
+            let result: Result<Arc<dyn RdmaProvider>, RdmaError>;
             #[cfg(any(feature = "cuobj-client", feature = "cuobj-server"))]
             {
                 let ep = match role {
-                    EndpointRole::Client => CuObjEndpoint::new_client(),
-                    EndpointRole::Server => CuObjEndpoint::new_server(cfg),
-                    EndpointRole::Both   => CuObjEndpoint::new_both(cfg),
+                    RdmaRole::Client => CuObjProvider::new_client(),
+                    RdmaRole::Server => CuObjProvider::new_server(cfg),
+                    RdmaRole::Both   => CuObjProvider::new_both(cfg),
                 };
                 result = ep.map(|e| {
                     if debug {
-                        eprintln!("[rdma] Using CuObjEndpoint (role={role:?})");
+                        eprintln!("[rdma] Using CuObjProvider (role={role:?})");
                     }
-                    Arc::new(e) as Arc<dyn RdmaEndpoint>
+                    Arc::new(e) as Arc<dyn RdmaProvider>
                 }).map_err(|e| RdmaError::ProviderUnavailable {
                     provider: provider.to_owned(),
                     reason: e.to_string(),
@@ -160,9 +160,9 @@ pub fn create_endpoint(
         }
         "auto" => {
             // Try cuobj first; fall back to mock on any error.
-            match create_endpoint("cuobj", debug, role, cfg) {
+            match create_provider("cuobj", debug, role, cfg) {
                 Ok(ep) => Ok(ep),
-                Err(_) => create_endpoint("mock", debug, role, cfg),
+                Err(_) => create_provider("mock", debug, role, cfg),
             }
         }
         other => Err(RdmaError::ProviderUnavailable {

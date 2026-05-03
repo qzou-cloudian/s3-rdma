@@ -4,14 +4,14 @@
 //! Generic pre-registered buffer pool for RDMA transfers.
 //!
 //! Provides a fixed-size pool of 4 KiB-aligned host buffers that are
-//! optionally pre-registered with any [`RdmaEndpoint`] at construction time.
+//! optionally pre-registered with any [`RdmaProvider`] at construction time.
 //! The three usage modes are:
 //!
 //! | Mode     | `with_rdma()`       | Behaviour                                      |
 //! |----------|---------------------|------------------------------------------------|
 //! | **bytes**| not called (None)   | Plain heap; no RDMA operations                 |
-//! | **mock** | `MockRdmaEndpoint`  | Each slot registered via SHM at startup        |
-//! | **cuobj**| `CuObjEndpoint`     | Each slot pinned with IOMMU at startup         |
+//! | **mock** | `MockRdmaProvider`  | Each slot registered via SHM at startup        |
+//! | **cuobj**| `CuObjProvider`     | Each slot pinned with IOMMU at startup         |
 //!
 //! In all modes the per-transfer cost is `acquire → write/read → release`.
 //! Registration overhead (historically `register_memory` + `deregister_memory`
@@ -35,7 +35,7 @@ use crossbeam_queue::ArrayQueue;
 use tokio::sync::Semaphore;
 
 use crate::error::RdmaError;
-use crate::endpoint::RdmaEndpoint;
+use crate::endpoint::RdmaProvider;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error type
@@ -105,7 +105,7 @@ pub struct BufferPool {
     parking_mu: Mutex<()>,
     parking_cv: Condvar,
     /// Provider used to register/deregister slots.  `None` → plain-bytes mode.
-    rdma:       Option<Arc<dyn RdmaEndpoint>>,
+    rdma:       Option<Arc<dyn RdmaProvider>>,
 }
 
 // SAFETY: `free_queue` and `sem` provide lock-free/atomic synchronisation;
@@ -338,7 +338,7 @@ impl Drop for OwnedBufferGuard {
 pub struct BufferPoolBuilder {
     count: usize,
     size:  usize,
-    rdma:  Option<Arc<dyn RdmaEndpoint>>,
+    rdma:  Option<Arc<dyn RdmaProvider>>,
 }
 
 impl BufferPoolBuilder {
@@ -351,11 +351,11 @@ impl BufferPoolBuilder {
     /// Attach an RDMA endpoint.  All slots are registered with it at build
     /// time so per-transfer `register_memory`/`deregister_memory` is avoided.
     ///
-    /// Accepts any `Arc<dyn RdmaEndpoint>`:
-    /// - `Arc<MockRdmaEndpoint>` — SHM-backed, no hardware required
-    /// - `Arc<CuObjEndpoint>` — real NVIDIA cuObj RDMA
+    /// Accepts any `Arc<dyn RdmaProvider>`:
+    /// - `Arc<MockRdmaProvider>` — SHM-backed, no hardware required
+    /// - `Arc<CuObjProvider>` — real NVIDIA cuObj RDMA
     /// - `None` (don't call this method) — plain heap buffers
-    pub fn with_rdma(mut self, rdma: Option<Arc<dyn RdmaEndpoint>>) -> Self {
+    pub fn with_rdma(mut self, rdma: Option<Arc<dyn RdmaProvider>>) -> Self {
         self.rdma = rdma;
         self
     }

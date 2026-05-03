@@ -1,7 +1,7 @@
 """
 s3-rdma Python binding example.
 
-Demonstrates the unified ``RdmaEndpoint`` API with both mock and cuObj
+Demonstrates the unified ``RdmaProvider`` API with both mock and cuObj
 providers for client and server roles — no NVIDIA hardware required for
 the mock provider.
 
@@ -17,7 +17,7 @@ def demo_mock_both_roles() -> None:
     """Mock provider, both roles in the same process (typical for testing)."""
     print("=== Mock endpoint — both roles ===\n")
 
-    ep = s3_rdma.MockRdmaEndpoint(debug=True)
+    ep = s3_rdma.MockRdmaProvider(debug=True)
     print(f"  endpoint : {ep!r}")
     print(f"  client?  : {ep.supports_client()}")
     print(f"  server?  : {ep.supports_server()}")
@@ -58,7 +58,7 @@ def demo_mock_client_role() -> None:
     """Mock provider, client role only."""
     print("=== Mock endpoint — client role only ===\n")
 
-    ep = s3_rdma.RdmaEndpoint(provider="mock", role="client", debug=True)
+    ep = s3_rdma.RdmaProvider(provider="mock", role="client", debug=True)
     print(f"  endpoint : {ep!r}")
 
     data  = bytes(b"\x11" * 1024)
@@ -77,8 +77,8 @@ def demo_mock_server_role() -> None:
     """Mock provider, server role only — token produced by a separate client ep."""
     print("=== Mock endpoint — server role only ===\n")
 
-    client = s3_rdma.RdmaEndpoint(provider="mock", role="client")
-    server = s3_rdma.RdmaEndpoint(provider="mock", role="server")
+    client = s3_rdma.RdmaProvider(provider="mock", role="client")
+    server = s3_rdma.RdmaProvider(provider="mock", role="server")
     print(f"  server endpoint : {server!r}")
 
     data  = bytes(b"\x22" * 1024)
@@ -102,7 +102,7 @@ def demo_cuobj_auto() -> None:
     """Auto-selection: tries cuObj first, falls back to mock gracefully."""
     print("=== Auto endpoint (cuobj → mock fallback) ===\n")
 
-    ep = s3_rdma.RdmaEndpoint(provider="auto", role="both", debug=True)
+    ep = s3_rdma.RdmaProvider(provider="auto", role="both", debug=True)
     print(f"  endpoint : {ep!r}")
     print(f"  protocol : {ep.protocol()}")
     print()
@@ -117,10 +117,10 @@ def main() -> None:
     demo_mock_server_role()
     demo_cuobj_auto()
 
-    # CuObjEndpoint convenience class: raises RuntimeError when the plugin is absent.
-    print("=== CuObjEndpoint (client) — expecting RuntimeError without plugin ===")
+    # CuObjProvider convenience class: raises RuntimeError when the plugin is absent.
+    print("=== CuObjProvider (client) — expecting RuntimeError without plugin ===")
     try:
-        ep = s3_rdma.CuObjEndpoint(role="client")
+        ep = s3_rdma.CuObjProvider(role="client")
         print(f"  cuobj available: {ep!r}")
     except RuntimeError as exc:
         print(f"  cuObj unavailable (expected): {exc}")

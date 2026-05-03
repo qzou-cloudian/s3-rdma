@@ -14,18 +14,18 @@ from __future__ import annotations
 from typing import Callable
 
 
-class RdmaEndpoint:
+class RdmaProvider:
     """
     Unified RDMA endpoint supporting client, server, or both roles.
 
-    Wraps the Rust ``RdmaEndpoint`` trait and supports all provider types
+    Wraps the Rust ``RdmaProvider`` trait and supports all provider types
     (``"mock"``, ``"cuobj"``, ``"auto"``) and roles (``"client"``,
     ``"server"``, ``"both"``).
 
     Example (client role)::
 
         import s3_rdma
-        ep = s3_rdma.RdmaEndpoint(provider="mock", role="client")
+        ep = s3_rdma.RdmaProvider(provider="mock", role="client")
         ep.register_memory(data)
         token = ep.prepare_put_token(data, 0, len(data), b"bucket/key")
         ep.process_rdma_reply(200, token, len(data), lambda code, reply: None)
@@ -33,7 +33,7 @@ class RdmaEndpoint:
 
     Example (server role)::
 
-        ep = s3_rdma.RdmaEndpoint(provider="mock", role="server")
+        ep = s3_rdma.RdmaProvider(provider="mock", role="server")
         received = ep.handle_put(b"bucket/key", token, size=len(data))
         written  = ep.handle_get(b"bucket/key", received, token)
     """
@@ -69,7 +69,7 @@ class RdmaEndpoint:
     # ── Info ─────────────────────────────────────────────────────────────────
 
     def name(self) -> str:
-        """Human-readable endpoint name (e.g. ``"MockRdmaEndpoint"``)."""
+        """Human-readable endpoint name (e.g. ``"MockRdmaProvider"``)."""
         ...
 
     def protocol(self) -> str:
@@ -221,17 +221,17 @@ class RdmaEndpoint:
     def __repr__(self) -> str: ...
 
 
-class MockRdmaEndpoint(RdmaEndpoint):
+class MockRdmaProvider(RdmaProvider):
     """
     Mock RDMA endpoint — no NVIDIA hardware required.
 
-    Equivalent to ``RdmaEndpoint(provider="mock", role="both")`` with a
+    Equivalent to ``RdmaProvider(provider="mock", role="both")`` with a
     simpler constructor.  Both client and server roles are active.
 
     Example::
 
         import s3_rdma
-        ep = s3_rdma.MockRdmaEndpoint(debug=True)
+        ep = s3_rdma.MockRdmaProvider(debug=True)
         ep.register_memory(data)
         token = ep.prepare_put_token(data, 0, len(data), b"bucket/key")
         received = ep.handle_put(b"bucket/key", token, size=len(data))
@@ -246,11 +246,11 @@ class MockRdmaEndpoint(RdmaEndpoint):
         ...
 
 
-class CuObjEndpoint(RdmaEndpoint):
+class CuObjProvider(RdmaProvider):
     """
     CuObj RDMA endpoint — requires NVIDIA hardware and the cuObject SDK plugin.
 
-    Equivalent to ``RdmaEndpoint(provider="cuobj", role=role)`` with a
+    Equivalent to ``RdmaProvider(provider="cuobj", role=role)`` with a
     simpler constructor.  Raises ``RuntimeError`` if the cuObj plugin
     (``libs3rdmacuobjclient.so`` / ``libs3rdmacuobjserver.so``) cannot be
     found at runtime.
@@ -258,7 +258,7 @@ class CuObjEndpoint(RdmaEndpoint):
     Example (client role)::
 
         import s3_rdma
-        ep = s3_rdma.CuObjEndpoint(role="client")
+        ep = s3_rdma.CuObjProvider(role="client")
         ep.register_memory(data)
         token = ep.prepare_put_token(data, 0, len(data), b"bucket/key")
         ep.process_rdma_reply(200, token, len(data), lambda code, reply: None)
@@ -266,7 +266,7 @@ class CuObjEndpoint(RdmaEndpoint):
 
     Example (server role)::
 
-        ep = s3_rdma.CuObjEndpoint(role="server", listen_addr="192.168.1.1", listen_port=4791)
+        ep = s3_rdma.CuObjProvider(role="server", listen_addr="192.168.1.1", listen_port=4791)
         received = ep.handle_put(b"bucket/key", token, size=len(data))
         written  = ep.handle_get(b"bucket/key", received, token)
     """
