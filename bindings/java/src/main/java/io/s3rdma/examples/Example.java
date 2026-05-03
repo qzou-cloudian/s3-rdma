@@ -42,10 +42,10 @@ public class Example {
 
     /** Mock provider — both client and server roles in the same process. */
     static void demoMockBothRoles() throws RdmaException {
-        System.out.println("=== Mock endpoint — both roles ===\n");
+        System.out.println("=== Mock provider — both roles ===\n");
 
         try (RdmaProvider ep = RdmaProvider.create("mock", "both", RdmaProviderConfig.defaults())) {
-            System.out.println("  endpoint : " + ep);
+            System.out.println("  provider: " + ep);
             System.out.println("  client?  : " + ep.supportsClient());
             System.out.println("  server?  : " + ep.supportsServer());
 
@@ -84,10 +84,10 @@ public class Example {
 
     /** Mock provider — client role only. */
     static void demoMockClientRole() throws RdmaException {
-        System.out.println("=== Mock endpoint — client role only ===\n");
+        System.out.println("=== Mock provider — client role only ===\n");
 
         try (RdmaProvider ep = RdmaProvider.create("mock", "client", RdmaProviderConfig.defaults())) {
-            System.out.println("  endpoint : " + ep);
+            System.out.println("  provider: " + ep);
 
             byte[] data = new byte[1024];
             Arrays.fill(data, (byte) 0x11);
@@ -102,14 +102,14 @@ public class Example {
         System.out.println();
     }
 
-    /** Mock provider — server role only, token produced by a separate client endpoint. */
+    /** Mock provider — server role only, token produced by a separate client provider. */
     static void demoMockServerRole() throws RdmaException {
-        System.out.println("=== Mock endpoint — server role only ===\n");
+        System.out.println("=== Mock provider — server role only ===\n");
 
         try (RdmaProvider client = RdmaProvider.create("mock", "client", RdmaProviderConfig.defaults());
              RdmaProvider server = RdmaProvider.create("mock", "server", RdmaProviderConfig.defaults())) {
 
-            System.out.println("  server endpoint : " + server);
+            System.out.println("  server provider: " + server);
 
             byte[] data = new byte[1024];
             Arrays.fill(data, (byte) 0x22);
@@ -134,10 +134,10 @@ public class Example {
 
     /** Auto-selection: tries cuObj first, falls back to mock transparently. */
     static void demoCuObjAutoFallback() throws RdmaException {
-        System.out.println("=== Auto endpoint (cuobj → mock fallback) ===\n");
+        System.out.println("=== Auto provider (cuobj → mock fallback) ===\n");
 
         try (RdmaProvider ep = RdmaProvider.create("auto", "both", RdmaProviderConfig.defaults())) {
-            System.out.println("  endpoint : " + ep);
+            System.out.println("  provider: " + ep);
             System.out.println("  protocol : " + ep.protocol());
         }
         System.out.println();

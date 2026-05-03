@@ -1,7 +1,7 @@
 package io.s3rdma;
 
 /**
- * Unified RDMA endpoint supporting client, server, or both roles.
+ * Unified RDMA provider supporting client, server, or both roles.
  *
  * <p>Wraps the Rust {@code RdmaProvider} trait via JNI and supports all
  * provider types ({@code "mock"}, {@code "cuobj"}, {@code "auto"}) and roles
@@ -76,7 +76,7 @@ public class RdmaProvider implements AutoCloseable {
     // ── Factory ────────────────────────────────────────────────────────────────
 
     /**
-     * Create an RDMA endpoint.
+     * Create an RDMA provider.
      *
      * @param provider {@code "mock"}, {@code "cuobj"}, or {@code "auto"}
      *                 ({@code "auto"} tries cuobj first, falls back to mock)
@@ -92,13 +92,13 @@ public class RdmaProvider implements AutoCloseable {
 
     // ── Info ───────────────────────────────────────────────────────────────────
 
-    /** Human-readable endpoint name (e.g. {@code "MockRdmaEndpoint"}). */
+    /** Human-readable provider name (e.g. {@code "MockRdmaProvider"}). */
     public String  name()            { return nativeName(nativeHandle); }
     /** Transport protocol string: {@code "mock"} or {@code "cuobj"}. */
     public String  protocol()        { return nativeProtocol(nativeHandle); }
-    /** {@code true} if this endpoint supports client-side operations. */
+    /** {@code true} if this provider supports client-side operations. */
     public boolean supportsClient()  { return nativeSupportsClient(nativeHandle); }
-    /** {@code true} if this endpoint supports server-side operations. */
+    /** {@code true} if this provider supports server-side operations. */
     public boolean supportsServer()  { return nativeSupportsServer(nativeHandle); }
 
     // ── Client methods ─────────────────────────────────────────────────────────

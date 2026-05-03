@@ -1,4 +1,4 @@
-//! Example: s3-rdma endpoint API using MockRdmaProvider (no hardware required).
+//! Example: s3-rdma provider API using MockRdmaProvider (no hardware required).
 //!
 //! Run with:
 //!   cargo run --example mock_provider --manifest-path s3-rdma/Cargo.toml

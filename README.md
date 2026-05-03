@@ -210,7 +210,7 @@ s3-rdma = { path = "core" }
 ```
 
 ```rust
-use s3_rdma::{MockRdmaProvider, endpoint::RdmaProvider};
+use s3_rdma::{MockRdmaProvider, provider::RdmaProvider};
 
 let ep = MockRdmaProvider::with_debug(false);
 let mut buf = vec![0u8; 4 * 1024 * 1024];

@@ -15,10 +15,10 @@ import s3_rdma
 
 def demo_mock_both_roles() -> None:
     """Mock provider, both roles in the same process (typical for testing)."""
-    print("=== Mock endpoint — both roles ===\n")
+    print("=== Mock provider — both roles ===\n")
 
     ep = s3_rdma.MockRdmaProvider(debug=True)
-    print(f"  endpoint : {ep!r}")
+    print(f"  provider: {ep!r}")
     print(f"  client?  : {ep.supports_client()}")
     print(f"  server?  : {ep.supports_server()}")
 
@@ -56,10 +56,10 @@ def demo_mock_both_roles() -> None:
 
 def demo_mock_client_role() -> None:
     """Mock provider, client role only."""
-    print("=== Mock endpoint — client role only ===\n")
+    print("=== Mock provider — client role only ===\n")
 
     ep = s3_rdma.RdmaProvider(provider="mock", role="client", debug=True)
-    print(f"  endpoint : {ep!r}")
+    print(f"  provider: {ep!r}")
 
     data  = bytes(b"\x11" * 1024)
     s3key = b"bucket/upload.bin"
@@ -75,11 +75,11 @@ def demo_mock_client_role() -> None:
 
 def demo_mock_server_role() -> None:
     """Mock provider, server role only — token produced by a separate client ep."""
-    print("=== Mock endpoint — server role only ===\n")
+    print("=== Mock provider — server role only ===\n")
 
     client = s3_rdma.RdmaProvider(provider="mock", role="client")
     server = s3_rdma.RdmaProvider(provider="mock", role="server")
-    print(f"  server endpoint : {server!r}")
+    print(f"  server provider: {server!r}")
 
     data  = bytes(b"\x22" * 1024)
     s3key = b"bucket/download.bin"
@@ -100,10 +100,10 @@ def demo_mock_server_role() -> None:
 
 def demo_cuobj_auto() -> None:
     """Auto-selection: tries cuObj first, falls back to mock gracefully."""
-    print("=== Auto endpoint (cuobj → mock fallback) ===\n")
+    print("=== Auto provider (cuobj → mock fallback) ===\n")
 
     ep = s3_rdma.RdmaProvider(provider="auto", role="both", debug=True)
-    print(f"  endpoint : {ep!r}")
+    print(f"  provider: {ep!r}")
     print(f"  protocol : {ep.protocol()}")
     print()
 

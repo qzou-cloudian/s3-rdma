@@ -1,7 +1,7 @@
 package io.s3rdma;
 
 /**
- * CuObj RDMA endpoint — requires NVIDIA hardware and the cuObject SDK plugin.
+ * CuObj RDMA provider — requires NVIDIA hardware and the cuObject SDK plugin.
  *
  * <p>Convenience subclass of {@link RdmaProvider} that pre-selects
  * {@code provider="cuobj"} and supports client, server, or both roles.
@@ -50,7 +50,7 @@ package io.s3rdma;
 public final class CuObjProvider extends RdmaProvider {
 
     /**
-     * Create a cuObj RDMA endpoint.
+     * Create a cuObj RDMA provider.
      *
      * @param role {@code "client"}, {@code "server"}, or {@code "both"}
      * @param cfg  provider configuration; for the server role set

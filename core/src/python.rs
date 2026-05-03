@@ -91,7 +91,7 @@ impl PyRdmaProvider {
         pool_count:  usize,
         buf_size:    usize,
     ) -> PyResult<Self> {
-        let endpoint_role = parse_role(role)?;
+        let provider_role = parse_role(role)?;
         let cfg = RdmaServerConfig {
             shm_path:    shm_path.to_owned(),
             listen_addr: listen_addr.to_owned(),
@@ -99,14 +99,14 @@ impl PyRdmaProvider {
             pool_count,
             buf_size,
         };
-        crate::create_provider(provider, debug, endpoint_role, &cfg)
+        crate::create_provider(provider, debug, provider_role, &cfg)
             .map(|inner| Self { inner })
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     // ── Info ─────────────────────────────────────────────────────────────────
 
-    /// Human-readable endpoint name (e.g. ``"MockRdmaProvider"``).
+    /// Human-readable provider name (e.g. ``"MockRdmaProvider"``).
     fn name(&self) -> &str { self.inner.name() }
 
     /// Transport protocol: ``"mock"`` or ``"cuobj"``.

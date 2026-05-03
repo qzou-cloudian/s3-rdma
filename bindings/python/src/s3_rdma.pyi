@@ -69,7 +69,7 @@ class RdmaProvider:
     # ── Info ─────────────────────────────────────────────────────────────────
 
     def name(self) -> str:
-        """Human-readable endpoint name (e.g. ``"MockRdmaProvider"``)."""
+        """Human-readable provider name (e.g. ``"MockRdmaProvider"``)."""
         ...
 
     def protocol(self) -> str:
