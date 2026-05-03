@@ -199,6 +199,9 @@ impl Drop for RdmaEngine {
 }
 
 impl RdmaClientProvider for RdmaEngine {
+    fn name(&self)     -> &str  { self.inner.name() }
+    fn protocol(&self) -> &str  { self.inner.protocol() }
+
     fn is_memory_suitable(&self, ptr: *const u8, size: usize) -> bool {
         self.inner.is_memory_suitable(ptr, size)
     }
@@ -337,9 +340,6 @@ impl RdmaServerProvider for RdmaEngine {
 }
 
 impl RdmaProvider for RdmaEngine {
-    fn name(&self)     -> &str  { self.inner.name() }
-    fn protocol(&self) -> &str  { self.inner.protocol() }
-
     fn supports_client(&self) -> bool { self.inner.supports_client() }
     fn supports_server(&self) -> bool { self.inner.supports_server() }
 }

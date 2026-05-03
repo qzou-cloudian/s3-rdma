@@ -97,12 +97,15 @@ unsafe impl Sync for Slot {}
 
 /// Bridges an `Arc<dyn RdmaProvider>` into an `Arc<dyn RdmaClientProvider>`.
 ///
-/// Only `register_memory`/`deregister_memory` are forwarded; all other methods
-/// use the default implementations (which return `OperationNotSupported`).
-/// This is acceptable here because the buffer pool only ever calls those two.
+/// Forwards `name`, `protocol`, `register_memory`, and `deregister_memory` to
+/// the inner provider.  All other client methods use their default implementations.
+/// This is acceptable for the buffer pool, which only ever calls the forwarded methods.
 struct ProviderClientBridge(Arc<dyn RdmaProvider>);
 
 impl crate::provider::RdmaClientProvider for ProviderClientBridge {
+    fn name(&self) -> &str { self.0.name() }
+    fn protocol(&self) -> &str { self.0.protocol() }
+
     fn register_memory(&self, ptr: *mut u8, size: usize) -> Result<(), RdmaError> {
         self.0.register_memory(ptr, size)
     }

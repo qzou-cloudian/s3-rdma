@@ -154,6 +154,9 @@ impl MockRdmaProvider {
 }
 
 impl RdmaClientProvider for MockRdmaProvider {
+    fn name(&self) -> &str { "MockRdmaProvider" }
+    fn protocol(&self) -> &str { "mock" }
+
     fn is_memory_suitable(&self, ptr: *const u8, size: usize) -> bool {
         let ok = !ptr.is_null() && size > 0;
         self.dbg(&format!("is_memory_suitable ptr={ptr:p} size={size} -> {ok}"));
@@ -473,8 +476,6 @@ impl RdmaServerProvider for MockRdmaProvider {
 }
 
 impl RdmaProvider for MockRdmaProvider {
-    fn name(&self) -> &str { "MockRdmaProvider" }
-    fn protocol(&self) -> &str { "mock" }
     fn supports_client(&self) -> bool { true }
     fn supports_server(&self) -> bool { true }
 }

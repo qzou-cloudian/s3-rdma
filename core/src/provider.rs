@@ -230,6 +230,16 @@ pub trait RdmaClientProvider: Send + Sync {
     fn rdma_bytes_header_name(&self) -> &[u8] {
         RDMA_BYTES_HEADER.as_bytes()
     }
+
+    /// Human-readable name of this provider implementation (e.g. `"MockRdmaProvider"`).
+    ///
+    /// Default: `"unknown"`.  Providers should override this for logging and debugging.
+    fn name(&self) -> &str { "unknown" }
+
+    /// Transport protocol identifier (e.g. `"mock"`, `"cuobj"`).
+    ///
+    /// Default: `"unknown"`.
+    fn protocol(&self) -> &str { "unknown" }
 }
 
 // ── RdmaServerProvider trait ──────────────────────────────────────────────────
@@ -333,8 +343,7 @@ pub trait RdmaServerProvider: Send + Sync {
 /// This is the trait implemented by concrete providers such as
 /// [`MockRdmaProvider`](crate::mock::MockRdmaProvider) and
 /// [`CuObjProvider`](crate::cuobj_client::CuObjProvider).  It extends both
-/// [`RdmaClientProvider`] and [`RdmaServerProvider`] and adds identity/role
-/// query methods.
+/// [`RdmaClientProvider`] and [`RdmaServerProvider`] and adds role query methods.
 ///
 /// ## Choosing the right trait
 ///
@@ -351,12 +360,6 @@ pub trait RdmaServerProvider: Send + Sync {
 /// - [`CuObjProvider`](crate::cuobj_client::CuObjProvider) – real NVIDIA cuObject;
 ///   each role requires the corresponding plugin at runtime.
 pub trait RdmaProvider: RdmaClientProvider + RdmaServerProvider {
-    /// Human-readable provider name (e.g. `"MockRdmaProvider"`).
-    fn name(&self) -> &str;
-
-    /// Transport protocol string: `"mock"` or `"cuobj"`.
-    fn protocol(&self) -> &str;
-
     /// Returns `true` if this provider supports client-side operations.
     fn supports_client(&self) -> bool;
 

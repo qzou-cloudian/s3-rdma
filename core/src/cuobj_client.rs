@@ -422,6 +422,9 @@ impl CuObjProvider {
 }
 
 impl crate::provider::RdmaClientProvider for CuObjProvider {
+    fn name(&self) -> &str { "CuObjProvider" }
+    fn protocol(&self) -> &str { "cuobj" }
+
     fn is_memory_suitable(&self, ptr: *const u8, size: usize) -> bool {
         #[cfg(feature = "cuobj-client")]
         if let Some(c) = &self.client {
@@ -604,9 +607,6 @@ impl crate::provider::RdmaServerProvider for CuObjProvider {
 }
 
 impl crate::provider::RdmaProvider for CuObjProvider {
-    fn name(&self) -> &str { "CuObjProvider" }
-    fn protocol(&self) -> &str { "cuobj" }
-
     fn supports_client(&self) -> bool {
         #[cfg(feature = "cuobj-client")]
         { self.client.is_some() }
