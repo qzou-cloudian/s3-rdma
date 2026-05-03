@@ -6,16 +6,14 @@ description = "SDK-agnostic RDMA provider abstractions for S3 object storage"
 license = "MIT"
 
 [features]
-# Enable runtime loading of the cuObject RDMA client provider plugin
-# (libs3rdmacuobjclient.so).  Built from the s3-rdma-cuobj-client crate.
-# No compile-time dependency on the cuObject SDK is required.
-cuobj-client = ["dep:libloading"]
-# Enable runtime loading of the cuObject RDMA server provider plugin
-# (libs3rdmacuobjserver.so).  Built from the s3-rdma-cuobj-server crate.
-# No compile-time dependency on the cuObject SDK or hsg-io is required.
-cuobj-server = ["dep:libloading"]
-# Export C-ABI vtable entry point (for use as a cdylib plugin from C code)
-c-abi    = []
+# Enable runtime loading of the RDMA client provider plugin
+# (libs3rdmaclient.so).  Built from the s3-rdma-client crate.
+# No compile-time dependency on any RDMA SDK is required.
+plugin-client = ["dep:libloading"]
+# Enable runtime loading of the RDMA server provider plugin
+# (libs3rdmaserver.so).  Built from the s3-rdma-server crate.
+# No compile-time dependency on any RDMA SDK or hsg-io is required.
+plugin-server = ["dep:libloading"]
 # Python bindings via PyO3 (build with maturin from the python/ directory)
 pyo3     = ["dep:pyo3", "pyo3/extension-module"]
 # Generic pre-registered RDMA buffer pool (works with any RdmaProvider:

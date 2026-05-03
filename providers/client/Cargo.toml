@@ -1,0 +1,21 @@
+[package]
+name        = "s3-rdma-client"
+version     = "0.2.0"
+edition     = "2021"
+description = "RDMA client provider plugin for S3 clients (cdylib)"
+license     = "MIT"
+
+[lib]
+name       = "s3rdmaclient"
+crate-type = ["cdylib"]
+
+[features]
+# Mock provider (shared-memory simulation, no hardware required)
+default = ["mock"]
+mock    = []
+# cuObject RDMA hardware backend
+cuobj   = ["dep:cuobj"]
+
+[dependencies]
+s3-rdma = { path = "../../core" }
+cuobj   = { path = "../../../cuobj", features = ["client"], optional = true }

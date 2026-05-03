@@ -128,13 +128,17 @@ pub struct RdmaProviderVtable {
 unsafe impl Send for RdmaProviderVtable {}
 unsafe impl Sync for RdmaProviderVtable {}
 
-/// Function signature of the plugin entry point.
+/// Function signature of the plugin entry point for the client provider.
 ///
-/// Every RDMA provider `.so` must export:
+/// Every RDMA client provider `.so` must export:
 /// ```c
-/// const RdmaProviderVtable *s3_rdma_provider_get_vtable(void);
+/// const RdmaProviderVtable *s3_rdma_get_client_vtable(const char *provider_name);
 /// ```
-pub type GetVtableFn = unsafe extern "C" fn() -> *const RdmaProviderVtable;
+///
+/// Returns a pointer to the vtable for the requested provider, or `NULL` if
+/// the provider name is not recognised.
+pub type GetNamedClientVtableFn =
+    unsafe extern "C" fn(name: *const c_char) -> *const RdmaProviderVtable;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RdmaServerVtable
@@ -297,6 +301,10 @@ unsafe impl Sync for RdmaServerVtable {}
 ///
 /// Every RDMA server provider `.so` must export:
 /// ```c
-/// const RdmaServerVtable *s3_rdma_server_provider_get_vtable(void);
+/// const RdmaServerVtable *s3_rdma_get_server_vtable(const char *provider_name);
 /// ```
-pub type GetServerVtableFn = unsafe extern "C" fn() -> *const RdmaServerVtable;
+///
+/// Returns a pointer to the vtable for the requested provider, or `NULL` if
+/// the provider name is not recognised.
+pub type GetNamedServerVtableFn =
+    unsafe extern "C" fn(name: *const c_char) -> *const RdmaServerVtable;

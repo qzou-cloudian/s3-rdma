@@ -1,24 +1,24 @@
-//! cuObject RDMA **server** provider via lazy runtime loading.
+//! Generic RDMA server provider via lazy runtime loading.
 //!
-//! Enabled by the `cuobj-server` Cargo feature.  At runtime the gateway
-//! searches for the server plugin (`libs3rdmacuobjserver.so`) and
-//! loads it on demand, so the main binary has **no compile-time dependency**
-//! on `libcuobjserver.so` or any cuObject SDK symbols.
+//! Enabled by the `plugin-server` Cargo feature.  At runtime the gateway
+//! searches for the server plugin (`libs3rdmaserver.so`) and loads it on
+//! demand, so the main binary has **no compile-time dependency** on any RDMA
+//! SDK or server library symbols.
 //!
-//! Search order for `libs3rdmacuobjserver.so`:
+//! Search order for `libs3rdmaserver.so`:
 //! 1. Standard dynamic-linker paths (`LD_LIBRARY_PATH`, RPATH, ldconfig cache).
 //! 2. Directory containing the current executable.
 //! 3. `/lib64/`, `/usr/lib64/` (common CUDA/cuObject install locations).
 
-#[cfg(feature = "cuobj-server")]
+#[cfg(feature = "plugin-server")]
 mod real {
     use std::ffi::{c_void, CString};
     use libloading::{Library, Symbol};
     use crate::error::RdmaError;
-    use crate::ffi::{ByteCursor, GetServerVtableFn, RdmaServerInitParams, RdmaServerVtable};
+    use crate::ffi::{ByteCursor, GetNamedServerVtableFn, RdmaServerInitParams, RdmaServerVtable};
     use crate::provider::RdmaServerConfig;
 
-    const LIB_NAME: &str = "libs3rdmacuobjserver.so";
+    const LIB_NAME: &str = "libs3rdmaserver.so";
 
     fn try_load(path: impl AsRef<std::ffi::OsStr>) -> Option<Library> {
         unsafe { Library::new(path) }.ok()
@@ -43,47 +43,48 @@ mod real {
         None
     }
 
-    // ── CuObjServerProvider ───────────────────────────────────────────────────
+    // ── PluginServerProvider ──────────────────────────────────────────────────
 
-    /// RDMA server provider that loads `libs3rdmacuobjserver.so` at runtime.
+    /// RDMA server provider that loads `libs3rdmaserver.so` at runtime.
     ///
-    /// Wraps a `CuObjServer` + `BufferPool` internally (inside the plugin);
-    /// the gateway has no compile-time dependency on either.
-    pub struct CuObjServerProvider {
+    /// Wraps a server + buffer pool internally (inside the plugin); the gateway
+    /// has no compile-time dependency on any RDMA SDK.
+    pub struct PluginServerProvider {
         vtable:   *const RdmaServerVtable,
         ctx:      *mut c_void,
         buf_size: usize,
         _lib:     Library,
     }
 
-    unsafe impl Send for CuObjServerProvider {}
-    unsafe impl Sync for CuObjServerProvider {}
+    unsafe impl Send for PluginServerProvider {}
+    unsafe impl Sync for PluginServerProvider {}
 
-    impl CuObjServerProvider {
+    impl PluginServerProvider {
         /// Load the plugin and initialise it with the given config.
         pub fn new(cfg: &RdmaServerConfig) -> Result<Self, RdmaError> {
             let lib = find_library().ok_or_else(|| {
-                RdmaError::CuObjConnectionFailed(
+                RdmaError::PluginLoadFailed(
                     format!("{LIB_NAME} not found \
                              (searched LD_LIBRARY_PATH, exe dir, /lib64, /usr/lib64)")
                 )
             })?;
 
+            let provider_name = CString::new("plugin").unwrap();
             let vtable: *const RdmaServerVtable = unsafe {
-                let get_vtable: Symbol<GetServerVtableFn> = lib
-                    .get(b"s3_rdma_server_provider_get_vtable\0")
-                    .map_err(|e| RdmaError::CuObjConnectionFailed(e.to_string()))?;
-                let ptr = get_vtable();
+                let get_vtable: Symbol<GetNamedServerVtableFn> = lib
+                    .get(b"s3_rdma_get_server_vtable\0")
+                    .map_err(|e| RdmaError::PluginLoadFailed(e.to_string()))?;
+                let ptr = get_vtable(provider_name.as_ptr());
                 if ptr.is_null() {
-                    return Err(RdmaError::CuObjConnectionFailed(
-                        "s3_rdma_server_provider_get_vtable returned null".into()
+                    return Err(RdmaError::PluginLoadFailed(
+                        format!("s3_rdma_get_server_vtable(\"plugin\") returned null")
                     ));
                 }
                 ptr
             };
 
             let addr_cstr = CString::new(cfg.listen_addr.as_str())
-                .map_err(|e| RdmaError::CuObjConnectionFailed(e.to_string()))?;
+                .map_err(|e| RdmaError::PluginLoadFailed(e.to_string()))?;
             let params = RdmaServerInitParams {
                 listen_addr:    addr_cstr.as_ptr(),
                 listen_port:    cfg.listen_port,
@@ -96,7 +97,7 @@ mod real {
             if let Some(init_fn) = unsafe { (*vtable).init } {
                 let rc = unsafe { init_fn(&params, &mut ctx) };
                 if rc != 0 {
-                    return Err(RdmaError::CuObjConnectionFailed(
+                    return Err(RdmaError::PluginLoadFailed(
                         format!("server vtable init() returned {rc}")
                     ));
                 }
@@ -110,7 +111,7 @@ mod real {
         }
     }
 
-    impl Drop for CuObjServerProvider {
+    impl Drop for PluginServerProvider {
         fn drop(&mut self) {
             if let Some(cleanup) = self.vtable().cleanup {
                 unsafe { cleanup(self.ctx); }
@@ -118,24 +119,24 @@ mod real {
         }
     }
 
-    impl CuObjServerProvider {
+    impl PluginServerProvider {
         pub fn name(&self) -> &str {
             let ptr = self.vtable().provider_name;
             if ptr.is_null() {
-                return "CuObjServerProvider";
+                return "PluginServerProvider";
             }
             unsafe { std::ffi::CStr::from_ptr(ptr) }
                 .to_str()
-                .unwrap_or("CuObjServerProvider")
+                .unwrap_or("PluginServerProvider")
         }
 
         pub fn buf_size(&self) -> usize { self.buf_size }
 
         /// Delegates to the plugin's `handle_put` vtable entry.
         ///
-        /// The plugin performs a cuObject `RDMA_READ` from the client's buffer
-        /// into its internal pool slot, then copies the transferred bytes into
-        /// the caller-provided `buf`.  Returns the number of bytes written.
+        /// The plugin performs an RDMA_READ from the client's buffer into its
+        /// internal pool slot, then copies the transferred bytes into the
+        /// caller-provided `buf`.  Returns the number of bytes written.
         pub fn handle_put(
             &self,
             s3_key: &[u8],
@@ -156,7 +157,7 @@ mod real {
             };
             if rc != 0 {
                 return Err(RdmaError::TransferFailed(
-                    format!("cuobj server handle_put returned {rc}")
+                    format!("plugin server handle_put returned {rc}")
                 ));
             }
             Ok(transferred)
@@ -164,9 +165,9 @@ mod real {
 
         /// Delegates to the plugin's `handle_get` vtable entry.
         ///
-        /// Copies `data` into a pool slot and performs a cuObject `RDMA_WRITE`
-        /// into the client's registered buffer via `token`.  Returns the number
-        /// of bytes successfully written.
+        /// Copies `data` into a pool slot and performs an RDMA_WRITE into the
+        /// client's registered buffer via `token`.  Returns the number of bytes
+        /// successfully written.
         pub fn handle_get(
             &self,
             s3_key: &[u8],
@@ -186,7 +187,7 @@ mod real {
             };
             if rc != 0 {
                 return Err(RdmaError::TransferFailed(
-                    format!("cuobj server handle_get returned {rc}")
+                    format!("plugin server handle_get returned {rc}")
                 ));
             }
             Ok(written)
@@ -200,7 +201,7 @@ mod real {
         ///
         /// # Safety
         /// `write_fn_data` must remain valid for the duration of the call.
-        /// `write_fn` must be thread-safe (it is called from a plugin worker thread).
+        /// `write_fn` must be thread-safe (called from a plugin worker thread).
         pub unsafe fn handle_put_zc(
             &self,
             s3_key:        &[u8],
@@ -222,7 +223,7 @@ mod real {
             };
             if rc != 0 {
                 return Err(RdmaError::TransferFailed(
-                    format!("cuobj server handle_put_zc returned {rc}")
+                    format!("plugin server handle_put_zc returned {rc}")
                 ));
             }
             Ok(transferred)
@@ -236,7 +237,7 @@ mod real {
         ///
         /// # Safety
         /// `read_fn_data` must remain valid for the duration of the call.
-        /// `read_fn` must be thread-safe (it is called from a plugin worker thread).
+        /// `read_fn` must be thread-safe (called from a plugin worker thread).
         pub unsafe fn handle_get_zc(
             &self,
             s3_key:       &[u8],
@@ -257,7 +258,7 @@ mod real {
             };
             if rc != 0 {
                 return Err(RdmaError::TransferFailed(
-                    format!("cuobj server handle_get_zc returned {rc}")
+                    format!("plugin server handle_get_zc returned {rc}")
                 ));
             }
             Ok(written)
@@ -265,6 +266,5 @@ mod real {
     }
 }
 
-#[cfg(feature = "cuobj-server")]
-pub use real::CuObjServerProvider;
-
+#[cfg(feature = "plugin-server")]
+pub use real::PluginServerProvider;

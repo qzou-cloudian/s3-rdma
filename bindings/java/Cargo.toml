@@ -10,10 +10,10 @@ name       = "s3_rdma_jni"
 crate-type = ["cdylib"]
 
 [features]
-# Forward cuobj features to the core crate so the JNI library can load
-# the real cuObject RDMA plugins at runtime.
-cuobj-client = ["s3-rdma/cuobj-client"]
-cuobj-server = ["s3-rdma/cuobj-server"]
+# Forward plugin features to the core crate so the JNI library can load
+# the RDMA plugins at runtime.
+plugin-client = ["s3-rdma/plugin-client"]
+plugin-server = ["s3-rdma/plugin-server"]
 
 [dependencies]
 s3-rdma = { path = "../../core" }

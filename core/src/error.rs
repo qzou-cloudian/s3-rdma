@@ -13,8 +13,8 @@ pub enum RdmaError {
     TokenGenerationFailed { key: String, reason: String },
     /// Reply token processing failed.
     ReplyTokenProcessingFailed(String),
-    /// cuObject client failed to connect.
-    CuObjConnectionFailed(String),
+    /// RDMA plugin failed to load or connect.
+    PluginLoadFailed(String),
     /// Requested provider is unknown or could not be initialised.
     ProviderUnavailable { provider: String, reason: String },
     /// RDMA data transfer failed (server side).
@@ -42,7 +42,7 @@ impl RdmaError {
             self,
             RdmaError::MemoryNotSuitable { .. }
                 | RdmaError::TokenGenerationFailed { .. }
-                | RdmaError::CuObjConnectionFailed(_)
+                | RdmaError::PluginLoadFailed(_)
                 | RdmaError::ProviderUnavailable { .. }
                 | RdmaError::BufferTooSmall { .. }
         )
@@ -67,8 +67,8 @@ impl fmt::Display for RdmaError {
             RdmaError::ReplyTokenProcessingFailed(msg) => {
                 write!(f, "Failed to process RDMA reply token: {msg}")
             }
-            RdmaError::CuObjConnectionFailed(msg) => {
-                write!(f, "cuObject client failed to connect: {msg}")
+            RdmaError::PluginLoadFailed(msg) => {
+                write!(f, "RDMA plugin load failed: {msg}")
             }
             RdmaError::ProviderUnavailable { provider, reason } => {
                 write!(f, "RDMA provider '{provider}' unavailable: {reason}")

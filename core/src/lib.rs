@@ -13,10 +13,10 @@
 //! Concrete implementations:
 //!
 //! - [`MockRdmaProvider`] — SHM-based simulation, no hardware required; both roles
-//! - [`CuObjProvider`] — real NVIDIA cuObj RDMA (loads plugin `.so` at runtime);
-//!   both roles from one instance
-//! - [`CuObjClientProvider`] / [`CuObjServerProvider`] — focused single-role wrappers
-//!   (require `cuobj-client` / `cuobj-server` feature respectively)
+//! - [`PluginProvider`] — generic RDMA plugin (loads `.so` at runtime); both roles
+//!   from one instance
+//! - [`PluginClientProvider`] / [`PluginServerProvider`] — focused single-role
+//!   wrappers (require `plugin-client` / `plugin-server` feature respectively)
 //! - [`RdmaEngine`] — fixed-size worker pool wrapping any provider (feature `engine`)
 //!
 //! ## Choosing the right trait
@@ -44,16 +44,16 @@
 //!
 //! ## Feature flags
 //!
-//! | Feature        | Effect                                                              |
-//! |----------------|---------------------------------------------------------------------|
-//! | `cuobj-client` | Enable [`CuObjClientProvider`] / [`CuObjProvider`] client role     |
-//! | `cuobj-server` | Enable [`CuObjServerProvider`] / [`CuObjProvider`] server role     |
-//! | `buffer-pool`  | Enable [`BufferPool`] for pre-registered RDMA buffers               |
-//! | `engine`       | Enable [`RdmaEngine`] fixed-size worker pool                        |
-//! | (none)         | Only [`MockRdmaProvider`] available                                 |
+//! | Feature         | Effect                                                              |
+//! |-----------------|---------------------------------------------------------------------|
+//! | `plugin-client` | Enable [`PluginClientProvider`] / [`PluginProvider`] client role   |
+//! | `plugin-server` | Enable [`PluginServerProvider`] / [`PluginProvider`] server role   |
+//! | `buffer-pool`   | Enable [`BufferPool`] for pre-registered RDMA buffers               |
+//! | `engine`        | Enable [`RdmaEngine`] fixed-size worker pool                        |
+//! | (none)          | Only [`MockRdmaProvider`] available                                 |
 
-pub(crate) mod cuobj_client;
-pub(crate) mod cuobj_server;
+pub(crate) mod plugin_client;
+pub(crate) mod plugin_server;
 #[cfg(feature = "engine")]
 pub mod engine;
 pub mod error;
@@ -63,27 +63,16 @@ pub mod mock;
 pub mod pool;
 pub mod provider;
 pub mod token;
-#[cfg(feature = "c-abi")]
-mod c_abi;
 #[cfg(feature = "pyo3")]
 mod python;
-
-/// Returns a pointer to the static C vtable for use by provider cdylibs.
-///
-/// Called by `s3-rdma-cuobj-client`'s `lib.rs` which re-exports it as
-/// `#[no_mangle] s3_rdma_provider_get_vtable`.
-#[cfg(feature = "c-abi")]
-pub fn get_vtable_ptr() -> *const ffi::RdmaProviderVtable {
-    c_abi::get_vtable()
-}
 
 // ── Primary public API ────────────────────────────────────────────────────────
 
 pub use provider::{RdmaRole, RdmaProvider, RdmaProviderConfig};
 pub use provider::{RdmaClientProvider, RdmaServerProvider};
 pub use mock::MockRdmaProvider;
-#[cfg(any(feature = "cuobj-client", feature = "cuobj-server"))]
-pub use cuobj_client::CuObjProvider;
+#[cfg(any(feature = "plugin-client", feature = "plugin-server"))]
+pub use plugin_client::PluginProvider;
 
 // ── Supporting types ──────────────────────────────────────────────────────────
 
@@ -96,27 +85,27 @@ pub use pool::{BufferPool, BufferPoolBuilder, BufferPoolError, OwnedBufferGuard}
 #[cfg(feature = "engine")]
 pub use engine::{RdmaEngine, RdmaEngineConfig};
 
-#[cfg(feature = "cuobj-client")]
-pub use cuobj_client::CuObjClientProvider;
-#[cfg(feature = "cuobj-client")]
-pub use cuobj_client::cuobj_available;
+#[cfg(feature = "plugin-client")]
+pub use plugin_client::PluginClientProvider;
+#[cfg(feature = "plugin-client")]
+pub use plugin_client::rdma_plugin_available;
 
-#[cfg(feature = "cuobj-server")]
-pub use cuobj_server::CuObjServerProvider;
+#[cfg(feature = "plugin-server")]
+pub use plugin_server::PluginServerProvider;
 
 use std::sync::Arc;
 
 pub use error::RdmaError;
 
 /// Returns a one-line summary of compiled-in RDMA providers and their runtime
-/// availability, e.g. `"RDMA providers: cuobj (available), mock"`.
+/// availability, e.g. `"RDMA providers: plugin (available), mock"`.
 pub fn rdma_provider_info() -> String {
     let mut entries: Vec<String> = Vec::new();
 
-    #[cfg(feature = "cuobj-client")]
+    #[cfg(feature = "plugin-client")]
     {
-        let status = if cuobj_available() { "available" } else { "unavailable" };
-        entries.push(format!("cuobj ({status})"));
+        let status = if rdma_plugin_available() { "available" } else { "unavailable" };
+        entries.push(format!("plugin ({status})"));
     }
 
     entries.push("mock".into());
@@ -127,9 +116,9 @@ pub fn rdma_provider_info() -> String {
 /// Build an `Arc<dyn RdmaProvider>` for the named provider and role(s).
 ///
 /// `provider` must be one of:
-/// - `"mock"`  → [`MockRdmaProvider`]
-/// - `"cuobj"` → [`CuObjProvider`] (requires `cuobj-client`/`cuobj-server` features)
-/// - `"auto"`  → tries `"cuobj"` first, falls back to `"mock"`
+/// - `"mock"`   → [`MockRdmaProvider`]
+/// - `"plugin"` → [`PluginProvider`] (requires `plugin-client`/`plugin-server` features)
+/// - `"auto"`   → tries `"plugin"` first, falls back to `"mock"`
 ///
 /// `role` specifies which capabilities to initialise:
 /// - [`RdmaRole::Client`]  — client methods (register/token/reply) only
@@ -152,18 +141,18 @@ pub fn create_provider(
             }
             Ok(Arc::new(MockRdmaProvider::new(debug, &cfg.shm_path, cfg.buf_size)))
         }
-        "cuobj" => {
+        "plugin" => {
             let result: Result<Arc<dyn RdmaProvider>, RdmaError>;
-            #[cfg(any(feature = "cuobj-client", feature = "cuobj-server"))]
+            #[cfg(any(feature = "plugin-client", feature = "plugin-server"))]
             {
                 let ep = match role {
-                    RdmaRole::Client => CuObjProvider::new_client(),
-                    RdmaRole::Server => CuObjProvider::new_server(cfg),
-                    RdmaRole::Both   => CuObjProvider::new_both(cfg),
+                    RdmaRole::Client => PluginProvider::new_client(),
+                    RdmaRole::Server => PluginProvider::new_server(cfg),
+                    RdmaRole::Both   => PluginProvider::new_both(cfg),
                 };
                 result = ep.map(|e| {
                     if debug {
-                        eprintln!("[rdma] Using CuObjProvider (role={role:?})");
+                        eprintln!("[rdma] Using PluginProvider (role={role:?})");
                     }
                     Arc::new(e) as Arc<dyn RdmaProvider>
                 }).map_err(|e| RdmaError::ProviderUnavailable {
@@ -171,26 +160,26 @@ pub fn create_provider(
                     reason: e.to_string(),
                 });
             }
-            #[cfg(not(any(feature = "cuobj-client", feature = "cuobj-server")))]
+            #[cfg(not(any(feature = "plugin-client", feature = "plugin-server")))]
             {
                 let _ = (debug, role, cfg);
                 result = Err(RdmaError::ProviderUnavailable {
                     provider: provider.to_owned(),
-                    reason: "compiled without `cuobj-client` or `cuobj-server` features".into(),
+                    reason: "compiled without `plugin-client` or `plugin-server` features".into(),
                 });
             }
             result
         }
         "auto" => {
-            // Try cuobj first; fall back to mock on any error.
-            match create_provider("cuobj", debug, role, cfg) {
+            // Try plugin first; fall back to mock on any error.
+            match create_provider("plugin", debug, role, cfg) {
                 Ok(ep) => Ok(ep),
                 Err(_) => create_provider("mock", debug, role, cfg),
             }
         }
         other => Err(RdmaError::ProviderUnavailable {
             provider: other.to_owned(),
-            reason: "unknown provider (valid: mock, cuobj, auto)".to_owned(),
+            reason: "unknown provider (valid: mock, plugin, auto)".to_owned(),
         }),
     }
 }
@@ -212,11 +201,11 @@ pub fn create_client_provider(
             }
             Ok(Arc::new(MockRdmaProvider::new(debug, &cfg.shm_path, cfg.buf_size)))
         }
-        #[cfg(any(feature = "cuobj-client", feature = "cuobj-server"))]
-        "cuobj" => {
-            CuObjProvider::new_client()
+        #[cfg(any(feature = "plugin-client", feature = "plugin-server"))]
+        "plugin" => {
+            PluginProvider::new_client()
                 .map(|e| {
-                    if debug { eprintln!("[rdma] Using CuObjProvider (role=Client)"); }
+                    if debug { eprintln!("[rdma] Using PluginProvider (role=Client)"); }
                     Arc::new(e) as Arc<dyn RdmaClientProvider>
                 })
                 .map_err(|e| RdmaError::ProviderUnavailable {
@@ -224,16 +213,16 @@ pub fn create_client_provider(
                     reason: e.to_string(),
                 })
         }
-        #[cfg(not(any(feature = "cuobj-client", feature = "cuobj-server")))]
-        "cuobj" => Err(RdmaError::ProviderUnavailable {
+        #[cfg(not(any(feature = "plugin-client", feature = "plugin-server")))]
+        "plugin" => Err(RdmaError::ProviderUnavailable {
             provider: provider.to_owned(),
-            reason: "compiled without `cuobj-client` or `cuobj-server` features".into(),
+            reason: "compiled without `plugin-client` or `plugin-server` features".into(),
         }),
-        "auto" => create_client_provider("cuobj", debug, cfg)
+        "auto" => create_client_provider("plugin", debug, cfg)
             .or_else(|_| create_client_provider("mock", debug, cfg)),
         other => Err(RdmaError::ProviderUnavailable {
             provider: other.to_owned(),
-            reason: "unknown provider (valid: mock, cuobj, auto)".to_owned(),
+            reason: "unknown provider (valid: mock, plugin, auto)".to_owned(),
         }),
     }
 }
@@ -254,11 +243,11 @@ pub fn create_server_provider(
             }
             Ok(Arc::new(MockRdmaProvider::new(debug, &cfg.shm_path, cfg.buf_size)))
         }
-        #[cfg(any(feature = "cuobj-client", feature = "cuobj-server"))]
-        "cuobj" => {
-            CuObjProvider::new_server(cfg)
+        #[cfg(any(feature = "plugin-client", feature = "plugin-server"))]
+        "plugin" => {
+            PluginProvider::new_server(cfg)
                 .map(|e| {
-                    if debug { eprintln!("[rdma] Using CuObjProvider (role=Server)"); }
+                    if debug { eprintln!("[rdma] Using PluginProvider (role=Server)"); }
                     Arc::new(e) as Arc<dyn RdmaServerProvider>
                 })
                 .map_err(|e| RdmaError::ProviderUnavailable {
@@ -266,16 +255,17 @@ pub fn create_server_provider(
                     reason: e.to_string(),
                 })
         }
-        #[cfg(not(any(feature = "cuobj-client", feature = "cuobj-server")))]
-        "cuobj" => Err(RdmaError::ProviderUnavailable {
+        #[cfg(not(any(feature = "plugin-client", feature = "plugin-server")))]
+        "plugin" => Err(RdmaError::ProviderUnavailable {
             provider: provider.to_owned(),
-            reason: "compiled without `cuobj-client` or `cuobj-server` features".into(),
+            reason: "compiled without `plugin-client` or `plugin-server` features".into(),
         }),
-        "auto" => create_server_provider("cuobj", debug, cfg)
+        "auto" => create_server_provider("plugin", debug, cfg)
             .or_else(|_| create_server_provider("mock", debug, cfg)),
         other => Err(RdmaError::ProviderUnavailable {
             provider: other.to_owned(),
-            reason: "unknown provider (valid: mock, cuobj, auto)".to_owned(),
+            reason: "unknown provider (valid: mock, plugin, auto)".to_owned(),
         }),
     }
 }
+

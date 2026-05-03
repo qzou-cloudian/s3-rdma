@@ -1,15 +1,4 @@
-//! cuObject RDMA provider plugin — real NVIDIA SDK implementation.
-//!
-//! Builds as a `cdylib` (`libs3rdmacuobjclient.so`) and exports:
-//! ```c
-//! const RdmaProviderVtable *s3_rdma_provider_get_vtable(void);
-//! ```
-//!
-//! The plugin registers client buffers with the RDMA fabric on demand (in
-//! `prepare_put_token` / `prepare_get_token`) and releases both the
-//! registration and the RDMA descriptor when `process_reply_token` is called,
-//! guaranteeing that the descriptor stays valid until the server has finished
-//! the RDMA transfer.
+//! cuObject RDMA client backend — NVIDIA SDK hardware implementation.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -21,17 +10,13 @@ use cuobj::{CuObjClient, CuObjClientError, CuObjRdmaToken};
 use s3_rdma::ffi::{ByteCursor, RdmaCompletionFn, RdmaProviderVtable};
 use s3_rdma::provider::{RDMA_BYTES_HEADER, RDMA_REPLY_HEADER, RDMA_TOKEN_HEADER};
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PendingOp
-// ─────────────────────────────────────────────────────────────────────────────
+static PROVIDER_NAME: &[u8] = b"s3-rdma-plugin\0";
 
 /// Keeps an RDMA-registered buffer and its outstanding descriptor token alive
 /// for the duration of one RDMA transfer.
 ///
-/// Both fields are dropped together when [`process_reply_token`] confirms
-/// that the server has completed its RDMA READ or WRITE:
-/// - `_buf`  → deregisters the MR (`cuMemObjPutDescriptor`)
-/// - `_token` → releases the RDMA descriptor (`cuMemObjPutRDMAToken`)
+/// Both fields are dropped together when [`c_process_reply_token`] confirms
+/// that the server has completed its RDMA READ or WRITE.
 struct PendingOp {
     _buf:   RegisteredBuffer<'static>,
     _token: CuObjRdmaToken,
@@ -39,10 +24,6 @@ struct PendingOp {
 
 // SAFETY: both fields wrap opaque handles into the thread-safe cuObj SDK.
 unsafe impl Send for PendingOp {}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Provider
-// ─────────────────────────────────────────────────────────────────────────────
 
 struct CuObjSdkClient {
     client:  CuObjClient,
@@ -55,10 +36,6 @@ struct CuObjSdkClient {
 unsafe impl Send for CuObjSdkClient {}
 unsafe impl Sync for CuObjSdkClient {}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Singleton
-// ─────────────────────────────────────────────────────────────────────────────
-
 fn get_provider() -> Option<&'static CuObjSdkClient> {
     static INSTANCE: OnceLock<Option<Box<CuObjSdkClient>>> = OnceLock::new();
     INSTANCE.get_or_init(|| {
@@ -68,16 +45,12 @@ fn get_provider() -> Option<&'static CuObjSdkClient> {
                 pending: Mutex::new(HashMap::new()),
             })),
             Err(e) => {
-                eprintln!("[s3-rdma-cuobj] CuObjClient::new failed: {e:?}");
+                eprintln!("[s3-rdma-plugin] CuObjClient::new failed: {e:?}");
                 None
             }
         }
     }).as_deref()
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Internal helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Register `ptr[0..size]` and obtain a PUT RDMA descriptor.
 ///
@@ -135,19 +108,12 @@ fn do_prepare_get(
     Ok(key)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// C-ABI shims
-// ─────────────────────────────────────────────────────────────────────────────
-
-static PROVIDER_NAME: &[u8] = b"s3-rdma-cuobj\0";
-
 unsafe extern "C" fn c_init(_: *mut c_void, _: *mut *mut c_void) -> i32 {
     if get_provider().is_some() { 0 } else { -1 }
 }
 
 unsafe extern "C" fn c_cleanup(_: *mut c_void) {}
 
-/// Check memory eligibility without requiring a client instance.
 unsafe extern "C" fn c_is_memory_suitable(
     _: *mut c_void, ptr: *const c_void, _size: usize,
 ) -> bool {
@@ -174,11 +140,11 @@ unsafe extern "C" fn c_get_max_transfer_size(
 
 unsafe extern "C" fn c_prepare_put_token(
     _: *mut c_void,
-    s3_key:  *const ByteCursor,
-    buffer:  *const c_void,
-    size:    usize,
-    offset:  usize,
-    out:     *mut ByteCursor,
+    s3_key: *const ByteCursor,
+    buffer: *const c_void,
+    size:   usize,
+    offset: usize,
+    out:    *mut ByteCursor,
 ) -> i32 {
     if s3_key.is_null() || out.is_null() { return -1; }
     let Some(p) = get_provider() else { return -1; };
@@ -191,7 +157,7 @@ unsafe extern "C" fn c_prepare_put_token(
         }
         Err(e) => {
             let key = unsafe { (*s3_key).as_slice() };
-            eprintln!("[s3-rdma-cuobj] prepare_put_token({}): {e:?}",
+            eprintln!("[s3-rdma-plugin] prepare_put_token({}): {e:?}",
                       String::from_utf8_lossy(key));
             -1
         }
@@ -217,7 +183,7 @@ unsafe extern "C" fn c_prepare_get_token(
         }
         Err(e) => {
             let key = unsafe { (*s3_key).as_slice() };
-            eprintln!("[s3-rdma-cuobj] prepare_get_token({}): {e:?}",
+            eprintln!("[s3-rdma-plugin] prepare_get_token({}): {e:?}",
                       String::from_utf8_lossy(key));
             -1
         }
@@ -262,15 +228,11 @@ unsafe extern "C" fn c_rdma_bytes_header_name(_: *mut c_void) -> ByteCursor {
     ByteCursor::from_slice(RDMA_BYTES_HEADER.as_bytes())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Static vtable + entry point
-// ─────────────────────────────────────────────────────────────────────────────
-
 static VTABLE: RdmaProviderVtable = RdmaProviderVtable {
-    provider_name:    PROVIDER_NAME.as_ptr() as *const c_char,
-    provider_version: 1,
-    init:    Some(c_init),
-    cleanup: Some(c_cleanup),
+    provider_name:          PROVIDER_NAME.as_ptr() as *const c_char,
+    provider_version:       1,
+    init:                   Some(c_init),
+    cleanup:                Some(c_cleanup),
     is_memory_suitable:     Some(c_is_memory_suitable),
     register_memory:        Some(c_register_memory),
     deregister_memory:      Some(c_deregister_memory),
@@ -283,8 +245,6 @@ static VTABLE: RdmaProviderVtable = RdmaProviderVtable {
     rdma_bytes_header_name: Some(c_rdma_bytes_header_name),
 };
 
-/// C ABI entry point: returns the statically allocated RDMA provider vtable.
-#[no_mangle]
-pub extern "C" fn s3_rdma_provider_get_vtable() -> *const RdmaProviderVtable {
+pub fn vtable() -> *const RdmaProviderVtable {
     &VTABLE
 }
