@@ -132,15 +132,18 @@ impl RdmaToken {
         Self { provider: String::new(), token: raw.to_vec(), offset: 0, size: 0, size_exact: false }
     }
 
-    /// Convenience constructor from a string slice.
-    pub fn from_str(s: &str) -> Self {
+    /// Convenience constructor from a UTF-8 string.
+    ///
+    /// Equivalent to `Self::parse(s.as_bytes())`.  Also available via
+    /// `s.parse::<RdmaToken>()` (see [`FromStr`](std::str::FromStr) impl).
+    pub fn parse_str(s: &str) -> Self {
         Self::parse(s.as_bytes())
     }
 
     /// Parse the `|`-separated multi-token header into individual tokens.
     ///
     /// Each token's size is read from its embedded encoding.  Pass an empty
-    /// string (or use [`from_str`](Self::from_str)) for single-token requests.
+    /// string (or use [`parse_str`](Self::parse_str)) for single-token requests.
     ///
     /// # Example
     /// ```rust
@@ -155,7 +158,7 @@ impl RdmaToken {
     pub fn parse_multi(tokens_header: &str) -> Vec<Self> {
         tokens_header
             .split(RDMA_TOKEN_SEPARATOR)
-            .map(Self::from_str)
+            .map(Self::parse_str)
             .collect()
     }
 
@@ -213,16 +216,16 @@ impl RdmaToken {
     /// ```rust
     /// # use s3_rdma::RdmaToken;
     /// // Mock token: size always exact.
-    /// let tok = RdmaToken::from_str("RDMA_PUT_rdma-1_64_0_key_b/k");
+    /// let tok = RdmaToken::parse_str("RDMA_PUT_rdma-1_64_0_key_b/k");
     /// assert!(tok.size_is_exact());
     /// assert_eq!(tok.size(), 64);
     ///
     /// // Basic cuObj: size = registered capacity, NOT the transfer size.
-    /// let tok = RdmaToken::from_str("7fab000000000000:20000000:deadbeef0000:extra");
+    /// let tok = RdmaToken::parse_str("7fab000000000000:20000000:deadbeef0000:extra");
     /// assert!(!tok.size_is_exact());
     ///
     /// // Extended cuObj: size = exact transfer size.
-    /// let tok = RdmaToken::from_str("7fab000000000000:20000000:deadbeef0000:extra:67108864:0");
+    /// let tok = RdmaToken::parse_str("7fab000000000000:20000000:deadbeef0000:extra:67108864:0");
     /// assert!(tok.size_is_exact());
     /// assert_eq!(tok.size(), 67108864);
     /// ```
@@ -404,7 +407,7 @@ impl From<&[u8]> for RdmaToken {
 }
 
 impl From<&str> for RdmaToken {
-    fn from(s: &str) -> Self { Self::from_str(s) }
+    fn from(s: &str) -> Self { Self::parse_str(s) }
 }
 
 /// Parses without cloning for non-cuObj tokens; for cuObj tokens the base
@@ -443,6 +446,14 @@ impl std::fmt::Display for RdmaToken {
     }
 }
 
+impl std::str::FromStr for RdmaToken {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::parse_str(s))
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -454,7 +465,7 @@ mod tests {
 
     #[test]
     fn parse_mock_put() {
-        let tok = RdmaToken::from_str(MOCK_PUT);
+        let tok = RdmaToken::parse_str(MOCK_PUT);
         assert_eq!(tok.provider(), "mock");
         assert_eq!(tok.size(),   1073741824);
         assert_eq!(tok.offset(), 0);
@@ -465,7 +476,7 @@ mod tests {
 
     #[test]
     fn parse_mock_get() {
-        let tok = RdmaToken::from_str(MOCK_GET);
+        let tok = RdmaToken::parse_str(MOCK_GET);
         assert_eq!(tok.provider(), "mock");
         assert_eq!(tok.size(),   268435456);
         assert_eq!(tok.offset(), 4096);
@@ -485,7 +496,7 @@ mod tests {
     #[test]
     fn parse_opaque_ascii_not_rdma() {
         // A plain string that doesn't start with "RDMA_" is treated as opaque.
-        let tok = RdmaToken::from_str("cuobj:abcdef1234");
+        let tok = RdmaToken::parse_str("cuobj:abcdef1234");
         assert!(tok.is_opaque());
         assert_eq!(tok.size(), 0);
         assert!(!tok.size_is_exact());
@@ -493,7 +504,7 @@ mod tests {
 
     #[test]
     fn slice_preserves_raw() {
-        let tok = RdmaToken::from_str(MOCK_PUT);
+        let tok = RdmaToken::parse_str(MOCK_PUT);
         let sl  = tok.slice(128, 64);
         assert_eq!(sl.raw(), tok.raw());   // same underlying descriptor
         assert_eq!(sl.offset(), 128);
@@ -505,7 +516,7 @@ mod tests {
 
     #[test]
     fn split_equal_chunks() {
-        let tok = RdmaToken::from_str("RDMA_PUT_rdma-1-abc_512_0_key_b/k");
+        let tok = RdmaToken::parse_str("RDMA_PUT_rdma-1-abc_512_0_key_b/k");
         let slices = tok.split(128);
         assert_eq!(slices.len(), 4);
         for (i, sl) in slices.iter().enumerate() {
@@ -517,7 +528,7 @@ mod tests {
 
     #[test]
     fn split_uneven_last_chunk() {
-        let tok = RdmaToken::from_str("RDMA_PUT_rdma-1-abc_300_0_key_b/k");
+        let tok = RdmaToken::parse_str("RDMA_PUT_rdma-1-abc_300_0_key_b/k");
         let slices = tok.split(128);
         assert_eq!(slices.len(), 3);
         assert_eq!(slices[0].size(), 128);
@@ -528,7 +539,7 @@ mod tests {
 
     #[test]
     fn split_fits_in_one() {
-        let tok = RdmaToken::from_str("RDMA_PUT_rdma-1-abc_64_0_key_b/k");
+        let tok = RdmaToken::parse_str("RDMA_PUT_rdma-1-abc_64_0_key_b/k");
         let slices = tok.split(128);
         assert_eq!(slices.len(), 1);
         assert_eq!(slices[0].offset(), 0);
@@ -546,7 +557,7 @@ mod tests {
     #[test]
     fn split_from_nonzero_offset() {
         // A sliced token covering bytes [256..512) of a 512-byte buffer.
-        let tok = RdmaToken::from_str("RDMA_PUT_rdma-1-abc_512_0_key_b/k");
+        let tok = RdmaToken::parse_str("RDMA_PUT_rdma-1-abc_512_0_key_b/k");
         let half = tok.slice(256, 256);
         let slices = half.split(128);
         assert_eq!(slices.len(), 2);
@@ -579,7 +590,7 @@ mod tests {
 
     #[test]
     fn parse_cuobj_basic() {
-        let tok = RdmaToken::from_str(CUOBJ_TOK);
+        let tok = RdmaToken::parse_str(CUOBJ_TOK);
         assert_eq!(tok.provider(), "cuobj");
         assert_eq!(tok.size(), 0x20000000);  // 512 MiB = registered capacity
         assert_eq!(tok.offset(), 0);
@@ -590,13 +601,13 @@ mod tests {
 
     #[test]
     fn parse_cuobj_remote_addr() {
-        let tok = RdmaToken::from_str(CUOBJ_TOK);
+        let tok = RdmaToken::parse_str(CUOBJ_TOK);
         assert_eq!(tok.remote_addr(), 0x7fab000000000000usize);
     }
 
     #[test]
     fn parse_cuobj_total_buffer_size() {
-        let tok = RdmaToken::from_str(CUOBJ_TOK);
+        let tok = RdmaToken::parse_str(CUOBJ_TOK);
         assert_eq!(tok.total_buffer_size(), 0x20000000);
         // After slicing, total_buffer_size still reflects the full token size.
         let sl = tok.slice(0x10000000, 0x10000000);
@@ -606,7 +617,7 @@ mod tests {
 
     #[test]
     fn parse_cuobj_split() {
-        let tok = RdmaToken::from_str(CUOBJ_TOK); // 512 MiB
+        let tok = RdmaToken::parse_str(CUOBJ_TOK); // 512 MiB
         let chunk = 128 * 1024 * 1024; // 128 MiB
         let slices = tok.split(chunk);
         assert_eq!(slices.len(), 4);
@@ -624,7 +635,7 @@ mod tests {
     #[test]
     fn cuobj_not_confused_with_opaque() {
         // Must not accidentally be treated as opaque (provider == "").
-        let tok = RdmaToken::from_str(CUOBJ_TOK);
+        let tok = RdmaToken::parse_str(CUOBJ_TOK);
         assert!(!tok.is_opaque());
         assert_eq!(tok.provider(), "cuobj");
     }
@@ -632,7 +643,7 @@ mod tests {
     #[test]
     fn opaque_non_cuobj_still_empty_provider() {
         // A string with colons but non-hex first field → opaque.
-        let tok = RdmaToken::from_str("not-hex:10000:rkey:extra");
+        let tok = RdmaToken::parse_str("not-hex:10000:rkey:extra");
         assert_eq!(tok.provider(), "");
         assert!(tok.is_opaque());
         assert_eq!(tok.size(), 0);
@@ -641,7 +652,7 @@ mod tests {
     #[test]
     fn cuobj_remote_addr_with_offset() {
         // remote_addr() returns the base vaddr regardless of slice offset.
-        let tok = RdmaToken::from_str(CUOBJ_TOK);
+        let tok = RdmaToken::parse_str(CUOBJ_TOK);
         let sl = tok.slice(0x1000, 0x1000000);
         assert_eq!(sl.remote_addr(), 0x7fab000000000000usize);
         assert_eq!(sl.offset(), 0x1000);
@@ -649,7 +660,7 @@ mod tests {
 
     #[test]
     fn display_mock() {
-        let tok = RdmaToken::from_str(MOCK_PUT);
+        let tok = RdmaToken::parse_str(MOCK_PUT);
         assert_eq!(tok.to_string(), MOCK_PUT);
     }
 
@@ -675,7 +686,7 @@ mod tests {
 
     #[test]
     fn parse_cuobj_extended_basic() {
-        let tok = RdmaToken::from_str(CUOBJ_EXT);
+        let tok = RdmaToken::parse_str(CUOBJ_EXT);
         assert_eq!(tok.provider(), "cuobj");
         // Extension fields override the base size_hex.
         assert_eq!(tok.size(),   67108864); // decimal extension, not 0x20000000
@@ -689,7 +700,7 @@ mod tests {
     fn cuobj_extended_raw_strips_extension() {
         // raw() must return only the base descriptor; the cuObj C SDK must not
         // see the trailing `:size:offset` fields.
-        let tok = RdmaToken::from_str(CUOBJ_EXT);
+        let tok = RdmaToken::parse_str(CUOBJ_EXT);
         assert_eq!(tok.raw(), CUOBJ_TOK.as_bytes());
     }
 
@@ -697,21 +708,21 @@ mod tests {
     fn cuobj_extended_total_buffer_size() {
         // total_buffer_size() always returns the registered capacity from the
         // base descriptor (size_hex), not the extension size.
-        let tok = RdmaToken::from_str(CUOBJ_EXT);
+        let tok = RdmaToken::parse_str(CUOBJ_EXT);
         assert_eq!(tok.total_buffer_size(), 0x20000000);
     }
 
     #[test]
     fn cuobj_non_extended_raw_unchanged() {
         // A plain (non-extended) cuObj token: raw() returns the full string.
-        let tok = RdmaToken::from_str(CUOBJ_TOK);
+        let tok = RdmaToken::parse_str(CUOBJ_TOK);
         assert_eq!(tok.raw(), CUOBJ_TOK.as_bytes());
     }
 
     #[test]
     fn cuobj_extended_split() {
         // size=67108864 (64 MiB), offset=4096.
-        let tok     = RdmaToken::from_str(CUOBJ_EXT);
+        let tok     = RdmaToken::parse_str(CUOBJ_EXT);
         let chunk   = 16 * 1024 * 1024; // 16 MiB
         let slices  = tok.split(chunk);
         assert_eq!(slices.len(), 4);
@@ -741,14 +752,14 @@ mod tests {
     #[test]
     fn cuobj_extended_remote_addr() {
         // remote_addr() reads from the (always-base) stored token.
-        let tok = RdmaToken::from_str(CUOBJ_EXT);
+        let tok = RdmaToken::parse_str(CUOBJ_EXT);
         assert_eq!(tok.remote_addr(), 0x7fab000000000000usize);
     }
 
     #[test]
     fn cuobj_base_not_falsely_extended() {
         // A base token whose last field is not decimal → no extension detected.
-        let tok = RdmaToken::from_str(CUOBJ_TOK);
+        let tok = RdmaToken::parse_str(CUOBJ_TOK);
         assert_eq!(tok.size(), 0x20000000); // from size_hex, no override
         assert_eq!(tok.offset(), 0);
         assert_eq!(tok.raw(), CUOBJ_TOK.as_bytes());
@@ -758,15 +769,15 @@ mod tests {
     #[test]
     fn size_is_exact_propagates_through_slice() {
         // slice() preserves size_is_exact from the parent token.
-        let mock = RdmaToken::from_str("RDMA_PUT_rdma-1_512_0_key_b/k");
+        let mock = RdmaToken::parse_str("RDMA_PUT_rdma-1_512_0_key_b/k");
         let sl   = mock.slice(128, 64);
         assert!(sl.size_is_exact());
 
-        let cuobj_ext = RdmaToken::from_str(CUOBJ_EXT);
+        let cuobj_ext = RdmaToken::parse_str(CUOBJ_EXT);
         let sl2 = cuobj_ext.slice(0, 1024);
         assert!(sl2.size_is_exact());
 
-        let cuobj_basic = RdmaToken::from_str(CUOBJ_TOK);
+        let cuobj_basic = RdmaToken::parse_str(CUOBJ_TOK);
         let sl3 = cuobj_basic.slice(0, 1024);
         assert!(!sl3.size_is_exact());
     }

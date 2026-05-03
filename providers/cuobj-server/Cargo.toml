@@ -11,4 +11,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 s3-rdma = { path = "../../core" }
-cuobj   = { path = "../../../cuobj", features = ["server", "buffer-pool"] }
+cuobj   = { path = "../../../cuobj", features = ["server"] }

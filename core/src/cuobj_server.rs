@@ -10,15 +10,13 @@
 //! 2. Directory containing the current executable.
 //! 3. `/lib64/`, `/usr/lib64/` (common CUDA/cuObject install locations).
 
-pub use crate::provider::RdmaServerConfig;
-
 #[cfg(feature = "cuobj-server")]
 mod real {
     use std::ffi::{c_void, CString};
     use libloading::{Library, Symbol};
     use crate::error::RdmaError;
     use crate::ffi::{ByteCursor, GetServerVtableFn, RdmaServerInitParams, RdmaServerVtable};
-    use super::RdmaServerConfig;
+    use crate::provider::RdmaServerConfig;
 
     const LIB_NAME: &str = "libs3rdmacuobjserver.so";
 
@@ -87,10 +85,11 @@ mod real {
             let addr_cstr = CString::new(cfg.listen_addr.as_str())
                 .map_err(|e| RdmaError::CuObjConnectionFailed(e.to_string()))?;
             let params = RdmaServerInitParams {
-                listen_addr: addr_cstr.as_ptr(),
-                listen_port: cfg.listen_port,
-                pool_count:  cfg.pool_count,
-                buf_size:    cfg.buf_size,
+                listen_addr:    addr_cstr.as_ptr(),
+                listen_port:    cfg.listen_port,
+                pool_count:     cfg.pool_count,
+                buf_pool_count: cfg.buf_pool_count,
+                buf_size:       cfg.buf_size,
             };
 
             let mut ctx = std::ptr::null_mut::<c_void>();
@@ -188,6 +187,77 @@ mod real {
             if rc != 0 {
                 return Err(RdmaError::TransferFailed(
                     format!("cuobj server handle_get returned {rc}")
+                ));
+            }
+            Ok(written)
+        }
+
+        /// Zero-copy RDMA PUT: delegates to the plugin's `handle_put_zc` entry.
+        ///
+        /// The plugin RDMA_READs from the client buffer into its internal
+        /// RDMA-registered slot, then invokes `write_fn(write_fn_data, ptr, n)`
+        /// to flush the data to storage without an intermediate copy.
+        ///
+        /// # Safety
+        /// `write_fn_data` must remain valid for the duration of the call.
+        /// `write_fn` must be thread-safe (it is called from a plugin worker thread).
+        pub unsafe fn handle_put_zc(
+            &self,
+            s3_key:        &[u8],
+            token:         &[u8],
+            offset:        usize,
+            size:          usize,
+            write_fn:      crate::ffi::RdmaIoWriteFn,
+            write_fn_data: *mut std::ffi::c_void,
+        ) -> Result<usize, RdmaError> {
+            let f = self.vtable().handle_put_zc.ok_or_else(|| {
+                RdmaError::TransferFailed("handle_put_zc not implemented in plugin".into())
+            })?;
+            let key_cursor   = ByteCursor::from_slice(s3_key);
+            let token_cursor = ByteCursor::from_slice(token);
+            let mut transferred: usize = 0;
+            let rc = unsafe {
+                f(self.ctx, &key_cursor, &token_cursor,
+                  offset, size, write_fn, write_fn_data, &mut transferred)
+            };
+            if rc != 0 {
+                return Err(RdmaError::TransferFailed(
+                    format!("cuobj server handle_put_zc returned {rc}")
+                ));
+            }
+            Ok(transferred)
+        }
+
+        /// Zero-copy RDMA GET: delegates to the plugin's `handle_get_zc` entry.
+        ///
+        /// The plugin calls `read_fn(read_fn_data, ptr, capacity)` to fill its
+        /// RDMA-registered slot directly from storage, then RDMA_WRITEs the
+        /// filled buffer to the client without an intermediate copy.
+        ///
+        /// # Safety
+        /// `read_fn_data` must remain valid for the duration of the call.
+        /// `read_fn` must be thread-safe (it is called from a plugin worker thread).
+        pub unsafe fn handle_get_zc(
+            &self,
+            s3_key:       &[u8],
+            token:        &[u8],
+            offset:       usize,
+            read_fn:      crate::ffi::RdmaIoReadFn,
+            read_fn_data: *mut std::ffi::c_void,
+        ) -> Result<usize, RdmaError> {
+            let f = self.vtable().handle_get_zc.ok_or_else(|| {
+                RdmaError::TransferFailed("handle_get_zc not implemented in plugin".into())
+            })?;
+            let key_cursor   = ByteCursor::from_slice(s3_key);
+            let token_cursor = ByteCursor::from_slice(token);
+            let mut written: usize = 0;
+            let rc = unsafe {
+                f(self.ctx, &key_cursor, &token_cursor,
+                  offset, read_fn, read_fn_data, &mut written)
+            };
+            if rc != 0 {
+                return Err(RdmaError::TransferFailed(
+                    format!("cuobj server handle_get_zc returned {rc}")
                 ));
             }
             Ok(written)

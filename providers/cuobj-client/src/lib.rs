@@ -17,7 +17,7 @@ use std::os::raw::c_char;
 use std::sync::{Mutex, OnceLock};
 
 use cuobj::client::RegisteredBuffer;
-use cuobj::{CuObjClient, CuObjClientError, RdmaToken};
+use cuobj::{CuObjClient, CuObjClientError, CuObjRdmaToken};
 use s3_rdma::ffi::{ByteCursor, RdmaCompletionFn, RdmaProviderVtable};
 use s3_rdma::provider::{RDMA_BYTES_HEADER, RDMA_REPLY_HEADER, RDMA_TOKEN_HEADER};
 
@@ -31,10 +31,10 @@ use s3_rdma::provider::{RDMA_BYTES_HEADER, RDMA_REPLY_HEADER, RDMA_TOKEN_HEADER}
 /// Both fields are dropped together when [`process_reply_token`] confirms
 /// that the server has completed its RDMA READ or WRITE:
 /// - `_buf`  → deregisters the MR (`cuMemObjPutDescriptor`)
-/// - `token` → releases the RDMA descriptor (`cuMemObjPutRDMAToken`)
+/// - `_token` → releases the RDMA descriptor (`cuMemObjPutRDMAToken`)
 struct PendingOp {
     _buf:   RegisteredBuffer<'static>,
-    _token: RdmaToken,
+    _token: CuObjRdmaToken,
 }
 
 // SAFETY: both fields wrap opaque handles into the thread-safe cuObj SDK.
@@ -44,7 +44,7 @@ unsafe impl Send for PendingOp {}
 // Provider
 // ─────────────────────────────────────────────────────────────────────────────
 
-struct CuObjClientProvider {
+struct CuObjSdkClient {
     client:  CuObjClient,
     /// Pending RDMA ops keyed by their RDMA descriptor bytes.
     pending: Mutex<HashMap<Vec<u8>, PendingOp>>,
@@ -52,18 +52,18 @@ struct CuObjClientProvider {
 
 // SAFETY: CuObjClient is Send+Sync; Mutex<HashMap> provides interior
 // mutability across threads.
-unsafe impl Send for CuObjClientProvider {}
-unsafe impl Sync for CuObjClientProvider {}
+unsafe impl Send for CuObjSdkClient {}
+unsafe impl Sync for CuObjSdkClient {}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Singleton
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn get_provider() -> Option<&'static CuObjClientProvider> {
-    static INSTANCE: OnceLock<Option<Box<CuObjClientProvider>>> = OnceLock::new();
+fn get_provider() -> Option<&'static CuObjSdkClient> {
+    static INSTANCE: OnceLock<Option<Box<CuObjSdkClient>>> = OnceLock::new();
     INSTANCE.get_or_init(|| {
         match CuObjClient::new() {
-            Ok(client) => Some(Box::new(CuObjClientProvider {
+            Ok(client) => Some(Box::new(CuObjSdkClient {
                 client,
                 pending: Mutex::new(HashMap::new()),
             })),
@@ -81,10 +81,10 @@ fn get_provider() -> Option<&'static CuObjClientProvider> {
 
 /// Register `ptr[0..size]` and obtain a PUT RDMA descriptor.
 ///
-/// Calling through a `&'static CuObjClientProvider` gives
+/// Calling through a `&'static CuObjSdkClient` gives
 /// `RegisteredBuffer<'static>`, so no lifetime transmute is required.
 fn do_prepare_put(
-    provider: &'static CuObjClientProvider,
+    provider: &'static CuObjSdkClient,
     ptr:      *const u8,
     size:     usize,
     offset:   usize,
@@ -122,7 +122,7 @@ fn do_prepare_put(
 
 /// Register `ptr[0..size]` and obtain a GET RDMA descriptor.
 fn do_prepare_get(
-    provider: &'static CuObjClientProvider,
+    provider: &'static CuObjSdkClient,
     ptr:      *mut u8,
     size:     usize,
     offset:   usize,

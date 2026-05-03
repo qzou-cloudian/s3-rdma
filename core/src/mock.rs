@@ -29,21 +29,24 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use crate::error::RdmaError;
-use crate::provider::{RdmaCompletionCallback, RdmaCompletionResult, RdmaProvider};
+use crate::provider::{RdmaCompletionCallback, RdmaCompletionResult, RdmaClientProvider, RdmaServerProvider, RdmaProvider};
 
 /// Base directory for shared-memory files.
 const SHM_DIR: &str = "/dev/shm";
 
-fn env_or(var: &str, default: &'static str) -> &'static str {
-    match std::env::var(var) {
-        // Box::leak is intentional: the value is read once at startup and lives
-        // for the process lifetime — equivalent cost to a static string.
-        Ok(v) if !v.is_empty() => Box::leak(v.into_boxed_str()),
-        _ => default,
-    }
+static TOKEN_HEADER: OnceLock<String> = OnceLock::new();
+static REPLY_HEADER: OnceLock<String> = OnceLock::new();
+
+fn env_header(lock: &'static OnceLock<String>, var: &str, default: &'static str) -> &'static str {
+    lock.get_or_init(|| {
+        std::env::var(var)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| default.to_owned())
+    })
 }
 
 struct ShmEntry {
@@ -118,8 +121,8 @@ impl MockRdmaProvider {
             shm_dir: shm_dir.into(),
             buf_size,
             registered: Mutex::new(HashMap::new()),
-            token_header: env_or("CUOBJ_RDMA_TOKEN_HEADER_NAME", "x-amz-rdma-token"),
-            reply_header: env_or("CUOBJ_RDMA_REPLY_HEADER_NAME", "x-amz-rdma-reply"),
+            token_header: env_header(&TOKEN_HEADER, "CUOBJ_RDMA_TOKEN_HEADER_NAME", "x-amz-rdma-token"),
+            reply_header: env_header(&REPLY_HEADER, "CUOBJ_RDMA_REPLY_HEADER_NAME", "x-amz-rdma-reply"),
         }
     }
 
@@ -150,14 +153,7 @@ impl MockRdmaProvider {
     }
 }
 
-impl RdmaProvider for MockRdmaProvider {
-    fn name(&self) -> &str { "MockRdmaProvider" }
-    fn protocol(&self) -> &str { "mock" }
-    fn supports_client(&self) -> bool { true }
-    fn supports_server(&self) -> bool { true }
-
-    // ── Client methods ──────────────────────────────────────────────────────
-
+impl RdmaClientProvider for MockRdmaProvider {
     fn is_memory_suitable(&self, ptr: *const u8, size: usize) -> bool {
         let ok = !ptr.is_null() && size > 0;
         self.dbg(&format!("is_memory_suitable ptr={ptr:p} size={size} -> {ok}"));
@@ -333,9 +329,9 @@ impl RdmaProvider for MockRdmaProvider {
 
     fn rdma_token_header_name(&self) -> &[u8] { self.token_header.as_bytes() }
     fn rdma_reply_header_name(&self) -> &[u8] { self.reply_header.as_bytes() }
+}
 
-    // ── Server methods ──────────────────────────────────────────────────────
-
+impl RdmaServerProvider for MockRdmaProvider {
     fn buf_size(&self) -> usize {
         if self.buf_size > 0 { self.buf_size } else { usize::MAX }
     }
@@ -399,4 +395,86 @@ impl RdmaProvider for MockRdmaProvider {
 
         Ok(write_len)
     }
+
+    unsafe fn handle_put_zc(
+        &self,
+        _s3_key:       &[u8],
+        token:         &[u8],
+        offset:        usize,
+        size:          usize,
+        write_fn:      crate::ffi::RdmaIoWriteFn,
+        write_fn_data: *mut std::ffi::c_void,
+    ) -> Result<usize, RdmaError> {
+        let (op, shm_name, token_size, _token_offset) = Self::parse_token(token)?;
+        if op != "PUT" {
+            return Err(RdmaError::TransferFailed(format!("expected PUT token, got {op}")));
+        }
+        let read_size = if size > 0 { size } else { token_size };
+        let path = format!("{}/{shm_name}", self.shm_dir);
+        self.dbg(&format!("handle_put_zc shm={shm_name} offset={offset} size={read_size}"));
+
+        let file_bytes = std::fs::read(&path)
+            .map_err(|e| RdmaError::TransferFailed(format!("read {path}: {e}")))?;
+        let start = offset.min(file_bytes.len());
+        let end = (offset + read_size).min(file_bytes.len());
+        let slice = &file_bytes[start..end];
+
+        let n = unsafe {
+            write_fn(write_fn_data, slice.as_ptr() as *const std::ffi::c_void, slice.len())
+        };
+        if n < 0 {
+            return Err(RdmaError::TransferFailed(format!("write_fn returned {n}")));
+        }
+        Ok(n as usize)
+    }
+
+    unsafe fn handle_get_zc(
+        &self,
+        _s3_key:      &[u8],
+        token:        &[u8],
+        offset:       usize,
+        read_fn:      crate::ffi::RdmaIoReadFn,
+        read_fn_data: *mut std::ffi::c_void,
+    ) -> Result<usize, RdmaError> {
+        let (op, shm_name, capacity, token_offset) = Self::parse_token(token)?;
+        if op != "GET" {
+            return Err(RdmaError::TransferFailed(format!("expected GET token, got {op}")));
+        }
+        let remaining_cap = capacity.saturating_sub(offset);
+        let buf_cap = if self.buf_size > 0 { remaining_cap.min(self.buf_size) } else { remaining_cap };
+        let mut buf = vec![0u8; buf_cap];
+
+        let n = unsafe {
+            read_fn(read_fn_data, buf.as_mut_ptr() as *mut std::ffi::c_void, buf_cap)
+        };
+        if n < 0 {
+            return Err(RdmaError::TransferFailed(format!("read_fn returned {n}")));
+        }
+        let read_bytes = n as usize;
+        let write_len = read_bytes.min(remaining_cap);
+        let write_start = token_offset + offset;
+        let path = format!("{}/{shm_name}", self.shm_dir);
+        self.dbg(&format!(
+            "handle_get_zc shm={shm_name} write={write_len} write_start={write_start}"
+        ));
+
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|e| RdmaError::TransferFailed(format!("open {path}: {e}")))?;
+        file.seek(SeekFrom::Start(write_start as u64))
+            .map_err(|e| RdmaError::TransferFailed(format!("seek {path}: {e}")))?;
+        file.write_all(&buf[..write_len])
+            .map_err(|e| RdmaError::TransferFailed(format!("write {path}: {e}")))?;
+
+        Ok(write_len)
+    }
+}
+
+impl RdmaProvider for MockRdmaProvider {
+    fn name(&self) -> &str { "MockRdmaProvider" }
+    fn protocol(&self) -> &str { "mock" }
+    fn supports_client(&self) -> bool { true }
+    fn supports_server(&self) -> bool { true }
 }

@@ -93,10 +93,11 @@ impl PyRdmaProvider {
     ) -> PyResult<Self> {
         let provider_role = parse_role(role)?;
         let cfg = RdmaServerConfig {
-            shm_path:    shm_path.to_owned(),
-            listen_addr: listen_addr.to_owned(),
+            shm_path:       shm_path.to_owned(),
+            listen_addr:    listen_addr.to_owned(),
             listen_port,
             pool_count,
+            buf_pool_count: 0,
             buf_size,
         };
         crate::create_provider(provider, debug, provider_role, &cfg)

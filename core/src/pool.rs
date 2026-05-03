@@ -35,7 +35,7 @@ use crossbeam_queue::ArrayQueue;
 use tokio::sync::Semaphore;
 
 use crate::error::RdmaError;
-use crate::provider::RdmaProvider;
+use crate::provider::{RdmaClientProvider, RdmaProvider};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error type
@@ -88,6 +88,30 @@ unsafe impl Send for Slot {}
 unsafe impl Sync for Slot {}
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ProviderClientBridge — adapts Arc<dyn RdmaProvider> to RdmaClientProvider
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Bridges an `Arc<dyn RdmaProvider>` into an `Arc<dyn RdmaClientProvider>`.
+///
+/// Only `register_memory`/`deregister_memory` are forwarded; all other methods
+/// use the default implementations (which return `OperationNotSupported`).
+/// This is acceptable here because the buffer pool only ever calls those two.
+struct ProviderClientBridge(Arc<dyn RdmaProvider>);
+
+impl crate::provider::RdmaClientProvider for ProviderClientBridge {
+    fn register_memory(&self, ptr: *mut u8, size: usize) -> Result<(), RdmaError> {
+        self.0.register_memory(ptr, size)
+    }
+    fn deregister_memory(&self, ptr: *mut u8) -> Result<(), RdmaError> {
+        self.0.deregister_memory(ptr)
+    }
+}
+
+// SAFETY: the inner Arc<dyn RdmaProvider> is Send + Sync.
+unsafe impl Send for ProviderClientBridge {}
+unsafe impl Sync for ProviderClientBridge {}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // BufferPool
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -105,7 +129,7 @@ pub struct BufferPool {
     parking_mu: Mutex<()>,
     parking_cv: Condvar,
     /// Provider used to register/deregister slots.  `None` → plain-bytes mode.
-    rdma:       Option<Arc<dyn RdmaProvider>>,
+    rdma:       Option<Arc<dyn RdmaClientProvider>>,
 }
 
 // SAFETY: `free_queue` and `sem` provide lock-free/atomic synchronisation;
@@ -122,16 +146,21 @@ impl BufferPool {
 
     // ── Acquire ──────────────────────────────────────────────────────────────
 
+    /// Pop a free slot index after a semaphore permit has been consumed.
+    fn pop_slot(self: &Arc<Self>) -> OwnedBufferGuard {
+        let idx  = self.free_queue.pop().expect("sem/queue invariant violated");
+        let ptr  = self.slots[idx].ptr;
+        let size = self.slots[idx].size;
+        OwnedBufferGuard { pool: Arc::clone(self), idx, ptr, size, len: size }
+    }
+
     /// Try to acquire a free buffer without blocking.
     ///
     /// Returns `None` if all buffers are in use.
     pub fn try_acquire_owned(self: &Arc<Self>) -> Option<OwnedBufferGuard> {
         let permit = self.sem.try_acquire().ok()?;
         permit.forget();
-        let idx  = self.free_queue.pop().expect("sem/queue invariant violated");
-        let ptr  = self.slots[idx].ptr;
-        let size = self.slots[idx].size;
-        Some(OwnedBufferGuard { pool: Arc::clone(self), idx, ptr, size, len: size })
+        Some(self.pop_slot())
     }
 
     /// Try to acquire a free buffer, waiting up to `timeout` for one.
@@ -145,10 +174,7 @@ impl BufferPool {
         loop {
             if let Ok(permit) = self.sem.try_acquire() {
                 permit.forget();
-                let idx  = self.free_queue.pop().expect("sem/queue invariant violated");
-                let ptr  = self.slots[idx].ptr;
-                let size = self.slots[idx].size;
-                return Some(OwnedBufferGuard { pool: Arc::clone(self), idx, ptr, size, len: size });
+                return Some(self.pop_slot());
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
@@ -158,10 +184,7 @@ impl BufferPool {
             if let Ok(permit) = self.sem.try_acquire() {
                 drop(lock);
                 permit.forget();
-                let idx  = self.free_queue.pop().expect("sem/queue invariant violated");
-                let ptr  = self.slots[idx].ptr;
-                let size = self.slots[idx].size;
-                return Some(OwnedBufferGuard { pool: Arc::clone(self), idx, ptr, size, len: size });
+                return Some(self.pop_slot());
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
@@ -172,10 +195,7 @@ impl BufferPool {
             if timed_out.timed_out() {
                 if let Ok(permit) = self.sem.try_acquire() {
                     permit.forget();
-                    let idx  = self.free_queue.pop().expect("sem/queue invariant violated");
-                    let ptr  = self.slots[idx].ptr;
-                    let size = self.slots[idx].size;
-                    return Some(OwnedBufferGuard { pool: Arc::clone(self), idx, ptr, size, len: size });
+                    return Some(self.pop_slot());
                 }
                 return None;
             }
@@ -187,10 +207,7 @@ impl BufferPool {
     pub async fn acquire_owned(self: &Arc<Self>) -> OwnedBufferGuard {
         let permit = self.sem.acquire().await.expect("BufferPool semaphore closed");
         permit.forget();
-        let idx  = self.free_queue.pop().expect("sem/queue invariant violated");
-        let ptr  = self.slots[idx].ptr;
-        let size = self.slots[idx].size;
-        OwnedBufferGuard { pool: Arc::clone(self), idx, ptr, size, len: size }
+        self.pop_slot()
     }
 
     /// Acquire a free buffer, **blocking the current thread** until one is
@@ -200,19 +217,13 @@ impl BufferPool {
         loop {
             if let Ok(permit) = self.sem.try_acquire() {
                 permit.forget();
-                let idx  = self.free_queue.pop().expect("sem/queue invariant violated");
-                let ptr  = self.slots[idx].ptr;
-                let size = self.slots[idx].size;
-                return OwnedBufferGuard { pool: Arc::clone(self), idx, ptr, size, len: size };
+                return self.pop_slot();
             }
             let lock = self.parking_mu.lock().unwrap();
             if let Ok(permit) = self.sem.try_acquire() {
                 drop(lock);
                 permit.forget();
-                let idx  = self.free_queue.pop().expect("sem/queue invariant violated");
-                let ptr  = self.slots[idx].ptr;
-                let size = self.slots[idx].size;
-                return OwnedBufferGuard { pool: Arc::clone(self), idx, ptr, size, len: size };
+                return self.pop_slot();
             }
             drop(self.parking_cv.wait(lock).unwrap());
         }
@@ -334,11 +345,14 @@ impl Drop for OwnedBufferGuard {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Builder for [`BufferPool`].  Obtain via [`BufferPool::builder()`].
-#[derive(Default)]
 pub struct BufferPoolBuilder {
     count: usize,
     size:  usize,
-    rdma:  Option<Arc<dyn RdmaProvider>>,
+    rdma:  Option<Arc<dyn RdmaClientProvider>>,
+}
+
+impl Default for BufferPoolBuilder {
+    fn default() -> Self { Self { count: 0, size: 0, rdma: None } }
 }
 
 impl BufferPoolBuilder {
@@ -348,15 +362,24 @@ impl BufferPoolBuilder {
     /// Size of each buffer slot in bytes.
     pub fn size(mut self, bytes: usize) -> Self { self.size = bytes; self }
 
-    /// Attach an RDMA provider.  All slots are registered with it at build
-    /// time so per-transfer `register_memory`/`deregister_memory` is avoided.
+    /// Attach a client-role RDMA provider.  All slots are registered with it
+    /// at build time so per-transfer `register_memory`/`deregister_memory` is
+    /// avoided.
     ///
-    /// Accepts any `Arc<dyn RdmaProvider>`:
-    /// - `Arc<MockRdmaProvider>` — SHM-backed, no hardware required
-    /// - `Arc<CuObjProvider>` — real NVIDIA cuObj RDMA
-    /// - `None` (don't call this method) — plain heap buffers
-    pub fn with_rdma(mut self, rdma: Option<Arc<dyn RdmaProvider>>) -> Self {
+    /// Use [`with_rdma`][Self::with_rdma] if you have an `Arc<dyn RdmaProvider>`
+    /// (the combined trait).
+    pub fn with_client(mut self, rdma: Option<Arc<dyn RdmaClientProvider>>) -> Self {
         self.rdma = rdma;
+        self
+    }
+
+    /// Attach a combined RDMA provider.
+    ///
+    /// Convenience for callers that hold an `Arc<dyn RdmaProvider>`.
+    /// Only the `register_memory`/`deregister_memory` methods are called on
+    /// the provider; the server-side methods are never invoked.
+    pub fn with_rdma(mut self, rdma: Option<Arc<dyn RdmaProvider>>) -> Self {
+        self.rdma = rdma.map(|r| Arc::new(ProviderClientBridge(r)) as Arc<dyn RdmaClientProvider>);
         self
     }
 
@@ -366,8 +389,18 @@ impl BufferPoolBuilder {
     ///
     /// Returns an error if any slot cannot be allocated or registered.
     pub fn build(self) -> Result<BufferPool, BufferPoolError> {
-        assert!(self.count >= 1, "BufferPool count must be ≥ 1");
-        assert!(self.size  >= 1, "BufferPool slot size must be ≥ 1");
+        if self.count < 1 {
+            return Err(BufferPoolError::ConstructionFailed {
+                slot: 0,
+                reason: "pool count must be ≥ 1".into(),
+            });
+        }
+        if self.size < 1 {
+            return Err(BufferPoolError::ConstructionFailed {
+                slot: 0,
+                reason: "pool slot size must be ≥ 1".into(),
+            });
+        }
 
         let mut slots = Vec::with_capacity(self.count);
         let free_queue = ArrayQueue::new(self.count);

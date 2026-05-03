@@ -1,42 +1,41 @@
-//! RDMA provider infrastructure for hsc.
+//! RDMA provider infrastructure for S3-compatible gateways.
 //!
-//! This module provides SDK-agnostic RDMA provider implementations (mock and
-//! cuObject) and a C ABI vtable for use from C consumers.  The S3-specific
-//! AWS Smithy interceptor lives in the root `hsc` crate.
+//! Provides SDK-agnostic RDMA abstractions used by both client-side S3 tools
+//! and server-side gateways.  The concrete implementations are:
 //!
-//! ## How it works
+//! - [`MockRdmaProvider`] — SHM-based simulation, no hardware required
+//! - [`CuObjProvider`] — real NVIDIA cuObj RDMA (loaded from plugin `.so` at runtime)
+//! - [`RdmaEngine`] — fixed-size worker pool wrapping any provider (feature `engine`)
+//!
+//! ## Flow
 //!
 //! ```text
-//!   hsc upload/download
-//!         │
-//!         ▼
-//!   Register buffer with cuObject (RdmaProvider::register_memory)
-//!         │
-//!         ▼
-//!   Generate RDMA token  (RdmaProvider::prepare_put_token / prepare_get_token)
-//!         │
-//!         ▼
-//!   aws-sdk-s3 PUT / GET  +  RdmaInterceptor
-//!         │  → adds x-amz-rdma-token request header
-//!         │  ← reads x-amz-rdma-reply response header
-//!         │
-//!         ▼
-//!   S3 server performs RDMA READ/WRITE on registered buffer
-//!         │
-//!         ▼
-//!   Deregister buffer  (RdmaProvider::deregister_memory)
+//!   Client
+//!     │  register_memory(ptr, size)
+//!     │  prepare_put_token(key, ptr, len, offset) → RdmaToken
+//!     │  PUT /bucket/key  +  x-amz-rdma-token: <token>
+//!     │                          ↓
+//!     │                   Gateway performs RDMA_READ into registered buffer
+//!     │                          ↓
+//!     │  ← x-amz-rdma-reply: <reply>
+//!     │  process_rdma_reply(200, reply_token, ...)
+//!     │  deregister_memory(ptr)
 //! ```
 //!
 //! ## Feature flags
 //!
-//! | Feature        | Effect                                                    |
-//! |----------------|-----------------------------------------------------------|
-//! | `cuobj-client` | Enable real [`CuObjProvider`] client role (loads plugin at runtime) |
-//! | `cuobj-server` | Enable real [`CuObjProvider`] server role (loads plugin at runtime) |
-//! | (default)      | Only [`MockRdmaProvider`]                                |
+//! | Feature        | Effect                                                              |
+//! |----------------|---------------------------------------------------------------------|
+//! | `cuobj-client` | Enable [`CuObjProvider`] client role (loads plugin at runtime)      |
+//! | `cuobj-server` | Enable [`CuObjProvider`] server role (loads plugin at runtime)      |
+//! | `buffer-pool`  | Enable [`BufferPool`] for pre-registered RDMA buffers               |
+//! | `engine`       | Enable [`RdmaEngine`] fixed-size worker pool                        |
+//! | (none)         | Only [`MockRdmaProvider`] available                                 |
 
-pub mod cuobj_client;
-pub mod cuobj_server;
+pub(crate) mod cuobj_client;
+pub(crate) mod cuobj_server;
+#[cfg(feature = "engine")]
+pub mod engine;
 pub mod error;
 pub mod ffi;
 pub mod mock;
@@ -61,7 +60,9 @@ pub fn get_vtable_ptr() -> *const ffi::RdmaProviderVtable {
 // ── Primary public API ────────────────────────────────────────────────────────
 
 pub use provider::{RdmaRole, RdmaProvider, RdmaProviderConfig};
+pub use provider::{RdmaClientProvider, RdmaServerProvider};
 pub use mock::MockRdmaProvider;
+#[cfg(any(feature = "cuobj-client", feature = "cuobj-server"))]
 pub use cuobj_client::CuObjProvider;
 
 // ── Supporting types ──────────────────────────────────────────────────────────
@@ -71,6 +72,9 @@ pub use token::RdmaToken;
 
 #[cfg(feature = "buffer-pool")]
 pub use pool::{BufferPool, BufferPoolBuilder, BufferPoolError, OwnedBufferGuard};
+
+#[cfg(feature = "engine")]
+pub use engine::{RdmaEngine, RdmaEngineConfig};
 
 #[cfg(feature = "cuobj-client")]
 pub use cuobj_client::CuObjClientProvider;
@@ -164,6 +168,91 @@ pub fn create_provider(
                 Err(_) => create_provider("mock", debug, role, cfg),
             }
         }
+        other => Err(RdmaError::ProviderUnavailable {
+            provider: other.to_owned(),
+            reason: "unknown provider (valid: mock, cuobj, auto)".to_owned(),
+        }),
+    }
+}
+
+/// Build an `Arc<dyn RdmaClientProvider>` for the named provider.
+///
+/// Convenience wrapper around [`create_provider`] with [`RdmaRole::Client`].
+/// Use this in code that only needs client-side operations (register memory,
+/// generate tokens, process replies).
+pub fn create_client_provider(
+    provider: &str,
+    debug: bool,
+    cfg: &RdmaServerConfig,
+) -> Result<Arc<dyn RdmaClientProvider>, RdmaError> {
+    match provider {
+        "mock" => {
+            if debug {
+                eprintln!("[rdma] Using MockRdmaProvider (role=Client)");
+            }
+            Ok(Arc::new(MockRdmaProvider::new(debug, &cfg.shm_path, cfg.buf_size)))
+        }
+        #[cfg(any(feature = "cuobj-client", feature = "cuobj-server"))]
+        "cuobj" => {
+            CuObjProvider::new_client()
+                .map(|e| {
+                    if debug { eprintln!("[rdma] Using CuObjProvider (role=Client)"); }
+                    Arc::new(e) as Arc<dyn RdmaClientProvider>
+                })
+                .map_err(|e| RdmaError::ProviderUnavailable {
+                    provider: provider.to_owned(),
+                    reason: e.to_string(),
+                })
+        }
+        #[cfg(not(any(feature = "cuobj-client", feature = "cuobj-server")))]
+        "cuobj" => Err(RdmaError::ProviderUnavailable {
+            provider: provider.to_owned(),
+            reason: "compiled without `cuobj-client` or `cuobj-server` features".into(),
+        }),
+        "auto" => create_client_provider("cuobj", debug, cfg)
+            .or_else(|_| create_client_provider("mock", debug, cfg)),
+        other => Err(RdmaError::ProviderUnavailable {
+            provider: other.to_owned(),
+            reason: "unknown provider (valid: mock, cuobj, auto)".to_owned(),
+        }),
+    }
+}
+
+/// Build an `Arc<dyn RdmaServerProvider>` for the named provider.
+///
+/// Convenience wrapper around [`create_provider`] with [`RdmaRole::Server`].
+/// Use this in code that only needs server-side operations (handle PUT/GET).
+pub fn create_server_provider(
+    provider: &str,
+    debug: bool,
+    cfg: &RdmaServerConfig,
+) -> Result<Arc<dyn RdmaServerProvider>, RdmaError> {
+    match provider {
+        "mock" => {
+            if debug {
+                eprintln!("[rdma] Using MockRdmaProvider (role=Server)");
+            }
+            Ok(Arc::new(MockRdmaProvider::new(debug, &cfg.shm_path, cfg.buf_size)))
+        }
+        #[cfg(any(feature = "cuobj-client", feature = "cuobj-server"))]
+        "cuobj" => {
+            CuObjProvider::new_server(cfg)
+                .map(|e| {
+                    if debug { eprintln!("[rdma] Using CuObjProvider (role=Server)"); }
+                    Arc::new(e) as Arc<dyn RdmaServerProvider>
+                })
+                .map_err(|e| RdmaError::ProviderUnavailable {
+                    provider: provider.to_owned(),
+                    reason: e.to_string(),
+                })
+        }
+        #[cfg(not(any(feature = "cuobj-client", feature = "cuobj-server")))]
+        "cuobj" => Err(RdmaError::ProviderUnavailable {
+            provider: provider.to_owned(),
+            reason: "compiled without `cuobj-client` or `cuobj-server` features".into(),
+        }),
+        "auto" => create_server_provider("cuobj", debug, cfg)
+            .or_else(|_| create_server_provider("mock", debug, cfg)),
         other => Err(RdmaError::ProviderUnavailable {
             provider: other.to_owned(),
             reason: "unknown provider (valid: mock, cuobj, auto)".to_owned(),

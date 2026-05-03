@@ -1,14 +1,29 @@
 //! RDMA provider types, traits, and configuration.
 //!
-//! This module contains the central [`RdmaProvider`] trait and all associated
-//! types used throughout the s3-rdma crate and its consumers.
+//! This module contains the central [`RdmaProvider`] trait family and all
+//! associated types used throughout the s3-rdma crate and its consumers.
 //!
+//! ## Trait hierarchy
+//!
+//! ```text
+//! RdmaProvider: RdmaClientProvider + RdmaServerProvider
+//!   │
+//!   ├── RdmaClientProvider  — register memory, generate tokens, process replies
+//!   └── RdmaServerProvider  — handle PUT/GET transfers from clients
+//! ```
+//!
+//! Code that only handles client-side operations accepts
+//! `Arc<dyn RdmaClientProvider>`.  Code that only handles server-side
+//! operations accepts `Arc<dyn RdmaServerProvider>`.  The combined
+//! `Arc<dyn RdmaProvider>` is used when both roles are needed (e.g. same-node
+//! mock testing, Python/Java/C-ABI bindings).
+
 /// Convert the `x-amz-rdma-reply` numeric status to a callback `error_code`.
 ///
-/// - `0`         → `-1` (absent header — treated as error, avoids `0` == success confusion)
+/// - `0`         → `-1` (absent header — treated as error)
 /// - `200..300`  → `0`  (RDMA success)
 /// - other       → status cast to `i32` (e.g. `501` for RDMA fallback)
-pub fn rdma_status_to_error_code(rdma_status: u16) -> i32 {
+pub(crate) fn rdma_status_to_error_code(rdma_status: u16) -> i32 {
     if rdma_status != 0 && (200..300).contains(&rdma_status) {
         0
     } else if rdma_status == 0 {
@@ -17,7 +32,6 @@ pub fn rdma_status_to_error_code(rdma_status: u16) -> i32 {
         rdma_status as i32
     }
 }
-
 
 /// Result delivered when an RDMA operation completes.
 #[derive(Debug)]
@@ -37,15 +51,13 @@ pub type RdmaCompletionCallback = Box<dyn FnOnce(RdmaCompletionResult) + Send + 
 pub const RDMA_TOKEN_HEADER: &str = "x-amz-rdma-token";
 pub const RDMA_REPLY_HEADER: &str = "x-amz-rdma-reply";
 pub const RDMA_BYTES_HEADER: &str = "x-amz-rdma-bytes";
+
 /// Header that signals HTTP/2 streaming token mode.
 ///
 /// When present with value `"true"`, the PUT request body contains
 /// newline-delimited RDMA token strings (one per line) instead of object data.
 /// Each token line uses the extended format `<base_token>:<size>:<offset>` so
 /// the server knows the exact transfer size and object offset for every chunk.
-/// The actual object bytes are fetched from the client's RDMA buffers via
-/// concurrent RDMA_READ operations.  Requires HTTP/2 (so the body can be
-/// streamed while RDMA_READs proceed in parallel).
 pub const RDMA_STREAM_HEADER: &str = "x-amz-rdma-stream";
 
 /// Separator used when multiple RDMA tokens (or sizes) are packed into a single
@@ -56,45 +68,37 @@ pub const RDMA_STREAM_HEADER: &str = "x-amz-rdma-stream";
 ///
 /// # Multi-token protocol
 ///
-/// **PUT** — the client registers N non-contiguous (or sub-range) memory regions
-/// and sends their tokens as a pipe-separated list:
-/// ```text
-/// x-amz-rdma-token:  tok0|tok1|tok2
-/// ```
-/// Each token encodes its own byte count.  The server reads each token's buffer
-/// sequentially, feeding bytes directly into the storage backend as one object.
-///
+/// **PUT** — the client sends pipe-separated tokens: `tok0|tok1|tok2`.
 /// **GET** — the client pre-allocates N receive buffers and sends their tokens
-/// the same way.  The server writes backend data into the buffers in order,
-/// advancing to the next buffer when the current one is full.
+/// the same way.
 pub const RDMA_TOKEN_SEPARATOR: char = '|';
 
 // ── RdmaServerConfig ─────────────────────────────────────────────────────────
 
 /// Unified configuration for any RDMA **server** provider.
 ///
-/// Always defined (no feature gate) so callers can build the config without
-/// conditional compilation.  Fields that are irrelevant for a given provider
-/// are silently ignored:
+/// Fields that are irrelevant for a given provider are silently ignored:
 ///
-/// | Field         | mock | cuobj |
-/// |---------------|------|-------|
-/// | `shm_path`    | ✓    | –     |
-/// | `listen_addr` | –    | ✓     |
-/// | `listen_port` | –    | ✓     |
-/// | `pool_count`  | –    | ✓     |
-/// | `buf_size`    | –    | ✓     |
+/// | Field           | mock | cuobj |
+/// |-----------------|------|-------|
+/// | `shm_path`      | ✓    | –     |
+/// | `listen_addr`   | –    | ✓     |
+/// | `listen_port`   | –    | ✓     |
+/// | `pool_count`    | –    | ✓     |
+/// | `buf_pool_count`| –    | ✓     |
+/// | `buf_size`      | –    | ✓     |
 #[derive(Debug, Clone)]
 pub struct RdmaServerConfig {
     /// Directory used for POSIX shared-memory files (mock provider).
-    /// Defaults to `"/dev/shm"`.
     pub shm_path: String,
     /// RDMA listen address for the cuObj provider (e.g. `"192.168.1.1"`).
     pub listen_addr: String,
     /// RDMA listen port for the cuObj provider.
     pub listen_port: u16,
-    /// Number of pre-allocated buffer slots (cuObj provider).
+    /// Number of RDMA worker threads / pre-allocated cuObj channels.
     pub pool_count: usize,
+    /// Number of pre-allocated RDMA buffer slots (`0` means use `pool_count`).
+    pub buf_pool_count: usize,
     /// Size in bytes of each buffer slot (cuObj provider).
     pub buf_size: usize,
 }
@@ -102,72 +106,41 @@ pub struct RdmaServerConfig {
 impl Default for RdmaServerConfig {
     fn default() -> Self {
         Self {
-            shm_path:    "/dev/shm".to_owned(),
-            listen_addr: String::new(),
-            listen_port: 0,
-            pool_count:  4,
-            buf_size:    128 * 1024 * 1024,
+            shm_path:       "/dev/shm".to_owned(),
+            listen_addr:    String::new(),
+            listen_port:    0,
+            pool_count:     4,
+            buf_pool_count: 0,
+            buf_size:       128 * 1024 * 1024,
         }
     }
 }
-
 
 // ── RdmaRole ─────────────────────────────────────────────────────────────────
 
 /// Requested role(s) for a new RDMA provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RdmaRole {
-    /// Client only — can initiate RDMA transfers (register memory, generate tokens).
+    /// Client only — register memory, generate tokens.
     Client,
-    /// Server only — can accept RDMA transfers (handle_put / handle_get).
+    /// Server only — handle_put / handle_get.
     Server,
     /// Both client and server roles — typical for a gateway node.
     Both,
 }
 
-// ── RdmaProvider trait ────────────────────────────────────────────────────────
+// ── RdmaClientProvider trait ──────────────────────────────────────────────────
 
-/// Unified RDMA abstraction covering both client-side token generation and
-/// server-side data movement.
+/// Client-side RDMA operations: memory registration and token generation.
 ///
-/// ## Role model
+/// Implemented by any provider that acts as an S3 client — the node that
+/// initiates transfers by registering buffers and attaching tokens to HTTP
+/// requests.
 ///
-/// | Role   | Methods used                                                 |
-/// |--------|--------------------------------------------------------------|
-/// | Client | `register_memory`, `prepare_{put,get}_token`, `process_rdma_reply`, `deregister_memory` |
-/// | Server | `handle_put`, `handle_get`, `buf_size`                       |
-/// | Both   | All of the above (typical for a gateway node)                |
-///
-/// A provider reports which roles it supports via [`supports_client`] and
-/// [`supports_server`].  Calling a server method on a client-only provider
-/// (or vice-versa) returns `Err(RdmaError::OperationNotSupported)`.
-///
-/// ## Implementations
-///
-/// - [`MockRdmaProvider`](crate::mock::MockRdmaProvider) – `/dev/shm`-backed,
-///   same-host only; supports both client and server roles.
-/// - [`CuObjProvider`](crate::cuobj_client::CuObjProvider) – real NVIDIA cuObject;
-///   each role requires the corresponding plugin to be loadable at runtime.
-///
-/// [`supports_client`]: RdmaProvider::supports_client
-/// [`supports_server`]: RdmaProvider::supports_server
-pub trait RdmaProvider: Send + Sync {
-    /// Human-readable provider name (e.g. `"MockRdmaProvider"`).
-    fn name(&self) -> &str;
-
-    /// Transport protocol string: `"mock"` or `"cuobj"`.
-    fn protocol(&self) -> &str;
-
-    /// Returns `true` if this provider supports client-side operations
-    /// (`register_memory`, `prepare_*_token`, `process_rdma_reply`).
-    fn supports_client(&self) -> bool;
-
-    /// Returns `true` if this provider supports server-side operations
-    /// (`handle_put`, `handle_get`).
-    fn supports_server(&self) -> bool;
-
-    // ── Client-side methods ───────────────────────────────────────────────────
-
+/// All methods have default implementations that return
+/// [`RdmaError::OperationNotSupported`](crate::error::RdmaError::OperationNotSupported)
+/// so implementors only override what they actually support.
+pub trait RdmaClientProvider: Send + Sync {
     /// Returns `true` if the memory at `ptr..ptr+size` is eligible for RDMA.
     fn is_memory_suitable(&self, _ptr: *const u8, _size: usize) -> bool {
         false
@@ -179,14 +152,14 @@ pub trait RdmaProvider: Send + Sync {
     /// `ptr` must remain valid until [`deregister_memory`](Self::deregister_memory).
     fn register_memory(&self, _ptr: *mut u8, _size: usize) -> Result<(), crate::error::RdmaError> {
         Err(crate::error::RdmaError::OperationNotSupported(
-            "register_memory: provider is server-only".into(),
+            "register_memory: not supported by this provider".into(),
         ))
     }
 
     /// Deregister a previously registered memory region.
     fn deregister_memory(&self, _ptr: *mut u8) -> Result<(), crate::error::RdmaError> {
         Err(crate::error::RdmaError::OperationNotSupported(
-            "deregister_memory: provider is server-only".into(),
+            "deregister_memory: not supported by this provider".into(),
         ))
     }
 
@@ -198,8 +171,7 @@ pub trait RdmaProvider: Send + Sync {
 
     /// Generate an RDMA descriptor token for a PUT (upload) sub-request.
     ///
-    /// The returned bytes are used as the value of the `x-amz-rdma-token`
-    /// request header.
+    /// Returns bytes used as the value of the `x-amz-rdma-token` request header.
     fn prepare_put_token(
         &self,
         _s3_key: &[u8],
@@ -208,7 +180,7 @@ pub trait RdmaProvider: Send + Sync {
         _offset: usize,
     ) -> Result<Vec<u8>, crate::error::RdmaError> {
         Err(crate::error::RdmaError::OperationNotSupported(
-            "prepare_put_token: provider is server-only".into(),
+            "prepare_put_token: not supported by this provider".into(),
         ))
     }
 
@@ -221,7 +193,7 @@ pub trait RdmaProvider: Send + Sync {
         _offset: usize,
     ) -> Result<Vec<u8>, crate::error::RdmaError> {
         Err(crate::error::RdmaError::OperationNotSupported(
-            "prepare_get_token: provider is server-only".into(),
+            "prepare_get_token: not supported by this provider".into(),
         ))
     }
 
@@ -258,16 +230,26 @@ pub trait RdmaProvider: Send + Sync {
     fn rdma_bytes_header_name(&self) -> &[u8] {
         RDMA_BYTES_HEADER.as_bytes()
     }
+}
 
-    // ── Server-side methods ───────────────────────────────────────────────────
+// ── RdmaServerProvider trait ──────────────────────────────────────────────────
 
+/// Server-side RDMA operations: handling PUT/GET transfers from clients.
+///
+/// Implemented by any provider that acts as an S3 server or gateway — the node
+/// that accepts RDMA transfers by reading from or writing to client-registered
+/// memory via RDMA_READ / RDMA_WRITE.
+///
+/// All methods have default implementations that return
+/// [`RdmaError::OperationNotSupported`](crate::error::RdmaError::OperationNotSupported).
+pub trait RdmaServerProvider: Send + Sync {
     /// Size in bytes of the server's per-slot transfer buffer.
     fn buf_size(&self) -> usize {
         0
     }
 
     /// Handle an RDMA PUT from a client: read `size` bytes from the client's
-    /// registered buffer identified by `token` (semantics: RDMA_READ).
+    /// registered buffer identified by `token` (RDMA_READ semantics).
     ///
     /// Returns the number of bytes written into `buf`.
     fn handle_put(
@@ -284,7 +266,7 @@ pub trait RdmaProvider: Send + Sync {
     }
 
     /// Handle an RDMA GET from a client: write `data` into the client's
-    /// registered buffer identified by `token` (semantics: RDMA_WRITE).
+    /// registered buffer identified by `token` (RDMA_WRITE semantics).
     ///
     /// Returns the number of bytes actually written.
     fn handle_get(
@@ -298,13 +280,95 @@ pub trait RdmaProvider: Send + Sync {
             "handle_get: provider is client-only".into(),
         ))
     }
+
+    /// Zero-copy RDMA PUT: perform RDMA_READ into an internal slot and call
+    /// `write_fn(write_fn_data, ptr, n)` with the data — no intermediate copy.
+    ///
+    /// Returns the number of bytes transferred.
+    ///
+    /// # Safety
+    /// `write_fn_data` must remain valid for the duration of the call.
+    /// `write_fn` must be thread-safe (it may be called from a worker thread).
+    unsafe fn handle_put_zc(
+        &self,
+        _s3_key: &[u8],
+        _token: &[u8],
+        _offset: usize,
+        _size: usize,
+        _write_fn: crate::ffi::RdmaIoWriteFn,
+        _write_fn_data: *mut std::ffi::c_void,
+    ) -> Result<usize, crate::error::RdmaError> {
+        Err(crate::error::RdmaError::OperationNotSupported(
+            "handle_put_zc: not supported by this provider".into(),
+        ))
+    }
+
+    /// Zero-copy RDMA GET: call `read_fn(read_fn_data, ptr, cap)` to fill an
+    /// internal slot from storage, then RDMA_WRITE that slot to the client —
+    /// no intermediate copy.
+    ///
+    /// Returns the number of bytes written to the client.
+    ///
+    /// # Safety
+    /// `read_fn_data` must remain valid for the duration of the call.
+    /// `read_fn` must be thread-safe (it may be called from a worker thread).
+    unsafe fn handle_get_zc(
+        &self,
+        _s3_key: &[u8],
+        _token: &[u8],
+        _offset: usize,
+        _read_fn: crate::ffi::RdmaIoReadFn,
+        _read_fn_data: *mut std::ffi::c_void,
+    ) -> Result<usize, crate::error::RdmaError> {
+        Err(crate::error::RdmaError::OperationNotSupported(
+            "handle_get_zc: not supported by this provider".into(),
+        ))
+    }
+}
+
+// ── RdmaProvider trait ────────────────────────────────────────────────────────
+
+/// Combined RDMA provider: supports both client and server roles.
+///
+/// This is the trait implemented by concrete providers such as
+/// [`MockRdmaProvider`](crate::mock::MockRdmaProvider) and
+/// [`CuObjProvider`](crate::cuobj_client::CuObjProvider).  It extends both
+/// [`RdmaClientProvider`] and [`RdmaServerProvider`] and adds identity/role
+/// query methods.
+///
+/// ## Choosing the right trait
+///
+/// | Scenario | Trait to use |
+/// |---|---|
+/// | S3 client node (register memory, generate tokens) | `Arc<dyn RdmaClientProvider>` |
+/// | S3 server/gateway node (handle PUT/GET) | `Arc<dyn RdmaServerProvider>` |
+/// | Both roles in the same node / testing | `Arc<dyn RdmaProvider>` |
+///
+/// ## Implementations
+///
+/// - [`MockRdmaProvider`](crate::mock::MockRdmaProvider) – `/dev/shm`-backed,
+///   same-host only; supports both roles.
+/// - [`CuObjProvider`](crate::cuobj_client::CuObjProvider) – real NVIDIA cuObject;
+///   each role requires the corresponding plugin at runtime.
+pub trait RdmaProvider: RdmaClientProvider + RdmaServerProvider {
+    /// Human-readable provider name (e.g. `"MockRdmaProvider"`).
+    fn name(&self) -> &str;
+
+    /// Transport protocol string: `"mock"` or `"cuobj"`.
+    fn protocol(&self) -> &str;
+
+    /// Returns `true` if this provider supports client-side operations.
+    fn supports_client(&self) -> bool;
+
+    /// Returns `true` if this provider supports server-side operations.
+    fn supports_server(&self) -> bool;
 }
 
 // ── RdmaProviderConfig ────────────────────────────────────────────────────────
 
 /// Unified configuration for constructing an [`RdmaProvider`].
 ///
-/// The `server_cfg` fields are only used when `role` includes the server role.
+/// The `server` fields are only used when `role` includes the server role.
 #[derive(Debug, Clone)]
 pub struct RdmaProviderConfig {
     /// Transport protocol: `"mock"`, `"cuobj"`, or `"auto"`.

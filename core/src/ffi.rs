@@ -1,8 +1,8 @@
-//! C-ABI types for the hsc RDMA provider vtable.
+//! C-ABI types for the s3-rdma RDMA provider vtable.
 //!
-//! These types define the wire format shared between `hsc-rdma` (the loader)
+//! These types define the wire format shared between `s3-rdma` (the loader)
 //! and any RDMA provider plugin compiled as a `cdylib`.  The layout must
-//! match exactly – types cross a `dlopen`/`dlsym` boundary.
+//! match exactly — types cross a `dlopen`/`dlsym` boundary.
 
 use std::ffi::c_void;
 use std::os::raw::c_char;
@@ -20,6 +20,10 @@ pub struct ByteCursor {
 }
 
 impl ByteCursor {
+    /// Returns a zero-length cursor with a null pointer.
+    ///
+    /// Used as a sentinel value where a `ByteCursor` is required but no data
+    /// is available (e.g. absent optional fields in C structs).
     pub const fn null() -> Self {
         Self { ptr: std::ptr::null(), len: 0 }
     }
@@ -136,6 +140,26 @@ pub type GetVtableFn = unsafe extern "C" fn() -> *const RdmaProviderVtable;
 // RdmaServerVtable
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Synchronous I/O read callback for zero-copy RDMA GET.
+///
+/// Called by the plugin's I/O worker to fill `buf[0..capacity]` directly from
+/// the caller's data source (e.g., `pread(fd, buf, capacity, offset)`).
+/// Returns the number of bytes read (≥ 0) or a negative error code.
+///
+/// Must be thread-safe: the plugin may invoke it from any worker thread.
+pub type RdmaIoReadFn =
+    unsafe extern "C" fn(user_data: *mut c_void, buf: *mut c_void, capacity: usize) -> isize;
+
+/// Synchronous I/O write callback for zero-copy RDMA PUT.
+///
+/// Called by the plugin's I/O worker to flush `buf[0..size]` directly to the
+/// caller's data sink (e.g., `pwrite(fd, buf, size, offset)`).
+/// Returns the number of bytes written (≥ 0) or a negative error code.
+///
+/// Must be thread-safe: the plugin may invoke it from any worker thread.
+pub type RdmaIoWriteFn =
+    unsafe extern "C" fn(user_data: *mut c_void, buf: *const c_void, size: usize) -> isize;
+
 /// Configuration passed to `RdmaServerVtable::init`.
 ///
 /// All fields must be valid for the duration of the `init` call; the plugin
@@ -146,15 +170,17 @@ pub struct RdmaServerInitParams {
     pub listen_addr: *const c_char,
     /// Listen port for the RDMA server.
     pub listen_port: u16,
-    /// Number of pre-allocated buffer slots in the pool.
+    /// Number of worker threads (one pre-allocated channel per thread).
     pub pool_count:  usize,
+    /// Number of pre-allocated RDMA buffer slots in the buffer pool.
+    /// `0` means "use `pool_count`".
+    pub buf_pool_count: usize,
     /// Size in bytes of each buffer slot.
     pub buf_size:    usize,
 }
 
-// SAFETY: only used during init() on the calling thread.
+// SAFETY: only used during init() on the calling thread; `Sync` is not needed.
 unsafe impl Send for RdmaServerInitParams {}
-unsafe impl Sync for RdmaServerInitParams {}
 
 /// C vtable exported by every RDMA **server** provider plugin.
 ///
@@ -217,6 +243,48 @@ pub struct RdmaServerVtable {
         token:       *const ByteCursor,
         offset:      usize,
         out_written: *mut usize,
+    ) -> i32>,
+
+    // ── Zero-copy variants ────────────────────────────────────────────────────
+
+    /// Handle a zero-copy RDMA PUT.
+    ///
+    /// Same RDMA semantics as `handle_put`, but instead of copying the received
+    /// bytes into a caller-provided buffer, the plugin calls
+    /// `write_fn(write_fn_data, rdma_buf_ptr, transferred)` directly from its
+    /// internal RDMA-registered buffer.  The callback performs the I/O (e.g.,
+    /// `pwrite(fd, ...)`) without an intermediate copy.
+    ///
+    /// `write_fn` must be thread-safe.  The plugin may call it from a worker
+    /// thread other than the one that invoked `handle_put_zc`.  Returns 0 on
+    /// success, non-zero on failure.
+    pub handle_put_zc: Option<unsafe extern "C" fn(
+        ctx:             *mut c_void,
+        s3_key:          *const ByteCursor,
+        token:           *const ByteCursor,
+        offset:          usize,
+        size:            usize,
+        write_fn:        RdmaIoWriteFn,
+        write_fn_data:   *mut c_void,
+        out_transferred: *mut usize,
+    ) -> i32>,
+
+    /// Handle a zero-copy RDMA GET.
+    ///
+    /// Instead of the caller copying data into the plugin's pool slot, the plugin
+    /// calls `read_fn(read_fn_data, rdma_buf_ptr, capacity)` to fill its
+    /// RDMA-registered buffer directly (e.g., `pread(fd, ...)`), then
+    /// RDMA_WRITEs that buffer to the client.
+    ///
+    /// `read_fn` must be thread-safe.  Returns 0 on success, non-zero on failure.
+    pub handle_get_zc: Option<unsafe extern "C" fn(
+        ctx:          *mut c_void,
+        s3_key:       *const ByteCursor,
+        token:        *const ByteCursor,
+        offset:       usize,
+        read_fn:      RdmaIoReadFn,
+        read_fn_data: *mut c_void,
+        out_written:  *mut usize,
     ) -> i32>,
 }
 
