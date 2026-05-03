@@ -376,7 +376,7 @@ impl CuObjEndpoint {
     pub fn new_server(cfg: &crate::provider::RdmaServerConfig) -> Result<Self, crate::RdmaError> {
         #[cfg(feature = "cuobj-server")]
         {
-            let server = crate::cuobj_server::real::CuObjServerProvider::new(cfg)?;
+            let server = crate::cuobj_server::CuObjServerProvider::new(cfg)?;
             Ok(Self {
                 #[cfg(feature = "cuobj-client")]
                 client: None,

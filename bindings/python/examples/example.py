@@ -1,53 +1,130 @@
 """
 s3-rdma Python binding example.
 
-Demonstrates MockRdmaProvider: register memory, generate PUT/GET tokens,
-and process a server reply token — all without NVIDIA hardware.
+Demonstrates the unified ``RdmaEndpoint`` API with both mock and cuObj
+providers for client and server roles — no NVIDIA hardware required for
+the mock provider.
 
 Run after building the extension with:
-    cd python && python3 -m maturin develop
-    python3 python/examples/example.py
+    cd bindings/python && maturin develop
+    python3 bindings/python/examples/example.py
 """
 
 import s3_rdma
 
 
-def main() -> None:
-    print("=== s3-rdma Python example ===\n")
+def demo_mock_both_roles() -> None:
+    """Mock provider, both roles in the same process (typical for testing)."""
+    print("=== Mock endpoint — both roles ===\n")
 
-    provider = s3_rdma.MockRdmaProvider(debug=True)
-    print(f"Provider : {provider.name()}")
-    print(f"Version  : {provider.version()}")
+    ep = s3_rdma.MockRdmaEndpoint(debug=True)
+    print(f"  endpoint : {ep!r}")
+    print(f"  client?  : {ep.supports_client()}")
+    print(f"  server?  : {ep.supports_server()}")
 
-    data  = bytes(b"\x42" * 1024 * 1024)  # 1 MiB of data
+    data  = bytearray(b"\x42" * 64 * 1024)  # 64 KiB
     s3key = b"my-bucket/my-object.bin"
 
-    print("\n[is_memory_suitable]")
-    import ctypes
-    ptr = ctypes.addressof((ctypes.c_char * len(data)).from_buffer_copy(data))
-    print(f"  suitable (ptr): {provider.is_memory_suitable(ptr, len(data))}")
+    ep.register_memory(bytes(data))
 
-    print("\n[register_memory]")
-    provider.register_memory(data, )
+    # Client: generate a PUT token (data is copied to SHM)
+    put_token = ep.prepare_put_token(bytes(data), 0, len(data), s3key)
+    print(f"\n  put_token : {put_token.decode()[:60]}…")
 
-    print("\n[prepare_put_token]  (S3 PUT / upload)")
-    put_token = provider.prepare_put_token(data, 0, len(data), s3key)
-    print(f"  token: {put_token.decode()}")
+    # Server: read the data back via the token
+    received = ep.handle_put(s3key, put_token, size=len(data))
+    assert received == bytes(data), "PUT round-trip mismatch"
+    print(f"  handle_put: got {len(received)} bytes ✓")
 
-    print("\n[prepare_get_token]  (S3 GET / download)")
-    get_token = provider.prepare_get_token(data, 0, len(data), s3key)
-    print(f"  token: {get_token.decode()}")
+    # Client: generate a GET token (server will fill SHM)
+    get_token = ep.prepare_get_token(bytes(data), 0, len(data), s3key)
+    print(f"\n  get_token : {get_token.decode()[:60]}…")
 
-    print("\n[process_reply_token]")
+    # Server: write data back via the token
+    payload = b"\xde\xad\xbe\xef" * (len(data) // 4)
+    written = ep.handle_get(s3key, payload, get_token)
+    print(f"  handle_get: wrote {written} bytes ✓")
+
+    # Client: process the server's reply (copies SHM back into buffer)
     def on_complete(error_code: int, reply: bytes) -> None:
-        print(f"  callback: error_code={error_code}, reply={reply.decode()}")
+        print(f"  callback  : error_code={error_code}")
 
-    provider.process_reply_token(b"mock-server-reply-ok", on_complete)
+    ep.process_rdma_reply(200, get_token, written, on_complete)
+    ep.deregister_memory(bytes(data))
+    print()
 
-    print("\n[deregister_memory]")
-    provider.deregister_memory(data)
 
-    print(f"\nProvider info: {s3_rdma.rdma_provider_info()}")
+def demo_mock_client_role() -> None:
+    """Mock provider, client role only."""
+    print("=== Mock endpoint — client role only ===\n")
+
+    ep = s3_rdma.RdmaEndpoint(provider="mock", role="client", debug=True)
+    print(f"  endpoint : {ep!r}")
+
+    data  = bytes(b"\x11" * 1024)
+    s3key = b"bucket/upload.bin"
+
+    ep.register_memory(data)
+    token = ep.prepare_put_token(data, 0, len(data), s3key)
+    print(f"  token    : {token.decode()[:60]}…")
+
+    ep.process_rdma_reply(200, token, len(data), lambda c, r: None)
+    ep.deregister_memory(data)
+    print()
+
+
+def demo_mock_server_role() -> None:
+    """Mock provider, server role only — token produced by a separate client ep."""
+    print("=== Mock endpoint — server role only ===\n")
+
+    client = s3_rdma.RdmaEndpoint(provider="mock", role="client")
+    server = s3_rdma.RdmaEndpoint(provider="mock", role="server")
+    print(f"  server endpoint : {server!r}")
+
+    data  = bytes(b"\x22" * 1024)
+    s3key = b"bucket/download.bin"
+
+    client.register_memory(data)
+    put_token = client.prepare_put_token(data, 0, len(data), s3key)
+
+    received = server.handle_put(s3key, put_token, size=len(data))
+    assert received == data, "Server PUT data mismatch"
+    print(f"  handle_put: received {len(received)} bytes ✓")
+
+    get_token = client.prepare_get_token(data, 0, len(data), s3key)
+    written = server.handle_get(s3key, b"\xff" * len(data), get_token)
+    print(f"  handle_get: wrote {written} bytes ✓")
+    client.deregister_memory(data)
+    print()
+
+
+def demo_cuobj_auto() -> None:
+    """Auto-selection: tries cuObj first, falls back to mock gracefully."""
+    print("=== Auto endpoint (cuobj → mock fallback) ===\n")
+
+    ep = s3_rdma.RdmaEndpoint(provider="auto", role="both", debug=True)
+    print(f"  endpoint : {ep!r}")
+    print(f"  protocol : {ep.protocol()}")
+    print()
+
+
+def main() -> None:
+    print("=== s3-rdma Python example ===\n")
+    print(f"Provider info: {s3_rdma.rdma_provider_info()}\n")
+
+    demo_mock_both_roles()
+    demo_mock_client_role()
+    demo_mock_server_role()
+    demo_cuobj_auto()
+
+    # CuObjEndpoint convenience class: raises RuntimeError when the plugin is absent.
+    print("=== CuObjEndpoint (client) — expecting RuntimeError without plugin ===")
+    try:
+        ep = s3_rdma.CuObjEndpoint(role="client")
+        print(f"  cuobj available: {ep!r}")
+    except RuntimeError as exc:
+        print(f"  cuObj unavailable (expected): {exc}")
+
     print("\nDone.")
 
 

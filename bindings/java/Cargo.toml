@@ -9,6 +9,12 @@ license     = "MIT"
 name       = "s3_rdma_jni"
 crate-type = ["cdylib"]
 
+[features]
+# Forward cuobj features to the core crate so the JNI library can load
+# the real cuObject RDMA plugins at runtime.
+cuobj-client = ["s3-rdma/cuobj-client"]
+cuobj-server = ["s3-rdma/cuobj-server"]
+
 [dependencies]
 s3-rdma = { path = "../../core" }
 jni     = { version = "0.21" }
