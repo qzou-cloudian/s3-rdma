@@ -11,7 +11,13 @@ documents the public Python API surface.
 """
 
 from __future__ import annotations
-from typing import Callable
+from typing import Callable, Union
+
+# Buffer-protocol types accepted by register_memory, prepare_*_token, etc.
+# Any object implementing the Python buffer protocol is accepted at runtime.
+# Common examples: bytes, bytearray, memoryview, numpy.ndarray.
+ReadableBuffer = Union[bytes, bytearray, memoryview]
+WritableBuffer = Union[bytearray, memoryview]
 
 
 class RdmaProvider:
@@ -99,27 +105,34 @@ class RdmaProvider:
         """
         ...
 
-    def register_memory(self, data: bytes) -> None:
+    def register_memory(self, data: ReadableBuffer) -> None:
         """
         Register a memory region for RDMA.
 
-        :param data: the buffer to register (``bytes`` or ``bytearray``).
+        Accepts any buffer-protocol object: ``bytes``, ``bytearray``,
+        ``memoryview``, NumPy arrays, etc.
+
+        The buffer's underlying memory pointer is recorded by the provider.
+        Keep the Python object alive until :meth:`deregister_memory` is called.
+
+        :param data: the buffer to register.
         :raises RuntimeError: if registration fails.
+        :raises BufferError: if ``data`` does not support the buffer protocol.
         """
         ...
 
-    def deregister_memory(self, data: bytes) -> None:
+    def deregister_memory(self, data: ReadableBuffer) -> None:
         """
         Deregister a previously registered memory region.
 
-        :param data: the same buffer passed to :meth:`register_memory`.
+        :param data: the same buffer object passed to :meth:`register_memory`.
         :raises RuntimeError: if deregistration fails.
         """
         ...
 
     def prepare_put_token(
         self,
-        data: bytes,
+        data: ReadableBuffer,
         offset: int,
         size: int,
         s3_key: bytes,
@@ -138,13 +151,16 @@ class RdmaProvider:
 
     def prepare_get_token(
         self,
-        data: bytes,
+        data: WritableBuffer,
         offset: int,
         size: int,
         s3_key: bytes,
     ) -> bytes:
         """
         Generate an RDMA token for an S3 GET (download).
+
+        Pass a writable buffer (``bytearray`` or similar) so that
+        :meth:`process_rdma_reply` can write the received data back into it.
 
         :param data:   buffer that will receive the downloaded data.
         :param offset: byte offset within the buffer for this sub-request.

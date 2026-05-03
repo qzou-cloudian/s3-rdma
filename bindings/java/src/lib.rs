@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
+use jni::objects::{JByteArray, JByteBuffer, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyteArray, jlong, JNI_TRUE};
 use jni::JNIEnv;
 
@@ -154,10 +154,16 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeIsMemorySuitable(
 #[no_mangle]
 pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeRegisterMemory(
     mut env: JNIEnv<'_>, _obj: JObject<'_>,
-    handle: jlong, buf: JByteArray<'_>,
+    handle: jlong, buf: JByteBuffer<'_>,
 ) {
-    let len = env.get_array_length(&buf).unwrap_or(0) as usize;
-    let ptr = buf.as_raw() as *mut u8;
+    let ptr = match env.get_direct_buffer_address(&buf) {
+        Ok(p) => p,
+        Err(e) => { throw(&mut env, &format!("buf must be a direct ByteBuffer: {e}")); return; }
+    };
+    let len = match env.get_direct_buffer_capacity(&buf) {
+        Ok(c) => c,
+        Err(e) => { throw(&mut env, &e.to_string()); return; }
+    };
     if let Err(e) = unsafe { arc_provider_ref(handle) }.register_memory(ptr, len) {
         throw(&mut env, &e.to_string());
     }
@@ -166,9 +172,12 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeRegisterMemory(
 #[no_mangle]
 pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeDeregisterMemory(
     mut env: JNIEnv<'_>, _obj: JObject<'_>,
-    handle: jlong, buf: JByteArray<'_>,
+    handle: jlong, buf: JByteBuffer<'_>,
 ) {
-    let ptr = buf.as_raw() as *mut u8;
+    let ptr = match env.get_direct_buffer_address(&buf) {
+        Ok(p) => p,
+        Err(e) => { throw(&mut env, &format!("buf must be a direct ByteBuffer: {e}")); return; }
+    };
     if let Err(e) = unsafe { arc_provider_ref(handle) }.deregister_memory(ptr) {
         throw(&mut env, &e.to_string());
     }
@@ -177,14 +186,17 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeDeregisterMemory(
 #[no_mangle]
 pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativePreparePutToken(
     mut env: JNIEnv<'_>, _obj: JObject<'_>,
-    handle: jlong, s3_key: JByteArray<'_>, buf: JByteArray<'_>,
+    handle: jlong, s3_key: JByteArray<'_>, buf: JByteBuffer<'_>,
     offset: jlong, size: jlong,
 ) -> jbyteArray {
     let key_bytes = match env.convert_byte_array(&s3_key) {
         Ok(b) => b,
         Err(e) => { throw(&mut env, &e.to_string()); return std::ptr::null_mut(); }
     };
-    let buf_ptr = buf.as_raw() as *const u8;
+    let buf_ptr = match env.get_direct_buffer_address(&buf) {
+        Ok(p) => p as *const u8,
+        Err(e) => { throw(&mut env, &format!("buf must be a direct ByteBuffer: {e}")); return std::ptr::null_mut(); }
+    };
     match unsafe { arc_provider_ref(handle) }
         .prepare_put_token(&key_bytes, buf_ptr, size as usize, offset as usize)
     {
@@ -197,14 +209,17 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativePreparePutToken(
 #[no_mangle]
 pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativePrepareGetToken(
     mut env: JNIEnv<'_>, _obj: JObject<'_>,
-    handle: jlong, s3_key: JByteArray<'_>, buf: JByteArray<'_>,
+    handle: jlong, s3_key: JByteArray<'_>, buf: JByteBuffer<'_>,
     offset: jlong, size: jlong,
 ) -> jbyteArray {
     let key_bytes = match env.convert_byte_array(&s3_key) {
         Ok(b) => b,
         Err(e) => { throw(&mut env, &e.to_string()); return std::ptr::null_mut(); }
     };
-    let buf_ptr = buf.as_raw() as *mut u8;
+    let buf_ptr = match env.get_direct_buffer_address(&buf) {
+        Ok(p) => p,
+        Err(e) => { throw(&mut env, &format!("buf must be a direct ByteBuffer: {e}")); return std::ptr::null_mut(); }
+    };
     match unsafe { arc_provider_ref(handle) }
         .prepare_get_token(&key_bytes, buf_ptr, size as usize, offset as usize)
     {

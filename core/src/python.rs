@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::PyClassInitializer;
@@ -134,25 +135,34 @@ impl PyRdmaProvider {
 
     /// Register a memory region for RDMA.
     ///
-    /// :param data: the buffer to register (``bytes`` or ``bytearray``).
-    fn register_memory<'py>(&self, data: &Bound<'py, PyBytes>) -> PyResult<()> {
-        let b = data.as_bytes();
+    /// Accepts any buffer-protocol object: ``bytes``, ``bytearray``,
+    /// ``memoryview``, NumPy arrays, etc.
+    ///
+    /// The buffer's underlying memory pointer is recorded by the provider and
+    /// must remain valid (keep the Python object alive) until
+    /// :meth:`deregister_memory` is called.
+    ///
+    /// :param data: the buffer to register.
+    fn register_memory(&self, data: &Bound<'_, PyAny>) -> PyResult<()> {
+        let buf = PyBuffer::<u8>::get_bound(data)?;
         self.inner
-            .register_memory(b.as_ptr() as *mut u8, b.len())
+            .register_memory(buf.buf_ptr() as *mut u8, buf.len_bytes())
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Deregister a previously registered memory region.
     ///
-    /// :param data: the same buffer passed to :meth:`register_memory`.
-    fn deregister_memory<'py>(&self, data: &Bound<'py, PyBytes>) -> PyResult<()> {
-        let b = data.as_bytes();
+    /// :param data: the same buffer object passed to :meth:`register_memory`.
+    fn deregister_memory(&self, data: &Bound<'_, PyAny>) -> PyResult<()> {
+        let buf = PyBuffer::<u8>::get_bound(data)?;
         self.inner
-            .deregister_memory(b.as_ptr() as *mut u8)
+            .deregister_memory(buf.buf_ptr() as *mut u8)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Generate an RDMA token for an S3 PUT (upload).
+    ///
+    /// Accepts any buffer-protocol object for ``data``.
     ///
     /// :param data:   buffer containing the data to upload.
     /// :param offset: byte offset within the buffer for this sub-request.
@@ -162,19 +172,26 @@ impl PyRdmaProvider {
     fn prepare_put_token<'py>(
         &self,
         py:     Python<'py>,
-        data:   &Bound<'py, PyBytes>,
+        data:   &Bound<'_, PyAny>,
         offset: usize,
         size:   usize,
         s3_key: &[u8],
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let b = data.as_bytes();
+        let buf = PyBuffer::<u8>::get_bound(data)?;
+        let b_ptr = buf.buf_ptr() as *const u8;
+        let b_len = buf.len_bytes();
         let token = self.inner
-            .prepare_put_token(s3_key, b.as_ptr(), size.min(b.len()), offset)
+            .prepare_put_token(s3_key, b_ptr, size.min(b_len), offset)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(PyBytes::new_bound(py, &token))
     }
 
     /// Generate an RDMA token for an S3 GET (download).
+    ///
+    /// Accepts any buffer-protocol object for ``data``.  For a GET, the
+    /// server will write data back into this buffer via
+    /// :meth:`process_rdma_reply`, so pass a writable buffer (``bytearray``
+    /// or similar) rather than ``bytes``.
     ///
     /// :param data:   buffer that will receive the downloaded data.
     /// :param offset: byte offset within the buffer for this sub-request.
@@ -184,14 +201,16 @@ impl PyRdmaProvider {
     fn prepare_get_token<'py>(
         &self,
         py:     Python<'py>,
-        data:   &Bound<'py, PyBytes>,
+        data:   &Bound<'_, PyAny>,
         offset: usize,
         size:   usize,
         s3_key: &[u8],
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let b = data.as_bytes();
+        let buf = PyBuffer::<u8>::get_bound(data)?;
+        let b_ptr = buf.buf_ptr() as *mut u8;
+        let b_len = buf.len_bytes();
         let token = self.inner
-            .prepare_get_token(s3_key, b.as_ptr() as *mut u8, size.min(b.len()), offset)
+            .prepare_get_token(s3_key, b_ptr, size.min(b_len), offset)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(PyBytes::new_bound(py, &token))
     }
