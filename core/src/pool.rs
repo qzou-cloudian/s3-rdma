@@ -4,18 +4,22 @@
 //! Generic pre-registered buffer pool for RDMA transfers.
 //!
 //! Provides a fixed-size pool of 4 KiB-aligned host buffers that are
-//! optionally pre-registered with any [`RdmaProvider`] at construction time.
-//! The three usage modes are:
+//! optionally pre-registered with an [`RdmaClientProvider`] at construction
+//! time.  The three usage modes are:
 //!
-//! | Mode     | `with_rdma()`       | Behaviour                                      |
-//! |----------|---------------------|------------------------------------------------|
-//! | **bytes**| not called (None)   | Plain heap; no RDMA operations                 |
-//! | **mock** | `MockRdmaProvider`  | Each slot registered via SHM at startup        |
-//! | **cuobj**| `CuObjProvider`     | Each slot pinned with IOMMU at startup         |
+//! | Mode      | Builder method                 | Behaviour                               |
+//! |-----------|--------------------------------|-----------------------------------------|
+//! | **bytes** | neither called (default)       | Plain heap; no RDMA operations          |
+//! | **mock**  | `with_client(mock_provider)`   | Each slot registered via SHM at startup |
+//! | **cuobj** | `with_client(cuobj_provider)`  | Each slot pinned with IOMMU at startup  |
+//!
+//! Use `with_client(Arc<dyn RdmaClientProvider>)` when you already have a
+//! client provider.  Use `with_rdma(Arc<dyn RdmaProvider>)` when you only
+//! have the combined trait — it wraps the provider in a thin bridge.
 //!
 //! In all modes the per-transfer cost is `acquire → write/read → release`.
-//! Registration overhead (historically `register_memory` + `deregister_memory`
-//! per transfer) is paid once at pool construction and never again.
+//! Registration overhead (`register_memory` / `deregister_memory`) is paid
+//! once at pool construction and never again.
 //!
 //! # Quick start
 //!

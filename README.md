@@ -38,7 +38,23 @@ s3-rdma/
 
 ## Provider model
 
-### Client side (`RdmaProvider` — client role)
+The provider model is built around three focused traits:
+
+```
+RdmaProvider: RdmaClientProvider + RdmaServerProvider
+  ├── RdmaClientProvider  — register memory, generate tokens, process replies
+  └── RdmaServerProvider  — handle PUT/GET transfers from clients
+```
+
+Consumers use the narrowest trait that fits their role:
+
+| Scenario | Trait |
+|---|---|
+| S3 client node (register memory, generate tokens) | `Arc<dyn RdmaClientProvider>` |
+| S3 server / gateway node (handle PUT/GET) | `Arc<dyn RdmaServerProvider>` |
+| Both roles in the same node / mock testing | `Arc<dyn RdmaProvider>` |
+
+### Client side (`RdmaClientProvider`)
 
 The client-side abstraction used by S3 clients and relay nodes:
 
@@ -64,7 +80,7 @@ client                        S3 server
 
 Header names are provider-configurable (`x-amz-rdma-token`, `x-amz-rdma-reply`).
 
-### Server side (`RdmaProvider` — server role)
+### Server side (`RdmaServerProvider`)
 
 The server-side abstraction used by the S3 gateway:
 
@@ -210,7 +226,7 @@ s3-rdma = { path = "core" }
 ```
 
 ```rust
-use s3_rdma::{MockRdmaProvider, provider::RdmaProvider};
+use s3_rdma::{MockRdmaProvider, RdmaClientProvider};
 
 let ep = MockRdmaProvider::with_debug(false);
 let mut buf = vec![0u8; 4 * 1024 * 1024];
@@ -249,7 +265,8 @@ cd bindings/python && python3 -m maturin develop
 import s3_rdma
 
 provider = s3_rdma.MockRdmaProvider(debug=False)
-data = bytes(b"\x42" * 4 * 1024 * 1024)
+# bytearray (or bytes/memoryview/numpy) — any buffer-protocol object is accepted
+data = bytearray(b"\x42" * 4 * 1024 * 1024)
 key  = b"my-bucket/my-object.bin"
 
 provider.register_memory(data)
@@ -258,7 +275,7 @@ token = provider.prepare_put_token(data, 0, len(data), key)
 def on_complete(error_code: int, reply: bytes) -> None:
     assert error_code == 0
 
-provider.process_reply_token(b"server-reply", on_complete)
+provider.process_rdma_reply(200, token, len(data), on_complete)
 provider.deregister_memory(data)
 ```
 
@@ -280,19 +297,26 @@ mvn compile -f bindings/java/pom.xml
 
 ```java
 import io.s3rdma.MockRdmaProvider;
+import io.s3rdma.RdmaBuffer;
+import java.nio.ByteBuffer;
 
-try (MockRdmaProvider provider = new MockRdmaProvider(false)) {
-    byte[] buf  = new byte[4 * 1024 * 1024];
-    byte[] key  = "my-bucket/my-object.bin".getBytes();
+try (MockRdmaProvider provider = new MockRdmaProvider()) {
+    byte[] key = "my-bucket/my-object.bin".getBytes();
 
-    provider.registerMemory(buf);
+    // RdmaBuffer wraps ByteBuffer.allocateDirect() — required for RDMA operations
+    try (RdmaBuffer rdmaBuf = new RdmaBuffer(4 * 1024 * 1024)) {
+        byte[] content = new byte[rdmaBuf.capacity()];
+        rdmaBuf.put(content, 0, content.length);
 
-    byte[] token = provider.preparePutToken(key, buf, 0, buf.length);
+        provider.registerMemory(rdmaBuf.buffer());
 
-    provider.processReplyToken(serverReply,
-        (errorCode, reply) -> assert errorCode == 0);
+        byte[] token = provider.preparePutToken(key, rdmaBuf.buffer(), 0, rdmaBuf.capacity());
 
-    provider.deregisterMemory(buf);
+        provider.processRdmaReply(200, token, rdmaBuf.capacity(),
+            (errorCode, reply) -> System.out.println("done, code=" + errorCode));
+
+        provider.deregisterMemory(rdmaBuf.buffer());
+    }
 }
 ```
 

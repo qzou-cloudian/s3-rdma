@@ -1,21 +1,41 @@
 //! RDMA provider infrastructure for S3-compatible gateways.
 //!
 //! Provides SDK-agnostic RDMA abstractions used by both client-side S3 tools
-//! and server-side gateways.  The concrete implementations are:
+//! and server-side gateways.  The central abstraction is the [`RdmaProvider`]
+//! trait family:
 //!
-//! - [`MockRdmaProvider`] — SHM-based simulation, no hardware required
-//! - [`CuObjProvider`] — real NVIDIA cuObj RDMA (loaded from plugin `.so` at runtime)
+//! ```text
+//! RdmaProvider: RdmaClientProvider + RdmaServerProvider
+//!   ├── RdmaClientProvider  — register memory, generate tokens, process replies
+//!   └── RdmaServerProvider  — handle PUT/GET transfers from clients
+//! ```
+//!
+//! Concrete implementations:
+//!
+//! - [`MockRdmaProvider`] — SHM-based simulation, no hardware required; both roles
+//! - [`CuObjProvider`] — real NVIDIA cuObj RDMA (loads plugin `.so` at runtime);
+//!   both roles from one instance
+//! - [`CuObjClientProvider`] / [`CuObjServerProvider`] — focused single-role wrappers
+//!   (require `cuobj-client` / `cuobj-server` feature respectively)
 //! - [`RdmaEngine`] — fixed-size worker pool wrapping any provider (feature `engine`)
+//!
+//! ## Choosing the right trait
+//!
+//! | Scenario | Use |
+//! |---|---|
+//! | S3 client node (register memory, generate tokens) | `Arc<dyn RdmaClientProvider>` |
+//! | S3 server / gateway node (handle PUT/GET) | `Arc<dyn RdmaServerProvider>` |
+//! | Both roles in the same node / bindings | `Arc<dyn RdmaProvider>` |
 //!
 //! ## Flow
 //!
 //! ```text
-//!   Client
+//!   Client (RdmaClientProvider)
 //!     │  register_memory(ptr, size)
 //!     │  prepare_put_token(key, ptr, len, offset) → RdmaToken
 //!     │  PUT /bucket/key  +  x-amz-rdma-token: <token>
 //!     │                          ↓
-//!     │                   Gateway performs RDMA_READ into registered buffer
+//!     │          Server (RdmaServerProvider): RDMA_READ into registered buffer
 //!     │                          ↓
 //!     │  ← x-amz-rdma-reply: <reply>
 //!     │  process_rdma_reply(200, reply_token, ...)
@@ -26,8 +46,8 @@
 //!
 //! | Feature        | Effect                                                              |
 //! |----------------|---------------------------------------------------------------------|
-//! | `cuobj-client` | Enable [`CuObjProvider`] client role (loads plugin at runtime)      |
-//! | `cuobj-server` | Enable [`CuObjProvider`] server role (loads plugin at runtime)      |
+//! | `cuobj-client` | Enable [`CuObjClientProvider`] / [`CuObjProvider`] client role     |
+//! | `cuobj-server` | Enable [`CuObjServerProvider`] / [`CuObjProvider`] server role     |
 //! | `buffer-pool`  | Enable [`BufferPool`] for pre-registered RDMA buffers               |
 //! | `engine`       | Enable [`RdmaEngine`] fixed-size worker pool                        |
 //! | (none)         | Only [`MockRdmaProvider`] available                                 |
