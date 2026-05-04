@@ -16,8 +16,11 @@ use pyo3::PyClassInitializer;
 use pyo3::types::PyBytes;
 
 use crate::provider::RdmaProvider;
+use crate::provider::RdmaClientProvider;
 use crate::provider::RdmaRole;
-use crate::provider::{RdmaServerConfig, RdmaCompletionCallback};
+use crate::provider::{RdmaServerConfig, RdmaCompletionCallback, DEFAULT_RDMA_BUF_SIZE};
+use crate::provider::TelemetryConfig;
+use crate::TelemLevel;
 
 fn parse_role(role: &str) -> PyResult<RdmaRole> {
     match role {
@@ -80,7 +83,7 @@ impl PyRdmaProvider {
         listen_addr = "",
         listen_port = 0u16,
         pool_count = 4usize,
-        buf_size = 134217728usize,
+        buf_size = 134217728usize,  // matches DEFAULT_RDMA_BUF_SIZE
     ))]
     pub fn new(
         provider:    &str,
@@ -264,8 +267,8 @@ impl PyRdmaProvider {
             size
         } else {
             // buf_size() returns usize::MAX for the mock when unconfigured;
-            // cap at 128 MiB to avoid allocating a giant buffer by default.
-            raw_cap.min(128 * 1024 * 1024).max(4096)
+            // cap to avoid allocating a giant buffer by default.
+            raw_cap.min(DEFAULT_RDMA_BUF_SIZE).max(4096)
         };
         let mut buf = vec![0u8; buf_cap];
         let n = self.inner
@@ -304,6 +307,60 @@ impl PyRdmaProvider {
             self.inner.supports_client(),
             self.inner.supports_server(),
         )
+    }
+
+    // ── Telemetry ────────────────────────────────────────────────────────────
+
+    /// ``True`` if this provider supports telemetry.
+    fn supports_telemetry(&self) -> bool {
+        RdmaClientProvider::supports_telemetry(self.inner.as_ref())
+    }
+
+    /// (Re-)configure the telemetry output.
+    ///
+    /// :param use_otel: ``True`` for OpenTelemetry backend, ``False`` for plain stream.
+    /// :param log_file: optional path to a log file (plain stream mode; ``None`` = stdout).
+    /// :param level: verbosity level (0=Off, 1=Error, 2=Info, 3=Debug; default 1).
+    #[pyo3(signature = (use_otel = false, log_file = None, level = 1u32))]
+    fn setup_telemetry(
+        &self,
+        use_otel: bool,
+        log_file: Option<&str>,
+        level: u32,
+    ) -> PyResult<()> {
+        let lvl = match level {
+            0 => TelemLevel::Off,
+            1 => TelemLevel::Error,
+            2 => TelemLevel::Info,
+            _ => TelemLevel::Debug,
+        };
+        let cfg = TelemetryConfig {
+            use_otel,
+            log_file: log_file.map(|s| s.to_owned()),
+            level: lvl,
+        };
+        RdmaClientProvider::setup_telemetry(self.inner.as_ref(), &cfg)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Shut down telemetry for this provider.
+    fn shutdown_telemetry(&self) -> PyResult<()> {
+        RdmaClientProvider::shutdown_telemetry(self.inner.as_ref())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Set telemetry verbosity level.
+    ///
+    /// :param level: verbosity level (0=Off, 1=Error, 2=Info, 3=Debug).
+    fn set_telem_level(&self, level: u32) -> PyResult<()> {
+        let lvl = match level {
+            0 => TelemLevel::Off,
+            1 => TelemLevel::Error,
+            2 => TelemLevel::Info,
+            _ => TelemLevel::Debug,
+        };
+        RdmaClientProvider::set_telem_level(self.inner.as_ref(), lvl)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 }
 
@@ -382,7 +439,7 @@ impl PyCuObjProvider {
         listen_addr = "",
         listen_port = 0u16,
         pool_count = 4usize,
-        buf_size = 134217728usize,
+        buf_size = 134217728usize,  // matches DEFAULT_RDMA_BUF_SIZE
     ))]
     fn new(
         role:        &str,

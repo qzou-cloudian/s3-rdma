@@ -6,14 +6,14 @@ description = "JNI bindings for the s3-rdma RDMA provider (Java)"
 license     = "MIT"
 
 [lib]
-name       = "s3_rdma_jni"
+name       = "s3rdmajni"
 crate-type = ["cdylib"]
 
 [features]
 # Forward plugin features to the core crate so the JNI library can load
 # the RDMA plugins at runtime.
-plugin-client = ["s3-rdma/plugin-client"]
-plugin-server = ["s3-rdma/plugin-server"]
+rdma-client = ["s3-rdma/rdma-client"]
+rdma-server = ["s3-rdma/rdma-server"]
 
 [dependencies]
 s3-rdma = { path = "../../core" }

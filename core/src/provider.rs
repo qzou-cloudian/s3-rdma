@@ -52,6 +52,12 @@ pub const RDMA_TOKEN_HEADER: &str = "x-amz-rdma-token";
 pub const RDMA_REPLY_HEADER: &str = "x-amz-rdma-reply";
 pub const RDMA_BYTES_HEADER: &str = "x-amz-rdma-bytes";
 
+/// Default RDMA buffer slot size: 128 MiB.
+///
+/// Used as the `buf_size` default in [`RdmaServerConfig`] and as the
+/// allocation cap in binding-layer `handle_put` helpers.
+pub const DEFAULT_RDMA_BUF_SIZE: usize = 128 * 1024 * 1024;
+
 /// Header that signals HTTP/2 streaming token mode.
 ///
 /// When present with value `"true"`, the PUT request body contains
@@ -72,6 +78,52 @@ pub const RDMA_STREAM_HEADER: &str = "x-amz-rdma-stream";
 /// **GET** — the client pre-allocates N receive buffers and sends their tokens
 /// the same way.
 pub const RDMA_TOKEN_SEPARATOR: char = '|';
+
+// ── TelemLevel ─────────────────────────────────────────────────────────────────
+
+/// Telemetry verbosity level.
+///
+/// Levels are ordered: `Off` < `Error` < `Info` < `Debug`.  Setting a level
+/// enables that level and all less-verbose levels (e.g. `Info` includes
+/// `Error`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum TelemLevel {
+    /// No telemetry output.
+    Off = 0,
+    /// Error messages only.
+    Error = 1,
+    /// Error + info messages.
+    Info = 2,
+    /// Error + info + debug messages (most verbose).
+    Debug = 3,
+}
+
+// ── TelemetryConfig ────────────────────────────────────────────────────────────
+
+/// Telemetry configuration for an RDMA provider.
+///
+/// Controls log output destination (OpenTelemetry or plain stream) and
+/// verbosity level.
+#[derive(Debug, Clone)]
+pub struct TelemetryConfig {
+    /// `true` = use OpenTelemetry backend; `false` = write to an output stream.
+    pub use_otel: bool,
+    /// Optional log file path (ostream mode only; `None` = stdout).
+    pub log_file: Option<String>,
+    /// Verbosity level.
+    pub level: TelemLevel,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            use_otel: false,
+            log_file: None,
+            level: TelemLevel::Error,
+        }
+    }
+}
 
 // ── RdmaServerConfig ─────────────────────────────────────────────────────────
 
@@ -111,7 +163,7 @@ impl Default for RdmaServerConfig {
             listen_port:    0,
             pool_count:     4,
             buf_pool_count: 0,
-            buf_size:       128 * 1024 * 1024,
+            buf_size:       DEFAULT_RDMA_BUF_SIZE,
         }
     }
 }
@@ -240,6 +292,44 @@ pub trait RdmaClientProvider: Send + Sync {
     ///
     /// Default: `"unknown"`.
     fn protocol(&self) -> &str { "unknown" }
+
+    // ── Telemetry ────────────────────────────────────────────────────────────
+    //
+    // Lifecycle: call `supports_telemetry()` → `setup_telemetry()` →
+    // optionally `set_telem_level()` → `shutdown_telemetry()` before drop.
+    // For the cuobj backend these methods forward to the C++ SDK's static
+    // `cuObjClient::setupTelemetry` / `cuObjServer::setupTelemetry`;
+    // the mock backend stores the config in-process.
+
+    /// Returns `true` if this provider supports telemetry configuration.
+    fn supports_telemetry(&self) -> bool { false }
+
+    /// Configure the telemetry output destination and verbosity level.
+    ///
+    /// May be called multiple times to change the destination; the previous
+    /// configuration is replaced.
+    fn setup_telemetry(
+        &self,
+        _config: &TelemetryConfig,
+    ) -> Result<(), crate::error::RdmaError> {
+        Err(crate::error::RdmaError::OperationNotSupported(
+            "telemetry not supported by this provider".into(),
+        ))
+    }
+
+    /// Shut down telemetry and reset to the default output stream.
+    fn shutdown_telemetry(&self) -> Result<(), crate::error::RdmaError> {
+        Err(crate::error::RdmaError::OperationNotSupported(
+            "telemetry not supported by this provider".into(),
+        ))
+    }
+
+    /// Change the verbosity level without reconfiguring the output destination.
+    fn set_telem_level(&self, _level: TelemLevel) -> Result<(), crate::error::RdmaError> {
+        Err(crate::error::RdmaError::OperationNotSupported(
+            "telemetry not supported by this provider".into(),
+        ))
+    }
 }
 
 // ── RdmaServerProvider trait ──────────────────────────────────────────────────
@@ -334,6 +424,31 @@ pub trait RdmaServerProvider: Send + Sync {
             "handle_get_zc: not supported by this provider".into(),
         ))
     }
+
+    // ── Telemetry (see same methods on [`RdmaClientProvider`]) ───────────────
+
+    fn supports_telemetry(&self) -> bool { false }
+
+    fn setup_telemetry(
+        &self,
+        _config: &TelemetryConfig,
+    ) -> Result<(), crate::error::RdmaError> {
+        Err(crate::error::RdmaError::OperationNotSupported(
+            "telemetry not supported by this provider".into(),
+        ))
+    }
+
+    fn shutdown_telemetry(&self) -> Result<(), crate::error::RdmaError> {
+        Err(crate::error::RdmaError::OperationNotSupported(
+            "telemetry not supported by this provider".into(),
+        ))
+    }
+
+    fn set_telem_level(&self, _level: TelemLevel) -> Result<(), crate::error::RdmaError> {
+        Err(crate::error::RdmaError::OperationNotSupported(
+            "telemetry not supported by this provider".into(),
+        ))
+    }
 }
 
 // ── RdmaProvider trait ────────────────────────────────────────────────────────
@@ -372,6 +487,8 @@ pub trait RdmaProvider: RdmaClientProvider + RdmaServerProvider {
 /// Unified configuration for constructing an [`RdmaProvider`].
 ///
 /// The `server` fields are only used when `role` includes the server role.
+/// Telemetry is configured post-construction via
+/// [`RdmaClientProvider::setup_telemetry`].
 #[derive(Debug, Clone)]
 pub struct RdmaProviderConfig {
     /// Transport protocol: `"mock"`, `"cuobj"`, or `"auto"`.

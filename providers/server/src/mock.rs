@@ -80,6 +80,10 @@ static VTABLE: RdmaServerVtable = RdmaServerVtable {
     handle_get:       Some(c_handle_get),
     handle_put_zc:    Some(c_handle_put_zc),
     handle_get_zc:    Some(c_handle_get_zc),
+    supports_telemetry: None,
+    setup_telemetry:    None,
+    shutdown_telemetry: None,
+    set_telem_level:    None,
 };
 
 pub fn vtable() -> *const RdmaServerVtable {

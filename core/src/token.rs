@@ -633,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn cuobj_not_confused_with_opaque() {
+    fn cuobj_token_is_not_opaque() {
         // Must not accidentally be treated as opaque (provider == "").
         let tok = RdmaToken::parse_str(CUOBJ_TOK);
         assert!(!tok.is_opaque());
@@ -757,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn cuobj_base_not_falsely_extended() {
+    fn cuobj_base_token_no_extension() {
         // A base token whose last field is not decimal → no extension detected.
         let tok = RdmaToken::parse_str(CUOBJ_TOK);
         assert_eq!(tok.size(), 0x20000000); // from size_hex, no override

@@ -7,6 +7,8 @@ use std::ffi::c_void;
 use std::os::raw::c_char;
 use std::sync::OnceLock;
 
+use tracing::error;
+
 use s3_rdma::ffi::{ByteCursor, RdmaCompletionFn, RdmaProviderVtable};
 use s3_rdma::provider::{RDMA_BYTES_HEADER, RDMA_REPLY_HEADER, RDMA_TOKEN_HEADER};
 use s3_rdma::{MockRdmaProvider, RdmaClientProvider};
@@ -32,7 +34,7 @@ unsafe extern "C" fn c_register_memory(
 ) -> i32 {
     match get_provider().register_memory(ptr as *mut u8, size) {
         Ok(()) => 0,
-        Err(e) => { eprintln!("[s3-rdma-mock] register_memory: {e}"); -1 }
+        Err(e) => { error!("[s3-rdma-mock] register_memory: {e}"); -1 }
     }
 }
 
@@ -41,7 +43,7 @@ unsafe extern "C" fn c_deregister_memory(
 ) -> i32 {
     match get_provider().deregister_memory(ptr as *mut u8) {
         Ok(()) => 0,
-        Err(e) => { eprintln!("[s3-rdma-mock] deregister_memory: {e}"); -1 }
+        Err(e) => { error!("[s3-rdma-mock] deregister_memory: {e}"); -1 }
     }
 }
 
@@ -68,7 +70,7 @@ unsafe extern "C" fn c_prepare_put_token(
             unsafe { *out = ByteCursor { ptr, len }; }
             0
         }
-        Err(e) => { eprintln!("[s3-rdma-mock] prepare_put_token: {e}"); -1 }
+        Err(e) => { error!("[s3-rdma-mock] prepare_put_token: {e}"); -1 }
     }
 }
 
@@ -89,7 +91,7 @@ unsafe extern "C" fn c_prepare_get_token(
             unsafe { *out = ByteCursor { ptr, len }; }
             0
         }
-        Err(e) => { eprintln!("[s3-rdma-mock] prepare_get_token: {e}"); -1 }
+        Err(e) => { error!("[s3-rdma-mock] prepare_get_token: {e}"); -1 }
     }
 }
 
@@ -102,6 +104,10 @@ unsafe extern "C" fn c_process_reply_token(
     if reply.is_null() { return -1; }
     let reply_bytes = unsafe { (*reply).as_slice() };
     let rdma_status: u16 = 200;
+    // Cast to usize so the closure is Send: the pointer address is captured as
+    // a plain integer. SAFETY: this fn is `unsafe extern "C"` — the caller
+    // guarantees the pointer remains valid and race-free for the callback.
+    let user_data_addr = user_data as usize;
     let result = get_provider().process_rdma_reply(
         rdma_status,
         reply_bytes,
@@ -109,13 +115,13 @@ unsafe extern "C" fn c_process_reply_token(
         Box::new(move |r| {
             if let Some(f) = callback {
                 let cursor = ByteCursor::from_slice(&r.reply_token);
-                unsafe { f(user_data, r.error_code, &cursor); }
+                unsafe { f(user_data_addr as *mut c_void, r.error_code, &cursor); }
             }
         }),
     );
     match result {
         Ok(()) => 0,
-        Err(e) => { eprintln!("[s3-rdma-mock] process_reply_token: {e}"); -1 }
+        Err(e) => { error!("[s3-rdma-mock] process_reply_token: {e}"); -1 }
     }
 }
 
@@ -146,6 +152,10 @@ static VTABLE: RdmaProviderVtable = RdmaProviderVtable {
     rdma_token_header_name: Some(c_rdma_token_header_name),
     rdma_reply_header_name: Some(c_rdma_reply_header_name),
     rdma_bytes_header_name: Some(c_rdma_bytes_header_name),
+    supports_telemetry:    None,
+    setup_telemetry:       None,
+    shutdown_telemetry:    None,
+    set_telem_level:       None,
 };
 
 pub fn vtable() -> *const RdmaProviderVtable {

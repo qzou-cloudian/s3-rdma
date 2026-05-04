@@ -13,10 +13,10 @@
 //! Concrete implementations:
 //!
 //! - [`MockRdmaProvider`] — SHM-based simulation, no hardware required; both roles
-//! - [`PluginProvider`] — generic RDMA plugin (loads `.so` at runtime); both roles
+//! - [`RdmaPlugin`] — generic RDMA plugin (loads `.so` at runtime); both roles
 //!   from one instance
-//! - [`PluginClientProvider`] / [`PluginServerProvider`] — focused single-role
-//!   wrappers (require `plugin-client` / `plugin-server` feature respectively)
+//! - [`RdmaPluginClient`] / [`RdmaPluginServer`] — focused single-role
+//!   wrappers (require `rdma-client` / `rdma-server` feature respectively)
 //! - [`RdmaEngine`] — fixed-size worker pool wrapping any provider (feature `engine`)
 //!
 //! ## Choosing the right trait
@@ -46,14 +46,14 @@
 //!
 //! | Feature         | Effect                                                              |
 //! |-----------------|---------------------------------------------------------------------|
-//! | `plugin-client` | Enable [`PluginClientProvider`] / [`PluginProvider`] client role   |
-//! | `plugin-server` | Enable [`PluginServerProvider`] / [`PluginProvider`] server role   |
+//! | `rdma-client` | Enable [`RdmaPluginClient`] / [`RdmaPlugin`] client role   |
+//! | `rdma-server` | Enable [`RdmaPluginServer`] / [`RdmaPlugin`] server role   |
 //! | `buffer-pool`   | Enable [`BufferPool`] for pre-registered RDMA buffers               |
 //! | `engine`        | Enable [`RdmaEngine`] fixed-size worker pool                        |
 //! | (none)          | Only [`MockRdmaProvider`] available                                 |
 
-pub(crate) mod plugin_client;
-pub(crate) mod plugin_server;
+pub(crate) mod rdma_client;
+pub(crate) mod rdma_server;
 #[cfg(feature = "engine")]
 pub mod engine;
 pub mod error;
@@ -70,9 +70,11 @@ mod python;
 
 pub use provider::{RdmaRole, RdmaProvider, RdmaProviderConfig};
 pub use provider::{RdmaClientProvider, RdmaServerProvider};
+pub use provider::{TelemetryConfig, TelemLevel};
+pub use provider::DEFAULT_RDMA_BUF_SIZE;
 pub use mock::MockRdmaProvider;
-#[cfg(any(feature = "plugin-client", feature = "plugin-server"))]
-pub use plugin_client::PluginProvider;
+#[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
+pub use rdma_client::RdmaPlugin;
 
 // ── Supporting types ──────────────────────────────────────────────────────────
 
@@ -85,27 +87,29 @@ pub use pool::{BufferPool, BufferPoolBuilder, BufferPoolError, OwnedBufferGuard}
 #[cfg(feature = "engine")]
 pub use engine::{RdmaEngine, RdmaEngineConfig};
 
-#[cfg(feature = "plugin-client")]
-pub use plugin_client::PluginClientProvider;
-#[cfg(feature = "plugin-client")]
-pub use plugin_client::rdma_plugin_available;
+#[cfg(feature = "rdma-client")]
+pub use rdma_client::RdmaPluginClient;
+#[cfg(feature = "rdma-client")]
+pub use rdma_client::rdma_available;
 
-#[cfg(feature = "plugin-server")]
-pub use plugin_server::PluginServerProvider;
+#[cfg(feature = "rdma-server")]
+pub use rdma_server::RdmaPluginServer;
 
 use std::sync::Arc;
+
+use tracing::info;
 
 pub use error::RdmaError;
 
 /// Returns a one-line summary of compiled-in RDMA providers and their runtime
-/// availability, e.g. `"RDMA providers: plugin (available), mock"`.
+/// availability, e.g. `"RDMA providers: rdma (available), mock"`.
 pub fn rdma_provider_info() -> String {
     let mut entries: Vec<String> = Vec::new();
 
-    #[cfg(feature = "plugin-client")]
+    #[cfg(feature = "rdma-client")]
     {
-        let status = if rdma_plugin_available() { "available" } else { "unavailable" };
-        entries.push(format!("plugin ({status})"));
+        let status = if rdma_available() { "available" } else { "unavailable" };
+        entries.push(format!("rdma ({status})"));
     }
 
     entries.push("mock".into());
@@ -117,8 +121,8 @@ pub fn rdma_provider_info() -> String {
 ///
 /// `provider` must be one of:
 /// - `"mock"`   → [`MockRdmaProvider`]
-/// - `"plugin"` → [`PluginProvider`] (requires `plugin-client`/`plugin-server` features)
-/// - `"auto"`   → tries `"plugin"` first, falls back to `"mock"`
+/// - `"rdma"`  → [`RdmaPlugin`] (requires `rdma-client`/`rdma-server` features)
+/// - `"auto"`  → tries `"rdma"` first, falls back to `"mock"`
 ///
 /// `role` specifies which capabilities to initialise:
 /// - [`RdmaRole::Client`]  — client methods (register/token/reply) only
@@ -134,25 +138,25 @@ pub fn create_provider(
     role: RdmaRole,
     cfg: &RdmaServerConfig,
 ) -> Result<Arc<dyn RdmaProvider>, RdmaError> {
-    match provider {
+    let ep: Arc<dyn RdmaProvider> = match provider {
         "mock" => {
             if debug {
-                eprintln!("[rdma] Using MockRdmaProvider (role={role:?})");
+                info!("[rdma] Using MockRdmaProvider (role={role:?})");
             }
-            Ok(Arc::new(MockRdmaProvider::new(debug, &cfg.shm_path, cfg.buf_size)))
+            Arc::new(MockRdmaProvider::new(debug, &cfg.shm_path, cfg.buf_size))
         }
-        "plugin" => {
+        "rdma" => {
             let result: Result<Arc<dyn RdmaProvider>, RdmaError>;
-            #[cfg(any(feature = "plugin-client", feature = "plugin-server"))]
+            #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
             {
                 let ep = match role {
-                    RdmaRole::Client => PluginProvider::new_client(),
-                    RdmaRole::Server => PluginProvider::new_server(cfg),
-                    RdmaRole::Both   => PluginProvider::new_both(cfg),
+                    RdmaRole::Client => RdmaPlugin::new_client(),
+                    RdmaRole::Server => RdmaPlugin::new_server(cfg),
+                    RdmaRole::Both   => RdmaPlugin::new_both(cfg),
                 };
                 result = ep.map(|e| {
                     if debug {
-                        eprintln!("[rdma] Using PluginProvider (role={role:?})");
+                        info!("[rdma] Using RdmaPlugin (role={role:?})");
                     }
                     Arc::new(e) as Arc<dyn RdmaProvider>
                 }).map_err(|e| RdmaError::ProviderUnavailable {
@@ -160,28 +164,29 @@ pub fn create_provider(
                     reason: e.to_string(),
                 });
             }
-            #[cfg(not(any(feature = "plugin-client", feature = "plugin-server")))]
+            #[cfg(not(any(feature = "rdma-client", feature = "rdma-server")))]
             {
                 let _ = (debug, role, cfg);
                 result = Err(RdmaError::ProviderUnavailable {
                     provider: provider.to_owned(),
-                    reason: "compiled without `plugin-client` or `plugin-server` features".into(),
+                    reason: "compiled without `rdma-client` or `rdma-server` features".into(),
                 });
             }
-            result
+            result?
         }
         "auto" => {
-            // Try plugin first; fall back to mock on any error.
-            match create_provider("plugin", debug, role, cfg) {
-                Ok(ep) => Ok(ep),
-                Err(_) => create_provider("mock", debug, role, cfg),
+            // Try rdma first; fall back to mock on any error.
+            match create_provider("rdma", debug, role, cfg) {
+                Ok(ep) => return Ok(ep),
+                Err(_) => return create_provider("mock", debug, role, cfg),
             }
         }
-        other => Err(RdmaError::ProviderUnavailable {
+        other => return Err(RdmaError::ProviderUnavailable {
             provider: other.to_owned(),
-            reason: "unknown provider (valid: mock, plugin, auto)".to_owned(),
+            reason: "unknown provider (valid: mock, rdma, auto)".to_owned(),
         }),
-    }
+    };
+    Ok(ep)
 }
 
 /// Build an `Arc<dyn RdmaClientProvider>` for the named provider.
@@ -197,15 +202,15 @@ pub fn create_client_provider(
     match provider {
         "mock" => {
             if debug {
-                eprintln!("[rdma] Using MockRdmaProvider (role=Client)");
+                info!("[rdma] Using MockRdmaProvider (role=Client)");
             }
             Ok(Arc::new(MockRdmaProvider::new(debug, &cfg.shm_path, cfg.buf_size)))
         }
-        #[cfg(any(feature = "plugin-client", feature = "plugin-server"))]
-        "plugin" => {
-            PluginProvider::new_client()
+        #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
+        "rdma" => {
+            RdmaPlugin::new_client()
                 .map(|e| {
-                    if debug { eprintln!("[rdma] Using PluginProvider (role=Client)"); }
+                    if debug { info!("[rdma] Using RdmaPlugin (role=Client)"); }
                     Arc::new(e) as Arc<dyn RdmaClientProvider>
                 })
                 .map_err(|e| RdmaError::ProviderUnavailable {
@@ -213,16 +218,16 @@ pub fn create_client_provider(
                     reason: e.to_string(),
                 })
         }
-        #[cfg(not(any(feature = "plugin-client", feature = "plugin-server")))]
-        "plugin" => Err(RdmaError::ProviderUnavailable {
+        #[cfg(not(any(feature = "rdma-client", feature = "rdma-server")))]
+        "rdma" => Err(RdmaError::ProviderUnavailable {
             provider: provider.to_owned(),
-            reason: "compiled without `plugin-client` or `plugin-server` features".into(),
+            reason: "compiled without `rdma-client` or `rdma-server` features".into(),
         }),
-        "auto" => create_client_provider("plugin", debug, cfg)
+        "auto" => create_client_provider("rdma", debug, cfg)
             .or_else(|_| create_client_provider("mock", debug, cfg)),
         other => Err(RdmaError::ProviderUnavailable {
             provider: other.to_owned(),
-            reason: "unknown provider (valid: mock, plugin, auto)".to_owned(),
+            reason: "unknown provider (valid: mock, rdma, auto)".to_owned(),
         }),
     }
 }
@@ -239,15 +244,15 @@ pub fn create_server_provider(
     match provider {
         "mock" => {
             if debug {
-                eprintln!("[rdma] Using MockRdmaProvider (role=Server)");
+                info!("[rdma] Using MockRdmaProvider (role=Server)");
             }
             Ok(Arc::new(MockRdmaProvider::new(debug, &cfg.shm_path, cfg.buf_size)))
         }
-        #[cfg(any(feature = "plugin-client", feature = "plugin-server"))]
-        "plugin" => {
-            PluginProvider::new_server(cfg)
+        #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
+        "rdma" => {
+            RdmaPlugin::new_server(cfg)
                 .map(|e| {
-                    if debug { eprintln!("[rdma] Using PluginProvider (role=Server)"); }
+                    if debug { info!("[rdma] Using RdmaPlugin (role=Server)"); }
                     Arc::new(e) as Arc<dyn RdmaServerProvider>
                 })
                 .map_err(|e| RdmaError::ProviderUnavailable {
@@ -255,16 +260,16 @@ pub fn create_server_provider(
                     reason: e.to_string(),
                 })
         }
-        #[cfg(not(any(feature = "plugin-client", feature = "plugin-server")))]
-        "plugin" => Err(RdmaError::ProviderUnavailable {
+        #[cfg(not(any(feature = "rdma-client", feature = "rdma-server")))]
+        "rdma" => Err(RdmaError::ProviderUnavailable {
             provider: provider.to_owned(),
-            reason: "compiled without `plugin-client` or `plugin-server` features".into(),
+            reason: "compiled without `rdma-client` or `rdma-server` features".into(),
         }),
-        "auto" => create_server_provider("plugin", debug, cfg)
+        "auto" => create_server_provider("rdma", debug, cfg)
             .or_else(|_| create_server_provider("mock", debug, cfg)),
         other => Err(RdmaError::ProviderUnavailable {
             provider: other.to_owned(),
-            reason: "unknown provider (valid: mock, plugin, auto)".to_owned(),
+            reason: "unknown provider (valid: mock, rdma, auto)".to_owned(),
         }),
     }
 }

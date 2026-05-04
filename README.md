@@ -23,16 +23,16 @@ This project exposes that capability through a uniform `RdmaProvider` interface 
 
 ```
 s3-rdma/
-├── core/                    # RdmaProvider trait, MockRdmaProvider, CuObjProvider, BufferPool
+├── core/                    # RdmaProvider trait, MockRdmaProvider, RdmaPlugin, BufferPool
 ├── providers/
-│   ├── cuobj-client/        # Client cdylib plugin → libs3rdmacuobjclient.so
-│   └── cuobj-server/        # Server cdylib plugin → libs3rdmacuobjserver.so
+│   ├── client/              # Client cdylib plugin → libs3rdmaclient.so
+│   └── server/              # Server cdylib plugin → libs3rdmaserver.so
 └── bindings/
     ├── java/                # JNI Rust crate + Maven project (io.s3rdma)
     └── python/              # PyO3 / maturin extension (s3_rdma)
 ```
 
-`~/work/cuobj/` is a separate standalone crate that wraps the low-level cuObject SDK C++ API. It is a dependency of `providers/cuobj-client` and `providers/cuobj-server`.
+`~/work/cuobj/` is a separate standalone crate that wraps the low-level cuObject SDK C++ API. It is an optional dependency of `providers/client` and `providers/server` (behind the `cuobj` feature).
 
 ---
 
@@ -86,10 +86,12 @@ The server-side abstraction used by the S3 gateway:
 
 | Method | Description |
 |--------|-------------|
-| `handle_put(key, token, offset, size)` | RDMA_READ from client buffer; returns transferred bytes |
+| `handle_put(key, token, buf, offset, size)` | RDMA_READ from client buffer; returns transferred bytes |
 | `handle_get(key, data, token, offset)` | Copy `data` into pool slot and RDMA_WRITE to client buffer |
+| `handle_put_zc(key, token, offset, size, write_fn, data)` | Zero-copy PUT: RDMA_READ into internal slot, flush via callback |
+| `handle_get_zc(key, token, offset, read_fn, data)` | Zero-copy GET: fill slot via callback, RDMA_WRITE to client |
 
-The server provider owns a `BufferPool` of pinned DMA slots. Each `handle_*` call acquires a slot, performs the RDMA transfer, and releases the slot back to the pool.
+The server provider owns a `BufferPool` of pinned DMA slots. Each `handle_*` call acquires a slot, performs the RDMA transfer, and releases the slot back to the pool. The zero-copy variants (`_zc`) eliminate the intermediate buffer copy by invoking I/O callbacks directly on the RDMA slot memory.
 
 ---
 
@@ -189,28 +191,59 @@ RDMA_GET_rdma-buf-0_8192_0_key_my-bucket/my-object.bin
 
 Built into `core`. Accepts any non-null buffer, generates deterministic ASCII tokens, and invokes the completion callback synchronously. No hardware or SDK required. Uses `/dev/shm` files as the transfer medium so client and server can run in separate processes on the same host (or in Docker containers sharing `ipc: host`). Supports both client and server roles from a single instance.
 
-### CuObj plugins
+### Feature flags
+
+The `core` crate exposes these Cargo features:
+
+| Feature | Effect |
+|---------|--------|
+| `rdma-client` | Enable `RdmaPlugin` / `RdmaPluginClient` (loads `libs3rdmaclient.so` at runtime) |
+| `rdma-server` | Enable `RdmaPlugin` / `RdmaPluginServer` (loads `libs3rdmaserver.so` at runtime) |
+| `buffer-pool` | Enable `BufferPool` for pre-registered RDMA buffers |
+| `engine` | Enable `RdmaEngine` fixed-size worker pool |
+| `pyo3` | Python bindings via PyO3 (used by `bindings/python`) |
+| (none) | Only `MockRdmaProvider` available |
+
+When both `rdma-client` and `rdma-server` are compiled in, `RdmaPlugin` can act as a unified provider supporting both roles.
+
+### RdmaPlugin (runtime-loaded plugins)
 
 Two separate plugins are loaded at runtime:
 
-- **`libs3rdmacuobjclient.so`** (`providers/cuobj-client/`) — exports the client vtable:
+- **`libs3rdmaclient.so`** (`providers/client/`) — exports the client vtable:
 
 | C symbol | Direction | Description |
 |----------|-----------|-------------|
-| `s3_rdma_provider_get_vtable()` | Client | `RdmaProviderVtable` — used by relay/client nodes |
+| `s3_rdma_get_client_vtable()` | Client | `RdmaProviderVtable` — used by relay/client nodes |
 
-- **`libs3rdmacuobjserver.so`** (`providers/cuobj-server/`) — exports the server vtable:
+- **`libs3rdmaserver.so`** (`providers/server/`) — exports the server vtable:
 
 | C symbol | Direction | Description |
 |----------|-----------|-------------|
-| `s3_rdma_server_provider_get_vtable()` | Server | `RdmaServerVtable` — used by the gateway |
+| `s3_rdma_get_server_vtable()` | Server | `RdmaServerVtable` — used by the gateway |
 
-Plugins are loaded at runtime via `libloading` — no compile-time SDK dependency. `CuObjClientProvider` and `CuObjServerProvider` in `core` search for the plugin in this order:
+Both `.so` files accept a backend name parameter (e.g. `"rdma"` for cuObject hardware, `"mock"` for testing). Plugins are loaded at runtime via `libloading` — no compile-time SDK dependency. The host searches for the plugin in this order:
 
 1. Standard dynamic-linker paths (`LD_LIBRARY_PATH`, RPATH, ldconfig cache)
 2. Directory alongside the running executable
 3. `/lib64/`, `/usr/lib64/`
 
+### Provider factory functions
+
+`core` exports convenience constructors that handle provider selection and fallback:
+
+```rust
+// Full provider (client+server roles)
+let ep: Arc<dyn RdmaProvider> = create_provider("auto", true, RdmaRole::Both, &cfg)?;
+
+// Client-only
+let ep: Arc<dyn RdmaClientProvider> = create_client_provider("mock", false, &cfg)?;
+
+// Server-only
+let ep: Arc<dyn RdmaServerProvider> = create_server_provider("rdma", false, &cfg)?;
+```
+
+`"auto"` tries the `"rdma"` plugin first, then falls back to `"mock"`.
 
 ---
 
@@ -222,13 +255,13 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-s3-rdma = { path = "core" }
+s3-rdma = { path = "core", features = ["rdma-client"] }
 ```
 
 ```rust
-use s3_rdma::{MockRdmaProvider, RdmaClientProvider};
+use s3_rdma::{rdma_provider_info, MockRdmaProvider, RdmaClientProvider};
 
-let ep = MockRdmaProvider::with_debug(false);
+let ep = MockRdmaProvider::new(true, "/dev/shm", 0);
 let mut buf = vec![0u8; 4 * 1024 * 1024];
 let key = b"my-bucket/my-object.bin";
 
@@ -243,6 +276,7 @@ ep.process_rdma_reply(200, &token, buf.len(), Box::new(|result| {
 }))?;
 
 ep.deregister_memory(buf.as_mut_ptr())?;
+println!("{}", rdma_provider_info());
 ```
 
 Run the full example:
@@ -264,8 +298,8 @@ cd bindings/python && python3 -m maturin develop
 ```python
 import s3_rdma
 
-provider = s3_rdma.MockRdmaProvider(debug=False)
-# bytearray (or bytes/memoryview/numpy) — any buffer-protocol object is accepted
+# Mock provider — both roles (typical for testing)
+provider = s3_rdma.MockRdmaProvider(debug=True)
 data = bytearray(b"\x42" * 4 * 1024 * 1024)
 key  = b"my-bucket/my-object.bin"
 
@@ -277,6 +311,10 @@ def on_complete(error_code: int, reply: bytes) -> None:
 
 provider.process_rdma_reply(200, token, len(data), on_complete)
 provider.deregister_memory(data)
+
+# Auto-select provider (tries rdma plugin first, falls back to mock)
+ep = s3_rdma.RdmaProvider(provider="auto", role="both")
+print(f"Using: {ep!r}, protocol: {ep.protocol()}")
 ```
 
 Run the full example:
@@ -296,14 +334,15 @@ mvn compile -f bindings/java/pom.xml
 ```
 
 ```java
-import io.s3rdma.MockRdmaProvider;
+import io.s3rdma.RdmaProvider;
 import io.s3rdma.RdmaBuffer;
 import java.nio.ByteBuffer;
 
-try (MockRdmaProvider provider = new MockRdmaProvider()) {
+// RdmaProvider with auto-selection (rdma plugin → mock fallback)
+try (RdmaProvider provider = new RdmaProvider("auto", "both", false,
+        "/dev/shm", "", 0, 4, 128 * 1024 * 1024)) {
     byte[] key = "my-bucket/my-object.bin".getBytes();
 
-    // RdmaBuffer wraps ByteBuffer.allocateDirect() — required for RDMA operations
     try (RdmaBuffer rdmaBuf = new RdmaBuffer(4 * 1024 * 1024)) {
         byte[] content = new byte[rdmaBuf.capacity()];
         rdmaBuf.put(content, 0, content.length);
@@ -338,7 +377,7 @@ java -Djava.library.path=target/debug \
 |---------|---------|-------------------|
 | `MemoryNotSuitable` | Buffer not usable for RDMA | ✅ fall back to plain HTTP |
 | `TokenGenerationFailed` | Could not build descriptor | ✅ fall back to plain HTTP |
-| `CuObjConnectionFailed` | SDK unavailable at runtime | ✅ fall back to plain HTTP |
+| `RdmaPluginLoadFailed` | Plugin `.so` not found or init failed | ✅ fall back to plain HTTP |
 | `ProviderUnavailable` | Named provider unknown or init failed | ✅ fall back to plain HTTP |
 | `BufferTooSmall` | Server slot smaller than requested transfer | ✅ fall back to plain HTTP |
 | `MemoryRegistrationFailed` | RDMA registration error | ❌ propagate |
@@ -358,14 +397,22 @@ java -Djava.library.path=target/debug \
 # Core library + all providers + Java JNI
 cargo build --workspace
 
-# cuObject client plugin (requires CUDA SDK)
-export CUOBJ_ROOT_DIR=/usr/local/cuda-13.2
-cargo build -p s3-rdma-cuobj-client --release
-# → target/release/libs3rdmacuobjclient.so
+# Client plugin (mock only, no CUDA SDK required)
+cargo build -p s3-rdma-client --release
+# → target/release/libs3rdmaclient.so
 
-# cuObject server plugin (requires CUDA SDK)
-cargo build -p s3-rdma-cuobj-server --release
-# → target/release/libs3rdmacuobjserver.so
+# Client plugin with cuObject hardware backend (requires CUDA SDK)
+export CUOBJ_ROOT_DIR=/usr/local/cuda-13.2
+cargo build -p s3-rdma-client --release --features cuobj
+# → target/release/libs3rdmaclient.so  (same filename, now with cuObj support)
+
+# Server plugin
+cargo build -p s3-rdma-server --release
+# → target/release/libs3rdmaserver.so
+
+# Server plugin with cuObject hardware backend
+cargo build -p s3-rdma-server --release --features cuobj
+# → target/release/libs3rdmaserver.so
 
 # Python extension (from bindings/python/)
 source ~/.venv/bin/activate
@@ -375,7 +422,6 @@ cd bindings/python && python3 -m maturin develop
 mvn compile -f bindings/java/pom.xml
 ```
 
-Place `libs3rdmacuobjclient.so` and `libs3rdmacuobjserver.so` alongside the gateway binary or on `LD_LIBRARY_PATH` before starting either the client or server process.
+Place `libs3rdmaclient.so` and `libs3rdmaserver.so` alongside the gateway binary or on `LD_LIBRARY_PATH` before starting either the client or server process.
 
 Minimum Rust edition: **2021**.  `unsafe` in `core` is limited to raw pointer forwarding to provider implementations and POSIX SHM operations in `MockRdmaProvider`.
-

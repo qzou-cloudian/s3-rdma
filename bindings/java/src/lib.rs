@@ -2,7 +2,7 @@
 //!
 //! Exposes the unified `RdmaProvider` Java class backed by
 //! `Box<Arc<dyn RdmaProvider>>`, supporting client, server, and both roles
-//! with any provider (`"mock"`, `"plugin"`, `"auto"`).
+//! with any provider (`"mock"`, `"rdma"`, `"auto"`).
 
 use std::sync::Arc;
 
@@ -10,8 +10,10 @@ use jni::objects::{JByteArray, JByteBuffer, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyteArray, jlong, JNI_TRUE};
 use jni::JNIEnv;
 
-use s3_rdma::provider::{RdmaRole, RdmaProvider};
-use s3_rdma::provider::{RdmaCompletionCallback, RdmaCompletionResult, RdmaServerConfig};
+use s3_rdma::TelemLevel;
+use s3_rdma::provider::{RdmaRole, RdmaProvider, RdmaClientProvider};
+use s3_rdma::provider::{RdmaCompletionCallback, RdmaCompletionResult, RdmaServerConfig, DEFAULT_RDMA_BUF_SIZE};
+use s3_rdma::provider::TelemetryConfig;
 
 fn throw(env: &mut JNIEnv<'_>, msg: &str) {
     let _ = env.throw_new("io/s3rdma/RdmaException", msg);
@@ -31,6 +33,10 @@ type ArcProvider = Arc<dyn RdmaProvider>;
 /// `Java_io_s3rdma_RdmaProvider_nativeCreate` and not yet passed to
 /// `Java_io_s3rdma_RdmaProvider_nativeDestroy`.
 unsafe fn arc_provider_ref(handle: jlong) -> &'static dyn RdmaProvider {
+    if handle == 0 {
+        eprintln!("[s3-rdma-jni] FATAL: null handle — nativeCreate likely returned 0 (error)");
+        std::process::abort();
+    }
     let arc = unsafe { &*(handle as *const ArcProvider) };
     arc.as_ref()
 }
@@ -296,8 +302,8 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeHandlePut(
     let buf_cap = if size > 0 {
         size as usize
     } else {
-        // buf_size() returns usize::MAX for mock when unconfigured; cap at 128 MiB.
-        raw_cap.min(128 * 1024 * 1024).max(4096)
+        // buf_size() returns usize::MAX for mock when unconfigured; cap to avoid OOM.
+        raw_cap.min(DEFAULT_RDMA_BUF_SIZE).max(4096)
     };
     let mut buf = vec![0u8; buf_cap];
     match ep.handle_put(&key_bytes, &tok_bytes, &mut buf, offset as usize, size as usize) {
@@ -331,5 +337,71 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeHandleGet(
     {
         Ok(n)  => n as jlong,
         Err(e) => { throw(&mut env, &e.to_string()); -1 }
+    }
+}
+
+// ── Telemetry ──────────────────────────────────────────────────────────────────
+
+#[no_mangle]
+pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeSupportsTelemetry(
+    _env: JNIEnv<'_>, _obj: JObject<'_>, handle: jlong,
+) -> jboolean {
+    RdmaClientProvider::supports_telemetry(unsafe { arc_provider_ref(handle) }) as jboolean
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeSetupTelemetry(
+    mut env: JNIEnv<'_>, _obj: JObject<'_>,
+    handle: jlong, use_otel: jboolean, log_file: JString<'_>, level: jni::sys::jint,
+) {
+    let log_file = if log_file.is_null() {
+        None
+    } else {
+        match env.get_string(&log_file) {
+            Ok(s) => Some(String::from(s)),
+            Err(e) => { throw(&mut env, &e.to_string()); return; }
+        }
+    };
+    let lvl = match level {
+        0 => TelemLevel::Off,
+        1 => TelemLevel::Error,
+        2 => TelemLevel::Info,
+        _ => TelemLevel::Debug,
+    };
+    let cfg = TelemetryConfig {
+        use_otel: use_otel == JNI_TRUE,
+        log_file,
+        level: lvl,
+    };
+    if let Err(e) = RdmaClientProvider::setup_telemetry(
+        unsafe { arc_provider_ref(handle) }, &cfg,
+    ) {
+        throw(&mut env, &e.to_string());
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeShutdownTelemetry(
+    mut env: JNIEnv<'_>, _obj: JObject<'_>, handle: jlong,
+) {
+    if let Err(e) = RdmaClientProvider::shutdown_telemetry(unsafe { arc_provider_ref(handle) }) {
+        throw(&mut env, &e.to_string());
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeSetTelemLevel(
+    mut env: JNIEnv<'_>, _obj: JObject<'_>, handle: jlong, level: jni::sys::jint,
+) {
+    let lvl = match level {
+        0 => TelemLevel::Off,
+        1 => TelemLevel::Error,
+        2 => TelemLevel::Info,
+        _ => TelemLevel::Debug,
+    };
+    if let Err(e) = RdmaClientProvider::set_telem_level(
+        unsafe { arc_provider_ref(handle) }, lvl,
+    ) {
+        throw(&mut env, &e.to_string());
     }
 }

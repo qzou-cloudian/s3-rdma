@@ -49,7 +49,7 @@ import java.nio.ByteBuffer;
 public class RdmaProvider implements AutoCloseable {
 
     static {
-        System.loadLibrary("s3_rdma_jni");
+        System.loadLibrary("s3rdmajni");
     }
 
     private long nativeHandle;
@@ -331,7 +331,7 @@ public class RdmaProvider implements AutoCloseable {
 public class RdmaProvider implements AutoCloseable {
 
     static {
-        System.loadLibrary("s3_rdma_jni");
+        System.loadLibrary("s3rdmajni");
     }
 
     private long nativeHandle;

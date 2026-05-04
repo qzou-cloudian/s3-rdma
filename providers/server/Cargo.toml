@@ -17,5 +17,6 @@ mock    = []
 cuobj   = ["dep:cuobj"]
 
 [dependencies]
+tracing = "0.1"
 s3-rdma = { path = "../../core" }
 cuobj   = { path = "../../../cuobj", features = ["server"], optional = true }

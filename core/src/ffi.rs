@@ -63,6 +63,21 @@ pub type RdmaCompletionFn = unsafe extern "C" fn(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
+// C-ABI telemetry types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// C-ABI telemetry configuration (mirrors [`TelemetryConfig`](crate::provider::TelemetryConfig)).
+#[repr(C)]
+pub struct CTelemetryConfig {
+    /// `1` = use OpenTelemetry backend; `0` = use ostream.
+    pub use_otel: i32,
+    /// Null-terminated log file path (may be null).
+    pub log_file: *const c_char,
+    /// [`TelemLevel`](crate::provider::TelemLevel) as its `#[repr(u32)]` value.
+    pub level: u32,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // RdmaProviderVtable
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -96,6 +111,15 @@ pub struct RdmaProviderVtable {
     pub get_max_transfer_size: Option<unsafe extern "C" fn(*mut c_void, *const c_void) -> usize>,
 
     /// Generate an RDMA token for a PUT (upload) operation.
+    ///
+    /// On success (`return 0`), `*out` receives an owning `ByteCursor` whose
+    /// `ptr` was allocated by the plugin (`Box::into_raw` / `malloc`).  The
+    /// **caller must free** the pointer via the matching deallocator
+    /// (`Box::from_raw` on the Rust side).
+    ///
+    /// On error (`return != 0`), `*out` **must** be left as
+    /// `ByteCursor::null()` (the value the caller initialised it to).  The
+    /// caller skips deallocation for error returns.
     pub prepare_put_token: Option<unsafe extern "C" fn(
         *mut c_void, *const ByteCursor,
         *const c_void, usize, usize,
@@ -103,6 +127,8 @@ pub struct RdmaProviderVtable {
     ) -> i32>,
 
     /// Generate an RDMA token for a GET (download) operation.
+    ///
+    /// Ownership convention: same as [`prepare_put_token`](#structfield.prepare_put_token).
     pub prepare_get_token: Option<unsafe extern "C" fn(
         *mut c_void, *const ByteCursor,
         *mut c_void, usize, usize,
@@ -121,6 +147,24 @@ pub struct RdmaProviderVtable {
     pub rdma_reply_header_name: Option<unsafe extern "C" fn(*mut c_void) -> ByteCursor>,
     /// Name of the byte-count header (e.g. `x-amz-rdma-bytes`).
     pub rdma_bytes_header_name: Option<unsafe extern "C" fn(*mut c_void) -> ByteCursor>,
+
+    // ── Telemetry ────────────────────────────────────────────────────────────
+
+    /// Returns `1` if this provider supports telemetry.
+    pub supports_telemetry: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
+
+    /// Set up telemetry output for this provider.
+    /// `cfg` points to a [`CTelemetryConfig`]; valid for the duration of the call.
+    /// Returns 0 on success, non-zero on failure.
+    pub setup_telemetry: Option<unsafe extern "C" fn(*mut c_void, *const CTelemetryConfig) -> i32>,
+
+    /// Shut down telemetry (reset to default output stream).
+    /// Returns 0 on success, non-zero on failure.
+    pub shutdown_telemetry: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
+
+    /// Set telemetry log-path flags.
+    /// Returns 0 on success, non-zero on failure.
+    pub set_telem_level: Option<unsafe extern "C" fn(*mut c_void, level: u32) -> i32>,
 }
 
 // SAFETY: the vtable contains only raw function pointers which are always safe
@@ -290,6 +334,24 @@ pub struct RdmaServerVtable {
         read_fn_data: *mut c_void,
         out_written:  *mut usize,
     ) -> i32>,
+
+    // ── Telemetry ────────────────────────────────────────────────────────────
+
+    /// Returns `1` if this provider supports telemetry.
+    pub supports_telemetry: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
+
+    /// Set up telemetry output for this server provider.
+    /// `cfg` points to a [`CTelemetryConfig`]; valid for the duration of the call.
+    /// Returns 0 on success, non-zero on failure.
+    pub setup_telemetry: Option<unsafe extern "C" fn(*mut c_void, *const CTelemetryConfig) -> i32>,
+
+    /// Shut down telemetry (reset to default output stream).
+    /// Returns 0 on success, non-zero on failure.
+    pub shutdown_telemetry: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
+
+    /// Set telemetry log-path flags.
+    /// Returns 0 on success, non-zero on failure.
+    pub set_telem_level: Option<unsafe extern "C" fn(*mut c_void, level: u32) -> i32>,
 }
 
 // SAFETY: vtable contains only function pointers and a static string pointer,

@@ -31,8 +31,10 @@ use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
 use std::sync::{Mutex, OnceLock};
 
+use tracing::debug;
+
 use crate::error::RdmaError;
-use crate::provider::{RdmaCompletionCallback, RdmaCompletionResult, RdmaClientProvider, RdmaServerProvider, RdmaProvider};
+use crate::provider::{RdmaCompletionCallback, RdmaCompletionResult, RdmaClientProvider, RdmaServerProvider, RdmaProvider, rdma_status_to_error_code, TelemetryConfig, TelemLevel};
 
 /// Base directory for shared-memory files.
 const SHM_DIR: &str = "/dev/shm";
@@ -96,6 +98,7 @@ pub struct MockRdmaProvider {
     registered: Mutex<HashMap<usize, ShmEntry>>,
     token_header: &'static str,
     reply_header: &'static str,
+    telem_config: Mutex<Option<TelemetryConfig>>,
 }
 
 impl std::fmt::Debug for MockRdmaProvider {
@@ -123,6 +126,7 @@ impl MockRdmaProvider {
             registered: Mutex::new(HashMap::new()),
             token_header: env_header(&TOKEN_HEADER, "CUOBJ_RDMA_TOKEN_HEADER_NAME", "x-amz-rdma-token"),
             reply_header: env_header(&REPLY_HEADER, "CUOBJ_RDMA_REPLY_HEADER_NAME", "x-amz-rdma-reply"),
+            telem_config: Mutex::new(None),
         }
     }
 
@@ -133,7 +137,7 @@ impl MockRdmaProvider {
 
     fn dbg(&self, msg: &str) {
         if self.debug {
-            eprintln!("[MockRdmaProvider] {msg}");
+            debug!("[MockRdmaProvider] {msg}");
         }
     }
 
@@ -221,28 +225,35 @@ impl RdmaClientProvider for MockRdmaProvider {
         offset: usize,
     ) -> Result<Vec<u8>, RdmaError> {
         let key = String::from_utf8_lossy(s3_key);
-        let registered = self.registered.lock().unwrap();
-        let entry = registered.get(&(buffer as usize)).ok_or_else(|| {
-            RdmaError::TokenGenerationFailed {
-                key: key.to_string(),
-                reason: format!("buffer {buffer:p} not registered"),
-            }
-        })?;
+        let shm_name = {
+            let registered = self.registered.lock().unwrap();
+            let entry = registered.get(&(buffer as usize)).ok_or_else(|| {
+                RdmaError::TokenGenerationFailed {
+                    key: key.to_string(),
+                    reason: format!("buffer {buffer:p} not registered"),
+                }
+            })?;
 
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                buffer.add(offset),
-                entry.shm_ptr as *mut u8,
-                size,
-            );
-            if libc::msync(entry.shm_ptr, size, libc::MS_SYNC) != 0 {
-                self.dbg(&format!("prepare_put_token: msync failed: {}", std::io::Error::last_os_error()));
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buffer.add(offset),
+                    entry.shm_ptr as *mut u8,
+                    size,
+                );
+                if libc::msync(entry.shm_ptr, size, libc::MS_SYNC) != 0 {
+                    let e = std::io::Error::last_os_error();
+                    return Err(RdmaError::TokenGenerationFailed {
+                        key: key.to_string(),
+                        reason: format!("msync shm={} failed: {e}", entry.name),
+                    });
+                }
             }
-        }
+            entry.name.clone()
+        }; // lock released; string allocation below is outside the critical section
 
-        let token = format!("RDMA_PUT_{}_{}_{}_key_{}", entry.name, size, offset, key)
+        let token = format!("RDMA_PUT_{shm_name}_{size}_{offset}_key_{key}")
             .into_bytes();
-        self.dbg(&format!("prepare_put_token key={key} shm={}", entry.name));
+        self.dbg(&format!("prepare_put_token key={key} shm={shm_name}"));
         Ok(token)
     }
 
@@ -254,17 +265,20 @@ impl RdmaClientProvider for MockRdmaProvider {
         offset: usize,
     ) -> Result<Vec<u8>, RdmaError> {
         let key = String::from_utf8_lossy(s3_key);
-        let registered = self.registered.lock().unwrap();
-        let entry = registered.get(&(buffer as usize)).ok_or_else(|| {
-            RdmaError::TokenGenerationFailed {
-                key: key.to_string(),
-                reason: format!("buffer {buffer:p} not registered"),
-            }
-        })?;
+        let shm_name = {
+            let registered = self.registered.lock().unwrap();
+            let entry = registered.get(&(buffer as usize)).ok_or_else(|| {
+                RdmaError::TokenGenerationFailed {
+                    key: key.to_string(),
+                    reason: format!("buffer {buffer:p} not registered"),
+                }
+            })?;
+            entry.name.clone()
+        }; // lock released; string allocation below is outside the critical section
 
-        let token = format!("RDMA_GET_{}_{}_{}_key_{}", entry.name, size, offset, key)
+        let token = format!("RDMA_GET_{shm_name}_{size}_{offset}_key_{key}")
             .into_bytes();
-        self.dbg(&format!("prepare_get_token key={key} shm={}", entry.name));
+        self.dbg(&format!("prepare_get_token key={key} shm={shm_name}"));
         Ok(token)
     }
 
@@ -277,25 +291,21 @@ impl RdmaClientProvider for MockRdmaProvider {
     ) -> Result<(), RdmaError> {
         self.dbg(&format!("process_rdma_reply status={rdma_status} transferred={transferred}"));
 
-        if rdma_status == 0 || !(200..300).contains(&rdma_status) {
-            let error_code = if rdma_status == 0 { -1i32 } else { rdma_status as i32 };
+        let error_code = rdma_status_to_error_code(rdma_status);
+        if error_code != 0 {
             callback(RdmaCompletionResult { error_code, reply_token: vec![] });
             return Ok(());
         }
 
-        let token_str = match std::str::from_utf8(request_token) {
-            Ok(s) => s,
-            Err(_) => {
+        let (op, shm_name, _size, token_offset) = match Self::parse_token(request_token) {
+            Ok(t) => t,
+            Err(e) => {
                 callback(RdmaCompletionResult { error_code: -1, reply_token: vec![] });
-                return Err(RdmaError::ReplyTokenProcessingFailed("token is not valid UTF-8".into()));
+                return Err(e);
             }
         };
-        let parts: Vec<&str> = token_str.splitn(7, '_').collect();
-        let entry_to_drop: Option<ShmEntry> = if parts.len() >= 5 && parts[0] == "RDMA" {
-            let op = parts[1];
-            let shm_name = parts[2];
-            let token_offset: usize = parts[4].parse().unwrap_or(0);
 
+        let entry_to_drop: Option<ShmEntry> = {
             let mut registered = self.registered.lock().unwrap();
             let found_ptr = registered.iter()
                 .find(|(_, e)| e.name == shm_name)
@@ -318,8 +328,6 @@ impl RdmaClientProvider for MockRdmaProvider {
                 }
                 Some(entry)
             })
-        } else {
-            None
         };
 
         if let Some(entry) = entry_to_drop {
@@ -332,6 +340,31 @@ impl RdmaClientProvider for MockRdmaProvider {
 
     fn rdma_token_header_name(&self) -> &[u8] { self.token_header.as_bytes() }
     fn rdma_reply_header_name(&self) -> &[u8] { self.reply_header.as_bytes() }
+
+    // ── Telemetry ────────────────────────────────────────────────────────────
+
+    fn supports_telemetry(&self) -> bool { true }
+
+    fn setup_telemetry(&self, config: &TelemetryConfig) -> Result<(), RdmaError> {
+        *self.telem_config.lock().unwrap() = Some(config.clone());
+        if self.debug {
+            let dest = config.log_file.as_deref().unwrap_or("stdout");
+            debug!("[MockRdmaProvider] telemetry: use_otel={} dest={dest} level={:?}", config.use_otel, config.level);
+        }
+        Ok(())
+    }
+
+    fn shutdown_telemetry(&self) -> Result<(), RdmaError> {
+        *self.telem_config.lock().unwrap() = None;
+        Ok(())
+    }
+
+    fn set_telem_level(&self, level: TelemLevel) -> Result<(), RdmaError> {
+        if let Some(ref mut cfg) = *self.telem_config.lock().unwrap() {
+            cfg.level = level;
+        }
+        Ok(())
+    }
 }
 
 impl RdmaServerProvider for MockRdmaProvider {
@@ -472,6 +505,27 @@ impl RdmaServerProvider for MockRdmaProvider {
             .map_err(|e| RdmaError::TransferFailed(format!("write {path}: {e}")))?;
 
         Ok(write_len)
+    }
+
+    // ── Telemetry ────────────────────────────────────────────────────────────
+
+    fn supports_telemetry(&self) -> bool { true }
+
+    fn setup_telemetry(&self, config: &TelemetryConfig) -> Result<(), RdmaError> {
+        *self.telem_config.lock().unwrap() = Some(config.clone());
+        Ok(())
+    }
+
+    fn shutdown_telemetry(&self) -> Result<(), RdmaError> {
+        *self.telem_config.lock().unwrap() = None;
+        Ok(())
+    }
+
+    fn set_telem_level(&self, level: TelemLevel) -> Result<(), RdmaError> {
+        if let Some(ref mut cfg) = *self.telem_config.lock().unwrap() {
+            cfg.level = level;
+        }
+        Ok(())
     }
 }
 

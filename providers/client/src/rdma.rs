@@ -5,12 +5,14 @@ use std::ffi::c_void;
 use std::os::raw::c_char;
 use std::sync::{Mutex, OnceLock};
 
+use tracing::error;
+
 use cuobj::client::RegisteredBuffer;
 use cuobj::{CuObjClient, CuObjClientError, CuObjRdmaToken};
-use s3_rdma::ffi::{ByteCursor, RdmaCompletionFn, RdmaProviderVtable};
+use s3_rdma::ffi::{ByteCursor, CTelemetryConfig, RdmaCompletionFn, RdmaProviderVtable};
 use s3_rdma::provider::{RDMA_BYTES_HEADER, RDMA_REPLY_HEADER, RDMA_TOKEN_HEADER};
 
-static PROVIDER_NAME: &[u8] = b"s3-rdma-plugin\0";
+static PROVIDER_NAME: &[u8] = b"s3-rdma\0";
 
 /// Keeps an RDMA-registered buffer and its outstanding descriptor token alive
 /// for the duration of one RDMA transfer.
@@ -45,7 +47,7 @@ fn get_provider() -> Option<&'static CuObjSdkClient> {
                 pending: Mutex::new(HashMap::new()),
             })),
             Err(e) => {
-                eprintln!("[s3-rdma-plugin] CuObjClient::new failed: {e:?}");
+                error!("[s3-rdma] CuObjClient::new failed: {e:?}");
                 None
             }
         }
@@ -134,8 +136,10 @@ unsafe extern "C" fn c_get_max_transfer_size(
     _: *mut c_void, ptr: *const c_void,
 ) -> usize {
     let Some(p) = get_provider() else { return usize::MAX; };
-    let v = p.client.max_transfer_size(ptr as *const u8);
-    if v == 0 { usize::MAX } else { v }
+    match p.client.max_transfer_size(ptr as *const u8) {
+        None | Some(0) => usize::MAX,
+        Some(n) => n,
+    }
 }
 
 unsafe extern "C" fn c_prepare_put_token(
@@ -157,7 +161,7 @@ unsafe extern "C" fn c_prepare_put_token(
         }
         Err(e) => {
             let key = unsafe { (*s3_key).as_slice() };
-            eprintln!("[s3-rdma-plugin] prepare_put_token({}): {e:?}",
+            error!("[s3-rdma] prepare_put_token({}): {e:?}",
                       String::from_utf8_lossy(key));
             -1
         }
@@ -183,7 +187,7 @@ unsafe extern "C" fn c_prepare_get_token(
         }
         Err(e) => {
             let key = unsafe { (*s3_key).as_slice() };
-            eprintln!("[s3-rdma-plugin] prepare_get_token({}): {e:?}",
+            error!("[s3-rdma] prepare_get_token({}): {e:?}",
                       String::from_utf8_lossy(key));
             -1
         }
@@ -228,6 +232,42 @@ unsafe extern "C" fn c_rdma_bytes_header_name(_: *mut c_void) -> ByteCursor {
     ByteCursor::from_slice(RDMA_BYTES_HEADER.as_bytes())
 }
 
+// ── Telemetry callbacks ──────────────────────────────────────────────────────
+
+unsafe extern "C" fn c_supports_telemetry(_: *mut c_void) -> i32 { 1 }
+
+fn level_to_cuobj_flags(level: u32) -> u32 {
+    match level {
+        0 => 0,
+        1 => 0x0004,                       // CUOBJ_LOG_PATH_ERROR
+        2 => 0x0005,                       // CUOBJ_LOG_PATH_ERROR | CUOBJ_LOG_PATH_INFO
+        _ => 0x0007,                       // all three
+    }
+}
+
+unsafe extern "C" fn c_setup_telemetry(_: *mut c_void, cfg: *const CTelemetryConfig) -> i32 {
+    if cfg.is_null() { return -1; }
+    let c = unsafe { &*cfg };
+    let log_file = if c.log_file.is_null() {
+        None
+    } else {
+        Some(unsafe { std::ffi::CStr::from_ptr(c.log_file) }.to_string_lossy())
+    };
+    CuObjClient::setup_telemetry(c.use_otel != 0, log_file.as_deref());
+    CuObjClient::set_telem_flags(level_to_cuobj_flags(c.level));
+    0
+}
+
+unsafe extern "C" fn c_shutdown_telemetry(_: *mut c_void) -> i32 {
+    CuObjClient::shutdown_telemetry();
+    0
+}
+
+unsafe extern "C" fn c_set_telem_level(_: *mut c_void, level: u32) -> i32 {
+    CuObjClient::set_telem_flags(level_to_cuobj_flags(level));
+    0
+}
+
 static VTABLE: RdmaProviderVtable = RdmaProviderVtable {
     provider_name:          PROVIDER_NAME.as_ptr() as *const c_char,
     provider_version:       1,
@@ -243,6 +283,10 @@ static VTABLE: RdmaProviderVtable = RdmaProviderVtable {
     rdma_token_header_name: Some(c_rdma_token_header_name),
     rdma_reply_header_name: Some(c_rdma_reply_header_name),
     rdma_bytes_header_name: Some(c_rdma_bytes_header_name),
+    supports_telemetry:    Some(c_supports_telemetry),
+    setup_telemetry:       Some(c_setup_telemetry),
+    shutdown_telemetry:    Some(c_shutdown_telemetry),
+    set_telem_level:       Some(c_set_telem_level),
 };
 
 pub fn vtable() -> *const RdmaProviderVtable {

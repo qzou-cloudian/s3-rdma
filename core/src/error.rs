@@ -14,7 +14,7 @@ pub enum RdmaError {
     /// Reply token processing failed.
     ReplyTokenProcessingFailed(String),
     /// RDMA plugin failed to load or connect.
-    PluginLoadFailed(String),
+    RdmaPluginLoadFailed(String),
     /// Requested provider is unknown or could not be initialised.
     ProviderUnavailable { provider: String, reason: String },
     /// RDMA data transfer failed (server side).
@@ -28,6 +28,8 @@ pub enum RdmaError {
     /// The called method is not supported by this provider in its current role
     /// (e.g. calling `handle_put` on a client-only provider).
     OperationNotSupported(String),
+    /// Telemetry operation failed.
+    TelemetryError(String),
 }
 
 impl RdmaError {
@@ -42,9 +44,10 @@ impl RdmaError {
             self,
             RdmaError::MemoryNotSuitable { .. }
                 | RdmaError::TokenGenerationFailed { .. }
-                | RdmaError::PluginLoadFailed(_)
+                | RdmaError::RdmaPluginLoadFailed(_)
                 | RdmaError::ProviderUnavailable { .. }
                 | RdmaError::BufferTooSmall { .. }
+                | RdmaError::TelemetryError(_)
         )
     }
 }
@@ -67,7 +70,7 @@ impl fmt::Display for RdmaError {
             RdmaError::ReplyTokenProcessingFailed(msg) => {
                 write!(f, "Failed to process RDMA reply token: {msg}")
             }
-            RdmaError::PluginLoadFailed(msg) => {
+            RdmaError::RdmaPluginLoadFailed(msg) => {
                 write!(f, "RDMA plugin load failed: {msg}")
             }
             RdmaError::ProviderUnavailable { provider, reason } => {
@@ -84,6 +87,7 @@ impl fmt::Display for RdmaError {
             }
             RdmaError::Io(e) => write!(f, "I/O error: {e}"),
             RdmaError::OperationNotSupported(msg) => write!(f, "Operation not supported: {msg}"),
+            RdmaError::TelemetryError(msg) => write!(f, "Telemetry error: {msg}"),
         }
     }
 }

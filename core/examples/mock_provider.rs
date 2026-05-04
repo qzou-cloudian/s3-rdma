@@ -3,7 +3,7 @@
 //! Run with:
 //!   cargo run --example mock_provider --manifest-path s3-rdma/Cargo.toml
 
-use s3_rdma::{rdma_provider_info, MockRdmaProvider, RdmaClientProvider, RdmaProvider};
+use s3_rdma::{rdma_provider_info, MockRdmaProvider, RdmaClientProvider};
 
 fn main() {
     println!("=== s3-rdma Rust example ===\n");

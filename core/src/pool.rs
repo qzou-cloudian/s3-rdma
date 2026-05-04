@@ -114,10 +114,6 @@ impl crate::provider::RdmaClientProvider for ProviderClientBridge {
     }
 }
 
-// SAFETY: the inner Arc<dyn RdmaProvider> is Send + Sync.
-unsafe impl Send for ProviderClientBridge {}
-unsafe impl Sync for ProviderClientBridge {}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // BufferPool
 // ─────────────────────────────────────────────────────────────────────────────
@@ -179,19 +175,16 @@ impl BufferPool {
     ) -> Option<OwnedBufferGuard> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            if let Ok(permit) = self.sem.try_acquire() {
-                permit.forget();
-                return Some(self.pop_slot());
+            if let Some(g) = self.try_acquire_owned() {
+                return Some(g);
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 return None;
             }
             let lock = self.parking_mu.lock().unwrap();
-            if let Ok(permit) = self.sem.try_acquire() {
-                drop(lock);
-                permit.forget();
-                return Some(self.pop_slot());
+            if let Some(g) = self.try_acquire_owned() {
+                return Some(g);
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
@@ -200,11 +193,7 @@ impl BufferPool {
             let (g, timed_out) = self.parking_cv.wait_timeout(lock, remaining).unwrap();
             drop(g);
             if timed_out.timed_out() {
-                if let Ok(permit) = self.sem.try_acquire() {
-                    permit.forget();
-                    return Some(self.pop_slot());
-                }
-                return None;
+                return self.try_acquire_owned();
             }
         }
     }
@@ -222,15 +211,12 @@ impl BufferPool {
     /// contexts; call this from `spawn_blocking` if needed.
     pub fn acquire_owned_blocking(self: &Arc<Self>) -> OwnedBufferGuard {
         loop {
-            if let Ok(permit) = self.sem.try_acquire() {
-                permit.forget();
-                return self.pop_slot();
+            if let Some(g) = self.try_acquire_owned() {
+                return g;
             }
             let lock = self.parking_mu.lock().unwrap();
-            if let Ok(permit) = self.sem.try_acquire() {
-                drop(lock);
-                permit.forget();
-                return self.pop_slot();
+            if let Some(g) = self.try_acquire_owned() {
+                return g;
             }
             drop(self.parking_cv.wait(lock).unwrap());
         }

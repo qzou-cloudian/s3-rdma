@@ -8,10 +8,13 @@ use std::ffi::{c_void, CStr};
 use std::os::raw::c_char;
 use std::sync::{Arc, OnceLock};
 
-use cuobj::server::CuObjServer;
-use s3_rdma::ffi::{ByteCursor, RdmaServerInitParams, RdmaServerVtable};
+use tracing::{error, info, warn};
 
-static PROVIDER_NAME: &[u8] = b"s3-rdma-plugin-server\0";
+use cuobj::server::CuObjServer;
+use s3_rdma::ffi::{ByteCursor, CTelemetryConfig, RdmaServerInitParams, RdmaServerVtable};
+use s3_rdma::provider::DEFAULT_RDMA_BUF_SIZE;
+
+static PROVIDER_NAME: &[u8] = b"s3-rdma-server\0";
 
 struct ServerProvider {
     server:   Arc<CuObjServer>,
@@ -29,19 +32,19 @@ fn get_provider() -> Option<&'static ServerProvider> {
 
 unsafe extern "C" fn c_init(params: *const RdmaServerInitParams, _ctx: *mut *mut c_void) -> i32 {
     if params.is_null() {
-        eprintln!("[s3-rdma-plugin-server] c_init: null params");
+        error!("[s3-rdma-server] c_init: null params");
         return -1;
     }
     let p = unsafe { &*params };
 
     let addr = if p.listen_addr.is_null() {
-        eprintln!("[s3-rdma-plugin-server] c_init: null listen_addr");
+        error!("[s3-rdma-server] c_init: null listen_addr");
         return -1;
     } else {
         match unsafe { CStr::from_ptr(p.listen_addr) }.to_str() {
             Ok(s)  => s.to_owned(),
             Err(e) => {
-                eprintln!("[s3-rdma-plugin-server] c_init: invalid listen_addr: {e}");
+                error!("[s3-rdma-server] c_init: invalid listen_addr: {e}");
                 return -1;
             }
         }
@@ -50,20 +53,20 @@ unsafe extern "C" fn c_init(params: *const RdmaServerInitParams, _ctx: *mut *mut
     let srv = match CuObjServer::new(&addr, p.listen_port) {
         Ok(s)  => Arc::new(s),
         Err(e) => {
-            eprintln!("[s3-rdma-plugin-server] CuObjServer::new({addr}:{}) failed: {e:?}", p.listen_port);
+            error!("[s3-rdma-server] CuObjServer::new({addr}:{}) failed: {e:?}", p.listen_port);
             return -1;
         }
     };
 
-    let buf_size = if p.buf_size > 0 { p.buf_size } else { 128 * 1024 * 1024 };
-    eprintln!(
-        "[s3-rdma-plugin-server] listening {addr}:{port}, buf={mb}MiB",
+    let buf_size = if p.buf_size > 0 { p.buf_size } else { DEFAULT_RDMA_BUF_SIZE };
+    info!(
+        "[s3-rdma-server] listening {addr}:{port}, buf={mb}MiB",
         port = p.listen_port,
         mb   = buf_size / (1024 * 1024),
     );
 
     if PROVIDER.set(Some(Box::new(ServerProvider { server: srv, buf_size }))).is_err() {
-        eprintln!("[s3-rdma-plugin-server] c_init: called more than once");
+        error!("[s3-rdma-server] c_init: called more than once");
         return -1;
     }
     0
@@ -96,14 +99,14 @@ unsafe extern "C" fn c_handle_put(
     let channel = match p.server.alloc_channel() {
         Ok(ch) => ch,
         Err(e) => {
-            eprintln!("[s3-rdma-plugin-server] handle_put({key_str}): alloc_channel: {e}");
+            error!("[s3-rdma-server] handle_put({key_str}): alloc_channel: {e}");
             return -1;
         }
     };
     let rdma_buf = match p.server.alloc_buffer(p.buf_size) {
         Ok(b)  => b,
         Err(e) => {
-            eprintln!("[s3-rdma-plugin-server] handle_put({key_str}): alloc buffer: {e}");
+            error!("[s3-rdma-server] handle_put({key_str}): alloc buffer: {e}");
             return -1;
         }
     };
@@ -119,7 +122,7 @@ unsafe extern "C" fn c_handle_put(
             0
         }
         Err(e) => {
-            eprintln!("[s3-rdma-plugin-server] handle_put({key_str}): {e}");
+            error!("[s3-rdma-server] handle_put({key_str}): {e}");
             -1
         }
     }
@@ -147,22 +150,22 @@ unsafe extern "C" fn c_handle_get(
     let channel = match p.server.alloc_channel() {
         Ok(ch) => ch,
         Err(e) => {
-            eprintln!("[s3-rdma-plugin-server] handle_get({key_str}): alloc_channel: {e}");
+            error!("[s3-rdma-server] handle_get({key_str}): alloc_channel: {e}");
             return -1;
         }
     };
     let rdma_buf = match p.server.alloc_buffer(p.buf_size) {
         Ok(b)  => b,
         Err(e) => {
-            eprintln!("[s3-rdma-plugin-server] handle_get({key_str}): alloc buffer: {e}");
+            error!("[s3-rdma-server] handle_get({key_str}): alloc buffer: {e}");
             return -1;
         }
     };
 
     let n = data_bytes.len().min(rdma_buf.len());
     if data_bytes.len() > rdma_buf.len() {
-        eprintln!(
-            "[s3-rdma-plugin-server] handle_get({key_str}): data ({}) > rdma_buf ({}), truncating",
+        warn!(
+            "[s3-rdma-server] handle_get({key_str}): data ({}) > rdma_buf ({}), truncating",
             data_bytes.len(), rdma_buf.len()
         );
     }
@@ -176,10 +179,46 @@ unsafe extern "C" fn c_handle_get(
             0
         }
         Err(e) => {
-            eprintln!("[s3-rdma-plugin-server] handle_get({key_str}): {e}");
+            error!("[s3-rdma-server] handle_get({key_str}): {e}");
             -1
         }
     }
+}
+
+// ── Telemetry callbacks ──────────────────────────────────────────────────────
+
+fn level_to_cuobj_flags(level: u32) -> u32 {
+    match level {
+        0 => 0,
+        1 => 0x0004,                       // CUOBJ_LOG_PATH_ERROR
+        2 => 0x0005,                       // CUOBJ_LOG_PATH_ERROR | CUOBJ_LOG_PATH_INFO
+        _ => 0x0007,                       // all three
+    }
+}
+
+unsafe extern "C" fn c_supports_telemetry(_: *mut c_void) -> i32 { 1 }
+
+unsafe extern "C" fn c_setup_telemetry(_: *mut c_void, cfg: *const CTelemetryConfig) -> i32 {
+    if cfg.is_null() { return -1; }
+    let c = unsafe { &*cfg };
+    let log_file = if c.log_file.is_null() {
+        None
+    } else {
+        Some(unsafe { std::ffi::CStr::from_ptr(c.log_file) }.to_string_lossy())
+    };
+    CuObjServer::setup_telemetry(c.use_otel != 0, log_file.as_deref());
+    CuObjServer::set_telem_flags(level_to_cuobj_flags(c.level));
+    0
+}
+
+unsafe extern "C" fn c_shutdown_telemetry(_: *mut c_void) -> i32 {
+    CuObjServer::shutdown_telemetry();
+    0
+}
+
+unsafe extern "C" fn c_set_telem_level(_: *mut c_void, level: u32) -> i32 {
+    CuObjServer::set_telem_flags(level_to_cuobj_flags(level));
+    0
 }
 
 static VTABLE: RdmaServerVtable = RdmaServerVtable {
@@ -191,6 +230,10 @@ static VTABLE: RdmaServerVtable = RdmaServerVtable {
     handle_get:       Some(c_handle_get),
     handle_put_zc:    None, // zero-copy path lives in hsg-rdma (gateway binary)
     handle_get_zc:    None, // zero-copy path lives in hsg-rdma (gateway binary)
+    supports_telemetry: Some(c_supports_telemetry),
+    setup_telemetry:    Some(c_setup_telemetry),
+    shutdown_telemetry: Some(c_shutdown_telemetry),
+    set_telem_level:    Some(c_set_telem_level),
 };
 
 pub fn vtable() -> *const RdmaServerVtable {
