@@ -303,7 +303,7 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeHandlePut(
         size as usize
     } else {
         // buf_size() returns usize::MAX for mock when unconfigured; cap to avoid OOM.
-        raw_cap.min(DEFAULT_RDMA_BUF_SIZE).max(4096)
+        raw_cap.clamp(4096, DEFAULT_RDMA_BUF_SIZE)
     };
     let mut buf = vec![0u8; buf_cap];
     match ep.handle_put(&key_bytes, &tok_bytes, &mut buf, offset as usize, size as usize) {

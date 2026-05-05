@@ -34,7 +34,7 @@ use std::sync::{Mutex, OnceLock};
 use tracing::debug;
 
 use crate::error::RdmaError;
-use crate::provider::{RdmaCompletionCallback, RdmaCompletionResult, RdmaClientProvider, RdmaServerProvider, RdmaProvider, rdma_status_to_error_code, TelemetryConfig, TelemLevel};
+use crate::provider::{RdmaCompletionCallback, RdmaCompletionResult, RdmaClientProvider, RdmaServerProvider, RdmaProvider, rdma_status_to_error_code, RDMA_REQUIRED_ALIGNMENT, TelemState, TelemetryConfig, TelemLevel};
 
 /// Base directory for shared-memory files.
 const SHM_DIR: &str = "/dev/shm";
@@ -98,7 +98,7 @@ pub struct MockRdmaProvider {
     registered: Mutex<HashMap<usize, ShmEntry>>,
     token_header: &'static str,
     reply_header: &'static str,
-    telem_config: Mutex<Option<TelemetryConfig>>,
+    telem: TelemState,
 }
 
 impl std::fmt::Debug for MockRdmaProvider {
@@ -126,7 +126,7 @@ impl MockRdmaProvider {
             registered: Mutex::new(HashMap::new()),
             token_header: env_header(&TOKEN_HEADER, "CUOBJ_RDMA_TOKEN_HEADER_NAME", "x-amz-rdma-token"),
             reply_header: env_header(&REPLY_HEADER, "CUOBJ_RDMA_REPLY_HEADER_NAME", "x-amz-rdma-reply"),
-            telem_config: Mutex::new(None),
+            telem: TelemState::new(),
         }
     }
 
@@ -151,8 +151,12 @@ impl MockRdmaProvider {
         }
         let op = parts[1];
         let shm_name = parts[2];
-        let size: usize = parts[3].parse().unwrap_or(0);
-        let offset: usize = parts[4].parse().unwrap_or(0);
+        let size: usize = parts[3].parse().map_err(|_| {
+            RdmaError::TransferFailed(format!("invalid size field in mock token: {}", parts[3]))
+        })?;
+        let offset: usize = parts[4].parse().map_err(|_| {
+            RdmaError::TransferFailed(format!("invalid offset field in mock token: {}", parts[4]))
+        })?;
         Ok((op, shm_name, size, offset))
     }
 }
@@ -162,13 +166,20 @@ impl RdmaClientProvider for MockRdmaProvider {
     fn protocol(&self) -> &str { "mock" }
 
     fn is_memory_suitable(&self, ptr: *const u8, size: usize) -> bool {
-        let ok = !ptr.is_null() && size > 0;
+        let ok = !ptr.is_null() && size > 0 && (ptr as usize).is_multiple_of(RDMA_REQUIRED_ALIGNMENT);
         self.dbg(&format!("is_memory_suitable ptr={ptr:p} size={size} -> {ok}"));
         ok
     }
 
     fn register_memory(&self, ptr: *mut u8, size: usize) -> Result<(), RdmaError> {
         self.dbg(&format!("register_memory ptr={ptr:p} size={size}"));
+
+        if !(ptr as usize).is_multiple_of(RDMA_REQUIRED_ALIGNMENT) {
+            return Err(RdmaError::MemoryNotSuitable {
+                ptr: ptr as usize,
+                size,
+            });
+        }
 
         let name = format!("rdma-{}-{:x}", std::process::id(), ptr as usize);
         let path = format!("{}/{name}", self.shm_dir);
@@ -217,6 +228,7 @@ impl RdmaClientProvider for MockRdmaProvider {
         Ok(())
     }
 
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn prepare_put_token(
         &self,
         s3_key: &[u8],
@@ -341,30 +353,21 @@ impl RdmaClientProvider for MockRdmaProvider {
     fn rdma_token_header_name(&self) -> &[u8] { self.token_header.as_bytes() }
     fn rdma_reply_header_name(&self) -> &[u8] { self.reply_header.as_bytes() }
 
-    // ── Telemetry ────────────────────────────────────────────────────────────
+    // ── Telemetry (delegated to TelemState) ──────────────────────────────────
 
-    fn supports_telemetry(&self) -> bool { true }
+    fn supports_telemetry(&self) -> bool { self.telem.supports_telemetry() }
 
     fn setup_telemetry(&self, config: &TelemetryConfig) -> Result<(), RdmaError> {
-        *self.telem_config.lock().unwrap() = Some(config.clone());
         if self.debug {
             let dest = config.log_file.as_deref().unwrap_or("stdout");
             debug!("[MockRdmaProvider] telemetry: use_otel={} dest={dest} level={:?}", config.use_otel, config.level);
         }
-        Ok(())
+        self.telem.setup_telemetry(config)
     }
 
-    fn shutdown_telemetry(&self) -> Result<(), RdmaError> {
-        *self.telem_config.lock().unwrap() = None;
-        Ok(())
-    }
+    fn shutdown_telemetry(&self) -> Result<(), RdmaError> { self.telem.shutdown_telemetry() }
 
-    fn set_telem_level(&self, level: TelemLevel) -> Result<(), RdmaError> {
-        if let Some(ref mut cfg) = *self.telem_config.lock().unwrap() {
-            cfg.level = level;
-        }
-        Ok(())
-    }
+    fn set_telem_level(&self, level: TelemLevel) -> Result<(), RdmaError> { self.telem.set_telem_level(level) }
 }
 
 impl RdmaServerProvider for MockRdmaProvider {
@@ -388,14 +391,21 @@ impl RdmaServerProvider for MockRdmaProvider {
         let path = format!("{}/{shm_name}", self.shm_dir);
         self.dbg(&format!("handle_put shm={shm_name} offset={offset} size={read_size}"));
 
-        let file_bytes = std::fs::read(&path)
-            .map_err(|e| RdmaError::TransferFailed(format!("read {path}: {e}")))?;
+        let mut file = std::fs::File::open(&path)
+            .map_err(|e| RdmaError::TransferFailed(format!("open {path}: {e}")))?;
+        let file_len = file.metadata()
+            .map_err(|e| RdmaError::TransferFailed(format!("metadata {path}: {e}")))?
+            .len() as usize;
 
-        let start = offset.min(file_bytes.len());
-        let end = (offset + read_size).min(file_bytes.len());
-        let slice = &file_bytes[start..end];
-        let n = slice.len().min(buf.len());
-        buf[..n].copy_from_slice(&slice[..n]);
+        use std::io::{Seek, SeekFrom, Read};
+        let start = offset.min(file_len);
+        let end = (offset + read_size).min(file_len);
+        let want = end.saturating_sub(start);
+        let n = want.min(buf.len());
+        file.seek(SeekFrom::Start(start as u64))
+            .map_err(|e| RdmaError::TransferFailed(format!("seek {path}: {e}")))?;
+        file.read_exact(&mut buf[..n])
+            .map_err(|e| RdmaError::TransferFailed(format!("read {path}: {e}")))?;
         Ok(n)
     }
 
@@ -449,14 +459,24 @@ impl RdmaServerProvider for MockRdmaProvider {
         let path = format!("{}/{shm_name}", self.shm_dir);
         self.dbg(&format!("handle_put_zc shm={shm_name} offset={offset} size={read_size}"));
 
-        let file_bytes = std::fs::read(&path)
+        let mut file = std::fs::File::open(&path)
+            .map_err(|e| RdmaError::TransferFailed(format!("open {path}: {e}")))?;
+        let file_len = file.metadata()
+            .map_err(|e| RdmaError::TransferFailed(format!("metadata {path}: {e}")))?
+            .len() as usize;
+
+        use std::io::{Seek, SeekFrom, Read};
+        let start = offset.min(file_len);
+        let end = (offset + read_size).min(file_len);
+        let want = end.saturating_sub(start);
+        let mut buf = vec![0u8; want];
+        file.seek(SeekFrom::Start(start as u64))
+            .map_err(|e| RdmaError::TransferFailed(format!("seek {path}: {e}")))?;
+        file.read_exact(&mut buf)
             .map_err(|e| RdmaError::TransferFailed(format!("read {path}: {e}")))?;
-        let start = offset.min(file_bytes.len());
-        let end = (offset + read_size).min(file_bytes.len());
-        let slice = &file_bytes[start..end];
 
         let n = unsafe {
-            write_fn(write_fn_data, slice.as_ptr() as *const std::ffi::c_void, slice.len())
+            write_fn(write_fn_data, buf.as_ptr() as *const std::ffi::c_void, buf.len())
         };
         if n < 0 {
             return Err(RdmaError::TransferFailed(format!("write_fn returned {n}")));
@@ -507,26 +527,17 @@ impl RdmaServerProvider for MockRdmaProvider {
         Ok(write_len)
     }
 
-    // ── Telemetry ────────────────────────────────────────────────────────────
+    // ── Telemetry (delegated to TelemState) ──────────────────────────────────
 
-    fn supports_telemetry(&self) -> bool { true }
+    fn supports_telemetry(&self) -> bool { self.telem.supports_telemetry() }
 
     fn setup_telemetry(&self, config: &TelemetryConfig) -> Result<(), RdmaError> {
-        *self.telem_config.lock().unwrap() = Some(config.clone());
-        Ok(())
+        self.telem.setup_telemetry(config)
     }
 
-    fn shutdown_telemetry(&self) -> Result<(), RdmaError> {
-        *self.telem_config.lock().unwrap() = None;
-        Ok(())
-    }
+    fn shutdown_telemetry(&self) -> Result<(), RdmaError> { self.telem.shutdown_telemetry() }
 
-    fn set_telem_level(&self, level: TelemLevel) -> Result<(), RdmaError> {
-        if let Some(ref mut cfg) = *self.telem_config.lock().unwrap() {
-            cfg.level = level;
-        }
-        Ok(())
-    }
+    fn set_telem_level(&self, level: TelemLevel) -> Result<(), RdmaError> { self.telem.set_telem_level(level) }
 }
 
 impl RdmaProvider for MockRdmaProvider {

@@ -58,6 +58,14 @@ pub const RDMA_BYTES_HEADER: &str = "x-amz-rdma-bytes";
 /// allocation cap in binding-layer `handle_put` helpers.
 pub const DEFAULT_RDMA_BUF_SIZE: usize = 128 * 1024 * 1024;
 
+/// Required alignment for RDMA-registered buffers: 4 KiB.
+///
+/// All buffers passed to [`RdmaClientProvider::register_memory`] must be
+/// aligned to this boundary.  Registered buffers are **pinned** (locked in
+/// physical memory — not swappable or migratable) for the duration of
+/// registration so the RDMA NIC can DMA to/from them without page faults.
+pub const RDMA_REQUIRED_ALIGNMENT: usize = 4096;
+
 /// Header that signals HTTP/2 streaming token mode.
 ///
 /// When present with value `"true"`, the PUT request body contains
@@ -194,11 +202,24 @@ pub enum RdmaRole {
 /// so implementors only override what they actually support.
 pub trait RdmaClientProvider: Send + Sync {
     /// Returns `true` if the memory at `ptr..ptr+size` is eligible for RDMA.
+    ///
+    /// Implementors should check that `ptr` is non-null, aligned to
+    /// [`RDMA_REQUIRED_ALIGNMENT`], and backed by pinnable memory (not
+    /// garbage-collected or JIT-compiled pages).
     fn is_memory_suitable(&self, _ptr: *const u8, _size: usize) -> bool {
         false
     }
 
     /// Register a memory region so the RDMA subsystem can access it.
+    ///
+    /// The registered buffer is **pinned** — the OS must not swap, migrate, or
+    /// move the physical pages for the duration of registration.  The provider
+    /// locks the pages (e.g. via `mlock` or IOMMU pinning) so the RDMA NIC can
+    /// perform DMA to/from them without page faults.
+    ///
+    /// **Alignment:** `ptr` must be aligned to [`RDMA_REQUIRED_ALIGNMENT`]
+    /// (4 KiB).  Implementors should return [`RdmaError::MemoryNotSuitable`]
+    /// for unaligned pointers.
     ///
     /// # Safety
     /// `ptr` must remain valid until [`deregister_memory`](Self::deregister_memory).
@@ -456,8 +477,8 @@ pub trait RdmaServerProvider: Send + Sync {
 /// Combined RDMA provider: supports both client and server roles.
 ///
 /// This is the trait implemented by concrete providers such as
-/// [`MockRdmaProvider`](crate::mock::MockRdmaProvider) and
-/// [`CuObjProvider`](crate::cuobj_client::CuObjProvider).  It extends both
+/// [`MockRdmaProvider`](crate::mock::MockRdmaProvider) and the
+/// [`RdmaPlugin`] (which wraps the cuObj plugin at runtime).  It extends both
 /// [`RdmaClientProvider`] and [`RdmaServerProvider`] and adds role query methods.
 ///
 /// ## Choosing the right trait
@@ -472,14 +493,66 @@ pub trait RdmaServerProvider: Send + Sync {
 ///
 /// - [`MockRdmaProvider`](crate::mock::MockRdmaProvider) – `/dev/shm`-backed,
 ///   same-host only; supports both roles.
-/// - [`CuObjProvider`](crate::cuobj_client::CuObjProvider) – real NVIDIA cuObject;
-///   each role requires the corresponding plugin at runtime.
+/// - [`RdmaPlugin`] – loads `libs3rdmaclient.so` / `libs3rdmaserver.so` at
+///   runtime for real NVIDIA cuObject RDMA hardware.
 pub trait RdmaProvider: RdmaClientProvider + RdmaServerProvider {
     /// Returns `true` if this provider supports client-side operations.
     fn supports_client(&self) -> bool;
 
     /// Returns `true` if this provider supports server-side operations.
     fn supports_server(&self) -> bool;
+}
+
+// ── TelemState ────────────────────────────────────────────────────────────────
+
+/// Shared telemetry state for provider implementors.
+///
+/// Wraps an `Option<TelemetryConfig>` behind a mutex and provides the four
+/// telemetry methods.  Implementors of [`RdmaClientProvider`] and
+/// [`RdmaServerProvider`] can delegate their telemetry methods to a single
+/// `TelemState` instance to avoid duplicating the four method bodies for each
+/// trait.
+///
+/// Both traits define identically-named telemetry methods.  When calling
+/// telemetry methods through `Arc<dyn RdmaProvider>`, disambiguate with UFCS:
+/// `RdmaClientProvider::supports_telemetry(&*provider)`.
+pub struct TelemState {
+    cfg: std::sync::Mutex<Option<TelemetryConfig>>,
+}
+
+impl TelemState {
+    pub const fn new() -> Self {
+        Self { cfg: std::sync::Mutex::new(None) }
+    }
+
+    pub fn supports_telemetry(&self) -> bool { true }
+
+    pub fn setup_telemetry(&self, config: &TelemetryConfig) -> Result<(), crate::RdmaError> {
+        *self.cfg.lock().unwrap() = Some(config.clone());
+        Ok(())
+    }
+
+    pub fn shutdown_telemetry(&self) -> Result<(), crate::RdmaError> {
+        *self.cfg.lock().unwrap() = None;
+        Ok(())
+    }
+
+    pub fn set_telem_level(&self, level: TelemLevel) -> Result<(), crate::RdmaError> {
+        if let Some(ref mut cfg) = *self.cfg.lock().unwrap() {
+            cfg.level = level;
+        }
+        Ok(())
+    }
+}
+
+impl Default for TelemState {
+    fn default() -> Self { Self::new() }
+}
+
+impl std::fmt::Debug for TelemState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelemState").finish()
+    }
 }
 
 // ── RdmaProviderConfig ────────────────────────────────────────────────────────

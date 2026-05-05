@@ -1,4 +1,5 @@
-//! Generic RDMA engine: fixed-size worker pool wrapping any [`RdmaProvider`].
+//! Generic RDMA engine: fixed-size worker pool wrapping any
+//! [`RdmaProvider`](crate::provider::RdmaProvider).
 //!
 //! [`RdmaEngine`] dispatches all server-side operations (`handle_put`,
 //! `handle_get`, and their zero-copy variants) to a bounded pool of worker
@@ -41,9 +42,6 @@ enum WorkItem {
     Put {
         key:       Vec<u8>,
         token:     Vec<u8>,
-        /// Raw pointer to the caller's output buffer (`&mut [u8]`).
-        /// Safe because the caller blocks on `result_rx` until the worker
-        /// is done — the buffer is valid for the entire worker execution.
         buf_ptr:   usize,
         buf_len:   usize,
         offset:    usize,
@@ -52,8 +50,6 @@ enum WorkItem {
     },
     Get {
         key:       Vec<u8>,
-        /// Raw pointer to the caller's `data: &[u8]`.  Same lifetime
-        /// argument as `buf_ptr` above.
         data_ptr:  usize,
         data_len:  usize,
         token:     Vec<u8>,
@@ -190,7 +186,6 @@ impl RdmaEngine {
 
 impl Drop for RdmaEngine {
     fn drop(&mut self) {
-        // Close channel; workers break out of their recv loop.
         drop(self.sender.take());
         for h in self.workers.drain(..) {
             let _ = h.join();
@@ -371,13 +366,11 @@ mod tests {
 
     #[test]
     fn drop_joins_workers() {
-        // Just confirm Drop does not hang.
         drop(mock_engine(4));
     }
 
     #[test]
     fn worker_count_clamped_to_one() {
-        // count=0 should not panic.
         drop(mock_engine(0));
     }
 }

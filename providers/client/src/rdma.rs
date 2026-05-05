@@ -10,7 +10,7 @@ use tracing::error;
 use cuobj::client::RegisteredBuffer;
 use cuobj::{CuObjClient, CuObjClientError, CuObjRdmaToken};
 use s3_rdma::ffi::{ByteCursor, CTelemetryConfig, RdmaCompletionFn, RdmaProviderVtable};
-use s3_rdma::provider::{RDMA_BYTES_HEADER, RDMA_REPLY_HEADER, RDMA_TOKEN_HEADER};
+use s3_rdma::provider::{RDMA_BYTES_HEADER, RDMA_REPLY_HEADER, RDMA_REQUIRED_ALIGNMENT, RDMA_TOKEN_HEADER};
 
 static PROVIDER_NAME: &[u8] = b"s3-rdma\0";
 
@@ -42,10 +42,16 @@ fn get_provider() -> Option<&'static CuObjSdkClient> {
     static INSTANCE: OnceLock<Option<Box<CuObjSdkClient>>> = OnceLock::new();
     INSTANCE.get_or_init(|| {
         match CuObjClient::new() {
-            Ok(client) => Some(Box::new(CuObjSdkClient {
-                client,
-                pending: Mutex::new(HashMap::new()),
-            })),
+            Ok(client) => {
+                if !client.is_connected() {
+                    error!("[s3-rdma] CuObjClient created but not connected to RDMA fabric");
+                    return None;
+                }
+                Some(Box::new(CuObjSdkClient {
+                    client,
+                    pending: Mutex::new(HashMap::new()),
+                }))
+            }
             Err(e) => {
                 error!("[s3-rdma] CuObjClient::new failed: {e:?}");
                 None
@@ -68,6 +74,15 @@ fn do_prepare_put(
     // *const to *mut is safe — the buffer is writable; we just expose it
     // as const to signal that the provider won't modify it.
     let mptr = ptr as *mut u8;
+    if (mptr as usize) % RDMA_REQUIRED_ALIGNMENT != 0 {
+        return Err(CuObjClientError::RegistrationFailed {
+            ptr: mptr as usize,
+            size,
+            reason: format!(
+                "buffer not {RDMA_REQUIRED_ALIGNMENT}-byte aligned: {ptr:p}"
+            ),
+        });
+    }
     let buf: RegisteredBuffer<'static> = match provider.client.register_raii(mptr, size) {
         Ok(buf) => buf,
         Err(CuObjClientError::AlreadyRegistered { .. }) => {
@@ -102,6 +117,15 @@ fn do_prepare_get(
     size:     usize,
     offset:   usize,
 ) -> Result<Vec<u8>, CuObjClientError> {
+    if !(ptr as usize).is_multiple_of(RDMA_REQUIRED_ALIGNMENT) {
+        return Err(CuObjClientError::RegistrationFailed {
+            ptr: ptr as usize,
+            size,
+            reason: format!(
+                "buffer not {RDMA_REQUIRED_ALIGNMENT}-byte aligned: {ptr:p}"
+            ),
+        });
+    }
     let buf: RegisteredBuffer<'static> =
         provider.client.register_raii(ptr, size)?;
     let token = buf.get_token(offset, size)?;
@@ -117,8 +141,10 @@ unsafe extern "C" fn c_init(_: *mut c_void, _: *mut *mut c_void) -> i32 {
 unsafe extern "C" fn c_cleanup(_: *mut c_void) {}
 
 unsafe extern "C" fn c_is_memory_suitable(
-    _: *mut c_void, ptr: *const c_void, _size: usize,
+    _: *mut c_void, ptr: *const c_void, size: usize,
 ) -> bool {
+    if ptr.is_null() || size == 0 { return false; }
+    if !(ptr as usize).is_multiple_of(RDMA_REQUIRED_ALIGNMENT) { return false; }
     CuObjClient::is_rdma_suitable(ptr as *const u8)
 }
 

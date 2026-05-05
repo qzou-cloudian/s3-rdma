@@ -39,7 +39,7 @@ use crossbeam_queue::ArrayQueue;
 use tokio::sync::Semaphore;
 
 use crate::error::RdmaError;
-use crate::provider::{RdmaClientProvider, RdmaProvider};
+use crate::provider::{RDMA_REQUIRED_ALIGNMENT, RdmaClientProvider, RdmaProvider};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error type
@@ -77,9 +77,6 @@ impl std::error::Error for BufferPoolError {
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal slot
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Alignment required for RDMA: 4 KiB.
-const RDMA_ALIGN: usize = 4096;
 
 struct Slot {
     ptr:    *mut u8,
@@ -399,10 +396,10 @@ impl BufferPoolBuilder {
         let free_queue = ArrayQueue::new(self.count);
 
         for i in 0..self.count {
-            let layout = Layout::from_size_align(self.size, RDMA_ALIGN).map_err(|_| {
+            let layout = Layout::from_size_align(self.size, RDMA_REQUIRED_ALIGNMENT).map_err(|_| {
                 BufferPoolError::ConstructionFailed {
                     slot: i,
-                    reason: format!("invalid layout: size={}, align={RDMA_ALIGN}", self.size),
+                    reason: format!("invalid layout: size={}, align={RDMA_REQUIRED_ALIGNMENT}", self.size),
                 }
             })?;
             let ptr = unsafe { alloc(layout) };
@@ -475,7 +472,7 @@ mod tests {
         let mut guards = Vec::new();
         for _ in 0..4 {
             let g = pool.try_acquire_owned().unwrap();
-            assert_eq!(g.as_ptr() as usize % RDMA_ALIGN, 0, "slot not 4 KiB aligned");
+            assert_eq!(g.as_ptr() as usize % RDMA_REQUIRED_ALIGNMENT, 0, "slot not 4 KiB aligned");
             guards.push(g);
         }
     }

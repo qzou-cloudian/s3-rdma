@@ -95,6 +95,14 @@ unsafe extern "C" fn c_prepare_get_token(
     }
 }
 
+/// Process a reply token for cleanup.
+///
+/// The mock provider handles cleanup in its own `process_rdma_reply` method on
+/// the Rust trait path.  This vtable entry exists for C-ABI callers that go
+/// through the plugin layer (where `RdmaPluginClient` passes `callback=None`
+/// and handles the status itself).  For direct vtable callers, we fire the
+/// callback with success — the caller is responsible for translating the HTTP
+/// status before calling here.
 unsafe extern "C" fn c_process_reply_token(
     _: *mut c_void,
     reply:     *const ByteCursor,
@@ -102,27 +110,12 @@ unsafe extern "C" fn c_process_reply_token(
     callback:  Option<RdmaCompletionFn>,
 ) -> i32 {
     if reply.is_null() { return -1; }
-    let reply_bytes = unsafe { (*reply).as_slice() };
-    let rdma_status: u16 = 200;
-    // Cast to usize so the closure is Send: the pointer address is captured as
-    // a plain integer. SAFETY: this fn is `unsafe extern "C"` — the caller
-    // guarantees the pointer remains valid and race-free for the callback.
-    let user_data_addr = user_data as usize;
-    let result = get_provider().process_rdma_reply(
-        rdma_status,
-        reply_bytes,
-        0,
-        Box::new(move |r| {
-            if let Some(f) = callback {
-                let cursor = ByteCursor::from_slice(&r.reply_token);
-                unsafe { f(user_data_addr as *mut c_void, r.error_code, &cursor); }
-            }
-        }),
-    );
-    match result {
-        Ok(()) => 0,
-        Err(e) => { error!("[s3-rdma-mock] process_reply_token: {e}"); -1 }
+    if let Some(f) = callback {
+        let reply_bytes = unsafe { (*reply).as_slice() };
+        let cursor = ByteCursor::from_slice(reply_bytes);
+        unsafe { f(user_data, 0, &cursor); }
     }
+    0
 }
 
 unsafe extern "C" fn c_rdma_token_header_name(_: *mut c_void) -> ByteCursor {

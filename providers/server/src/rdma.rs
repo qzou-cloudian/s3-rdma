@@ -51,7 +51,16 @@ unsafe extern "C" fn c_init(params: *const RdmaServerInitParams, _ctx: *mut *mut
     };
 
     let srv = match CuObjServer::new(&addr, p.listen_port) {
-        Ok(s)  => Arc::new(s),
+        Ok(s)  => {
+            if !s.is_connected() {
+                error!(
+                    "[s3-rdma-server] CuObjServer created but not connected to RDMA fabric \
+                     at {addr}:{}", p.listen_port
+                );
+                return -1;
+            }
+            Arc::new(s)
+        }
         Err(e) => {
             error!("[s3-rdma-server] CuObjServer::new({addr}:{}) failed: {e:?}", p.listen_port);
             return -1;

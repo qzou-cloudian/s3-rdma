@@ -62,7 +62,9 @@ impl fmt::Display for RdmaError {
                 write!(f, "Failed to deregister memory at {ptr:#x}: {reason}")
             }
             RdmaError::MemoryNotSuitable { ptr, size } => {
-                write!(f, "Memory at {ptr:#x} (size={size}) not suitable for RDMA")
+                write!(f, "Memory at {ptr:#x} (size={size}) not suitable for RDMA \
+                           (must be non-null, {}-byte aligned, and pinnable)",
+                           crate::provider::RDMA_REQUIRED_ALIGNMENT)
             }
             RdmaError::TokenGenerationFailed { key, reason } => {
                 write!(f, "Failed to generate RDMA token for key '{key}': {reason}")

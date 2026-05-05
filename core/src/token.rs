@@ -321,7 +321,7 @@ impl RdmaToken {
             return vec![self.clone()];
         }
         let end = self.offset + self.size;
-        let mut out = Vec::with_capacity((self.size + chunk_size - 1) / chunk_size);
+        let mut out = Vec::with_capacity(self.size.div_ceil(chunk_size));
         let mut off = self.offset;
         while off < end {
             let sz = chunk_size.min(end - off);

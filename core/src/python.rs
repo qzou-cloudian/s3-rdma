@@ -268,7 +268,7 @@ impl PyRdmaProvider {
         } else {
             // buf_size() returns usize::MAX for the mock when unconfigured;
             // cap to avoid allocating a giant buffer by default.
-            raw_cap.min(DEFAULT_RDMA_BUF_SIZE).max(4096)
+            raw_cap.clamp(4096, DEFAULT_RDMA_BUF_SIZE)
         };
         let mut buf = vec![0u8; buf_cap];
         let n = self.inner
