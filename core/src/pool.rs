@@ -33,13 +33,30 @@
 //! ```
 
 use std::alloc::{Layout, alloc, dealloc};
+use std::ffi::c_void;
 use std::sync::{Arc, Condvar, Mutex};
 
 use crossbeam_queue::ArrayQueue;
 use tokio::sync::Semaphore;
 
 use crate::error::RdmaError;
-use crate::provider::{RDMA_REQUIRED_ALIGNMENT, RdmaClientProvider, RdmaProvider};
+use crate::provider::RDMA_REQUIRED_ALIGNMENT;
+
+// ── BufferRegistrar ───────────────────────────────────────────────────────────
+
+/// Trait for registering/deregistering buffers with an RDMA backend.
+///
+/// Implementations wrap the client-side `RdmaClientProvider::register_memory`
+/// path or the server-side `CuObjServer::registerBuffer` path, so `BufferPool`
+/// works with both.
+pub trait BufferRegistrar: Send + Sync {
+    /// Register a buffer.  Returns an opaque handle for deregistration
+    /// (e.g. a cuobj `rdma_buffer*`, or null for client-side registrars).
+    fn register(&self, ptr: *mut u8, size: usize) -> Result<*mut c_void, RdmaError>;
+    /// Deregister a buffer previously registered via [`register`](Self::register).
+    /// `handle` is the value returned by `register`.
+    fn deregister(&self, ptr: *mut u8, handle: *mut c_void);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error type
@@ -79,37 +96,15 @@ impl std::error::Error for BufferPoolError {
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct Slot {
-    ptr:    *mut u8,
-    size:   usize,
-    layout: Layout,
+    ptr:       *mut u8,
+    size:      usize,
+    layout:    Layout,
+    reg_handle: *mut c_void,
 }
 
 // SAFETY: Slot bytes are accessed only while a guard has exclusive ownership.
 unsafe impl Send for Slot {}
 unsafe impl Sync for Slot {}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ProviderClientBridge — adapts Arc<dyn RdmaProvider> to RdmaClientProvider
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Bridges an `Arc<dyn RdmaProvider>` into an `Arc<dyn RdmaClientProvider>`.
-///
-/// Forwards `name`, `protocol`, `register_memory`, and `deregister_memory` to
-/// the inner provider.  All other client methods use their default implementations.
-/// This is acceptable for the buffer pool, which only ever calls the forwarded methods.
-struct ProviderClientBridge(Arc<dyn RdmaProvider>);
-
-impl crate::provider::RdmaClientProvider for ProviderClientBridge {
-    fn name(&self) -> &str { self.0.name() }
-    fn protocol(&self) -> &str { self.0.protocol() }
-
-    fn register_memory(&self, ptr: *mut u8, size: usize) -> Result<(), RdmaError> {
-        self.0.register_memory(ptr, size)
-    }
-    fn deregister_memory(&self, ptr: *mut u8) -> Result<(), RdmaError> {
-        self.0.deregister_memory(ptr)
-    }
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BufferPool
@@ -128,8 +123,8 @@ pub struct BufferPool {
     sem:        Semaphore,
     parking_mu: Mutex<()>,
     parking_cv: Condvar,
-    /// Provider used to register/deregister slots.  `None` → plain-bytes mode.
-    rdma:       Option<Arc<dyn RdmaClientProvider>>,
+    /// Registrar used to register/deregister slots.  `None` → plain-bytes mode.
+    registrar:  Option<Arc<dyn BufferRegistrar>>,
 }
 
 // SAFETY: `free_queue` and `sem` provide lock-free/atomic synchronisation;
@@ -151,7 +146,8 @@ impl BufferPool {
         let idx  = self.free_queue.pop().expect("sem/queue invariant violated");
         let ptr  = self.slots[idx].ptr;
         let size = self.slots[idx].size;
-        OwnedBufferGuard { pool: Arc::clone(self), idx, ptr, size, len: size }
+        let reg_handle = self.slots[idx].reg_handle;
+        OwnedBufferGuard { pool: Arc::clone(self), idx, ptr, size, len: size, reg_handle }
     }
 
     /// Try to acquire a free buffer without blocking.
@@ -228,7 +224,7 @@ impl BufferPool {
     pub fn available(&self) -> usize { self.free_queue.len() }
 
     /// Whether this pool has an RDMA provider attached.
-    pub fn is_rdma_registered(&self) -> bool { self.rdma.is_some() }
+    pub fn is_rdma_registered(&self) -> bool { self.registrar.is_some() }
 
     // ── Internal ─────────────────────────────────────────────────────────────
 
@@ -243,8 +239,8 @@ impl BufferPool {
 impl Drop for BufferPool {
     fn drop(&mut self) {
         for slot in &self.slots {
-            if let Some(rdma) = &self.rdma {
-                let _ = rdma.deregister_memory(slot.ptr);
+            if let Some(reg) = &self.registrar {
+                reg.deregister(slot.ptr, slot.reg_handle);
             }
             // SAFETY: allocated via alloc(); not null; layout matches.
             unsafe { dealloc(slot.ptr, slot.layout) };
@@ -263,13 +259,13 @@ impl Drop for BufferPool {
 ///   `bytes::Bytes::from_owner(guard)` for a zero-copy hand-off.
 /// - Released back to the pool on `Drop`.
 pub struct OwnedBufferGuard {
-    pool: Arc<BufferPool>,
-    idx:  usize,
-    ptr:  *mut u8,
-    size: usize,
-    /// Valid bytes from `ptr[0..len]`.  Starts == `size`; call
-    /// [`set_len`][Self::set_len] after a partial write.
-    len:  usize,
+    pool:       Arc<BufferPool>,
+    idx:        usize,
+    ptr:        *mut u8,
+    size:       usize,
+    len:        usize,
+    /// Registration handle from BufferRegistrar::register (null if no registrar).
+    reg_handle: *mut c_void,
 }
 
 // SAFETY: the guard has exclusive access to the slot bytes.
@@ -287,6 +283,8 @@ impl OwnedBufferGuard {
     #[inline] pub fn as_ptr(&self) -> *const u8 { self.ptr }
     /// Raw mutable pointer to the slot's memory.
     #[inline] pub fn as_mut_ptr(&mut self) -> *mut u8 { self.ptr }
+    /// Opaque handle from the registrar (e.g. cuobj `rdma_buffer*`), or null.
+    #[inline] pub fn reg_handle(&self) -> *mut c_void { self.reg_handle }
 
     /// Immutable view of the valid region (`ptr[..len]`).
     #[inline]
@@ -336,13 +334,13 @@ impl Drop for OwnedBufferGuard {
 
 /// Builder for [`BufferPool`].  Obtain via [`BufferPool::builder()`].
 pub struct BufferPoolBuilder {
-    count: usize,
-    size:  usize,
-    rdma:  Option<Arc<dyn RdmaClientProvider>>,
+    count:     usize,
+    size:      usize,
+    registrar: Option<Arc<dyn BufferRegistrar>>,
 }
 
 impl Default for BufferPoolBuilder {
-    fn default() -> Self { Self { count: 0, size: 0, rdma: None } }
+    fn default() -> Self { Self { count: 0, size: 0, registrar: None } }
 }
 
 impl BufferPoolBuilder {
@@ -352,24 +350,9 @@ impl BufferPoolBuilder {
     /// Size of each buffer slot in bytes.
     pub fn size(mut self, bytes: usize) -> Self { self.size = bytes; self }
 
-    /// Attach a client-role RDMA provider.  All slots are registered with it
-    /// at build time so per-transfer `register_memory`/`deregister_memory` is
-    /// avoided.
-    ///
-    /// Use [`with_rdma`][Self::with_rdma] if you have an `Arc<dyn RdmaProvider>`
-    /// (the combined trait).
-    pub fn with_client(mut self, rdma: Option<Arc<dyn RdmaClientProvider>>) -> Self {
-        self.rdma = rdma;
-        self
-    }
-
-    /// Attach a combined RDMA provider.
-    ///
-    /// Convenience for callers that hold an `Arc<dyn RdmaProvider>`.
-    /// Only the `register_memory`/`deregister_memory` methods are called on
-    /// the provider; the server-side methods are never invoked.
-    pub fn with_rdma(mut self, rdma: Option<Arc<dyn RdmaProvider>>) -> Self {
-        self.rdma = rdma.map(|r| Arc::new(ProviderClientBridge(r)) as Arc<dyn RdmaClientProvider>);
+    /// Attach a backend registrar for server-side or client-side RDMA registration.
+    pub fn with_registrar(mut self, registrar: Option<Arc<dyn BufferRegistrar>>) -> Self {
+        self.registrar = registrar;
         self
     }
 
@@ -409,11 +392,13 @@ impl BufferPoolBuilder {
                     reason: "std::alloc::alloc returned null".into(),
                 });
             }
-            if let Some(rdma) = &self.rdma {
-                rdma.register_memory(ptr, self.size)
-                    .map_err(|e| BufferPoolError::RegistrationFailed { slot: i, source: e })?;
-            }
-            slots.push(Slot { ptr, size: self.size, layout });
+            let reg_handle = if let Some(reg) = &self.registrar {
+                reg.register(ptr, self.size)
+                    .map_err(|e| BufferPoolError::RegistrationFailed { slot: i, source: e })?
+            } else {
+                std::ptr::null_mut()
+            };
+            slots.push(Slot { ptr, size: self.size, layout, reg_handle });
             free_queue.push(i).ok().expect("ArrayQueue capacity exceeded during build");
         }
 
@@ -423,7 +408,7 @@ impl BufferPoolBuilder {
             sem:        Semaphore::new(self.count),
             parking_mu: Mutex::new(()),
             parking_cv: Condvar::new(),
-            rdma:       self.rdma,
+            registrar:  self.registrar,
         })
     }
 }

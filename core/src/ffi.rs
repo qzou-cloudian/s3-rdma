@@ -218,11 +218,6 @@ pub struct RdmaServerInitParams {
     pub listen_addr: *const c_char,
     /// Listen port for the RDMA server.
     pub listen_port: u16,
-    /// Number of worker threads (one pre-allocated channel per thread).
-    pub pool_count:  usize,
-    /// Number of pre-allocated RDMA buffer slots in the buffer pool.
-    /// `0` means "use `pool_count`".
-    pub buf_pool_count: usize,
     /// Size in bytes of each buffer slot.
     pub buf_size:    usize,
 }

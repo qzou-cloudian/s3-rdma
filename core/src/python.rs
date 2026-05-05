@@ -70,7 +70,6 @@ impl PyRdmaProvider {
     /// :param shm_path: SHM directory for the mock provider (default ``"/dev/shm"``).
     /// :param listen_addr: RDMA listen address for the cuObj server.
     /// :param listen_port: RDMA listen port for the cuObj server.
-    /// :param pool_count: number of buffer pool slots for the cuObj server (default 4).
     /// :param buf_size: buffer slot size in bytes for the cuObj server (default 128 MiB).
     /// :raises RuntimeError: if the provider is unavailable or fails to initialise.
     #[new]
@@ -82,8 +81,7 @@ impl PyRdmaProvider {
         shm_path = "/dev/shm",
         listen_addr = "",
         listen_port = 0u16,
-        pool_count = 4usize,
-        buf_size = 134217728usize,  // matches DEFAULT_RDMA_BUF_SIZE
+        buf_size = 134217728usize,
     ))]
     pub fn new(
         provider:    &str,
@@ -92,7 +90,6 @@ impl PyRdmaProvider {
         shm_path:    &str,
         listen_addr: &str,
         listen_port: u16,
-        pool_count:  usize,
         buf_size:    usize,
     ) -> PyResult<Self> {
         let provider_role = parse_role(role)?;
@@ -100,8 +97,6 @@ impl PyRdmaProvider {
             shm_path:       shm_path.to_owned(),
             listen_addr:    listen_addr.to_owned(),
             listen_port,
-            pool_count,
-            buf_pool_count: 0,
             buf_size,
         };
         crate::create_provider(provider, debug, provider_role, &cfg)
@@ -271,8 +266,9 @@ impl PyRdmaProvider {
             raw_cap.clamp(4096, DEFAULT_RDMA_BUF_SIZE)
         };
         let mut buf = vec![0u8; buf_cap];
-        let n = self.inner
-            .handle_put(s3_key, token, &mut buf, offset, size)
+        let ch = self.inner.open_channel(s3_key, token)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let n = ch.handle_put(&mut buf, offset, size)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         buf.truncate(n);
         Ok(PyBytes::new_bound(py, &buf))
@@ -294,8 +290,9 @@ impl PyRdmaProvider {
         token:  &[u8],
         offset: usize,
     ) -> PyResult<usize> {
-        self.inner
-            .handle_get(s3_key, data, token, offset)
+        self.inner.open_channel(s3_key, token)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            .handle_get(data, offset)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -389,7 +386,7 @@ impl PyMockRdmaProvider {
     #[new]
     #[pyo3(signature = (debug = false))]
     fn new(debug: bool) -> PyResult<PyClassInitializer<Self>> {
-        let base = PyRdmaProvider::new("mock", "both", debug, "/dev/shm", "", 0, 4, 0)?;
+        let base = PyRdmaProvider::new("mock", "both", debug, "/dev/shm", "", 0, 0)?;
         Ok(PyClassInitializer::from(base).add_subclass(PyMockRdmaProvider))
     }
 }
@@ -428,7 +425,6 @@ impl PyCuObjProvider {
     /// :param debug: emit trace lines to stderr (default ``False``).
     /// :param listen_addr: RDMA listen address for the server role (cuObj server).
     /// :param listen_port: RDMA listen port for the server role (cuObj server).
-    /// :param pool_count: number of pre-allocated buffer pool slots (default 4).
     /// :param buf_size: size of each buffer pool slot in bytes (default 128 MiB).
     /// :raises RuntimeError: if the cuObj plugin is unavailable or fails to initialise.
     #[new]
@@ -438,20 +434,18 @@ impl PyCuObjProvider {
         debug = false,
         listen_addr = "",
         listen_port = 0u16,
-        pool_count = 4usize,
-        buf_size = 134217728usize,  // matches DEFAULT_RDMA_BUF_SIZE
+        buf_size = 134217728usize,
     ))]
     fn new(
         role:        &str,
         debug:       bool,
         listen_addr: &str,
         listen_port: u16,
-        pool_count:  usize,
         buf_size:    usize,
     ) -> PyResult<PyClassInitializer<Self>> {
         let base = PyRdmaProvider::new(
             "cuobj", role, debug, "/dev/shm",
-            listen_addr, listen_port, pool_count, buf_size,
+            listen_addr, listen_port, buf_size,
         )?;
         Ok(PyClassInitializer::from(base).add_subclass(PyCuObjProvider))
     }

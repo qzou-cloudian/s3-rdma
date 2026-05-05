@@ -64,7 +64,7 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeCreate(
     shm_path:       JString<'_>,
     listen_addr:    JString<'_>,
     listen_port:    jni::sys::jint,
-    pool_count:     jni::sys::jint,
+    _pool_count:    jni::sys::jint,
     buf_size:       jlong,
 ) -> jlong {
     macro_rules! jstr {
@@ -93,8 +93,6 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeCreate(
         shm_path:       shm_path_str,
         listen_addr:    listen_str,
         listen_port:    listen_port as u16,
-        pool_count:     pool_count as usize,
-        buf_pool_count: 0,
         buf_size:       buf_size as usize,
     };
 
@@ -306,7 +304,9 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeHandlePut(
         raw_cap.clamp(4096, DEFAULT_RDMA_BUF_SIZE)
     };
     let mut buf = vec![0u8; buf_cap];
-    match ep.handle_put(&key_bytes, &tok_bytes, &mut buf, offset as usize, size as usize) {
+    match ep.open_channel(&key_bytes, &tok_bytes)
+        .and_then(|ch| ch.handle_put(&mut buf, offset as usize, size as usize))
+    {
         Ok(n) => {
             buf.truncate(n);
             env.byte_array_from_slice(&buf)
@@ -333,7 +333,8 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeHandleGet(
         Ok(b) => b, Err(e) => { throw(&mut env, &e.to_string()); return -1; }
     };
     match unsafe { arc_provider_ref(handle) }
-        .handle_get(&key_bytes, &data_bytes, &tok_bytes, offset as usize)
+        .open_channel(&key_bytes, &tok_bytes)
+        .and_then(|ch| ch.handle_get(&data_bytes, offset as usize))
     {
         Ok(n)  => n as jlong,
         Err(e) => { throw(&mut env, &e.to_string()); -1 }

@@ -88,8 +88,6 @@ mod real {
             let params = RdmaServerInitParams {
                 listen_addr:    addr_cstr.as_ptr(),
                 listen_port:    cfg.listen_port,
-                pool_count:     cfg.pool_count,
-                buf_pool_count: cfg.buf_pool_count,
                 buf_size:       cfg.buf_size,
             };
 
@@ -131,6 +129,14 @@ mod real {
         }
 
         pub fn buf_size(&self) -> usize { self.buf_size }
+
+        pub fn open_channel(&self, key: &[u8], token: &[u8])
+            -> Result<Box<dyn crate::provider::RdmaServerChannel>, RdmaError>
+        {
+            Err(RdmaError::OperationNotSupported(
+                "open_channel: not supported by rdma server plugin".into(),
+            ))
+        }
 
         /// Delegates to the plugin's `handle_put` vtable entry.
         ///

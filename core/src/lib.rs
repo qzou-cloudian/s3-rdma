@@ -6,40 +6,49 @@
 //!
 //! ```text
 //! RdmaProvider: RdmaClientProvider + RdmaServerProvider
-//!   ├── RdmaClientProvider  — register memory, generate tokens, process replies
-//!   └── RdmaServerProvider  — handle PUT/GET transfers from clients
+//!   ├── RdmaClientProvider  — bind buffers, create RdmaClientChannel
+//!   │   └── RdmaClientChannel — generate tokens, process replies
+//!   └── RdmaServerProvider  — open channels for key+token pairs
+//!       └── RdmaServerChannel  — handle PUT/GET transfers
 //! ```
+//!
+//! ## Channel-based API (preferred)
+//!
+//! | Side   | Provider method | Returns | Channel methods |
+//! |--------|----------------|---------|-----------------|
+//! | Client | `bind(ptr, size, key)` | `RdmaClientChannel` | `prepare_put_token`, `prepare_get_token`, `process_rdma_reply` |
+//! | Server | `open_channel(key, token)` | `RdmaServerChannel` | `handle_put`, `handle_get` (+ ZC variants) |
+//!
+//! The channel owns the binding (key, token, buffer registration) so callers
+//! don't pass the same parameters repeatedly.  Drop deregisters / cleans up.
 //!
 //! Concrete implementations:
 //!
 //! - [`MockRdmaProvider`] — SHM-based simulation, no hardware required; both roles
 //! - [`RdmaPlugin`] — generic RDMA plugin (loads `.so` at runtime); both roles
-//!   from one instance
-//! - [`RdmaPluginClient`] / [`RdmaPluginServer`] — focused single-role
-//!   wrappers (require `rdma-client` / `rdma-server` feature respectively)
-//! - [`RdmaEngine`] — trait for provider-specific worker pools (feature `engine`)
+//! - [`RdmaPlugin`] — loads `.so` at runtime via the plugin system
 //!
 //! ## Choosing the right trait
 //!
 //! | Scenario | Use |
 //! |---|---|
-//! | S3 client node (register memory, generate tokens) | `Arc<dyn RdmaClientProvider>` |
-//! | S3 server / gateway node (handle PUT/GET) | `Arc<dyn RdmaServerProvider>` |
+//! | S3 client node (bind buffers, generate tokens) | `Arc<dyn RdmaClientProvider>` |
+//! | S3 server / gateway node (open channels, handle PUT/GET) | `Arc<dyn RdmaServerProvider>` |
 //! | Both roles in the same node / bindings | `Arc<dyn RdmaProvider>` |
 //!
 //! ## Flow
 //!
 //! ```text
-//!   Client (RdmaClientProvider)
-//!     │  register_memory(ptr, size)
-//!     │  prepare_put_token(key, ptr, len, offset) → RdmaToken
+//!   Client                                    Server
+//!   ──────                                    ──────
+//!   ch = provider.bind(ptr, size, key)
+//!   token = ch.prepare_put_token(offset, size)
 //!     │  PUT /bucket/key  +  x-amz-rdma-token: <token>
-//!     │                          ↓
-//!     │          Server (RdmaServerProvider): RDMA_READ into registered buffer
-//!     │                          ↓
+//!     │                          ↓             ch = provider.open_channel(key, token)
+//!     │                          ↓             n = ch.handle_put(buf, offset, size)
 //!     │  ← x-amz-rdma-reply: <reply>
-//!     │  process_rdma_reply(200, reply_token, ...)
-//!     │  deregister_memory(ptr)
+//!   ch.process_rdma_reply(200, token, n, cb)
+//!   drop(ch)  →  deregister memory
 //! ```
 //!
 //! ## Feature flags
@@ -49,14 +58,11 @@
 //! | `rdma-client` | Enable [`RdmaPluginClient`] / [`RdmaPlugin`] client role   |
 //! | `rdma-server` | Enable [`RdmaPluginServer`] / [`RdmaPlugin`] server role   |
 //! | `buffer-pool`   | Enable [`BufferPool`] for pre-registered RDMA buffers               |
-//! | `engine`        | Enable [`RdmaEngine`] fixed-size worker pool                        |
 //! | (none)          | Only [`MockRdmaProvider`] available                                 |
 
 pub(crate) mod rdma_client;
 pub(crate) mod rdma_server;
 pub mod engine;
-#[cfg(feature = "engine")]
-pub mod mock_engine;
 pub mod error;
 pub mod ffi;
 pub mod mock;
@@ -64,13 +70,15 @@ pub mod mock;
 pub mod pool;
 pub mod provider;
 pub mod token;
+#[cfg(feature = "engine")]
+pub mod worker_pool;
 #[cfg(feature = "pyo3")]
 mod python;
 
 // ── Primary public API ────────────────────────────────────────────────────────
 
 pub use provider::{RdmaRole, RdmaProvider, RdmaProviderConfig};
-pub use provider::{RdmaClientProvider, RdmaServerProvider};
+pub use provider::{RdmaServerChannel, RdmaClientChannel, RdmaClientProvider, RdmaServerProvider};
 pub use provider::{TelemetryConfig, TelemLevel, TelemState};
 pub use provider::{DEFAULT_RDMA_BUF_SIZE, RDMA_REQUIRED_ALIGNMENT};
 pub use mock::MockRdmaProvider;
@@ -82,11 +90,12 @@ pub use rdma_client::RdmaPlugin;
 pub use provider::RdmaServerConfig;
 pub use token::RdmaToken;
 
-#[cfg(feature = "buffer-pool")]
-pub use pool::{BufferPool, BufferPoolBuilder, BufferPoolError, OwnedBufferGuard};
-
 #[cfg(feature = "engine")]
-pub use engine::RdmaEngine;
+pub use worker_pool::RdmaWorkerPool;
+
+#[cfg(feature = "buffer-pool")]
+pub use pool::{BufferPool, BufferPoolBuilder, BufferPoolError, BufferRegistrar, OwnedBufferGuard};
+
 
 #[cfg(feature = "rdma-client")]
 pub use rdma_client::RdmaPluginClient;
@@ -217,70 +226,56 @@ pub fn create_server_provider(
         .map(|p| p as Arc<dyn RdmaServerProvider>)
 }
 
-/// Build a `Box<dyn RdmaEngine>` for the named provider.
+/// Build a [`RdmaWorkerPool`] wrapping the named provider.
 ///
-/// Constructs a provider-specific engine: a bounded worker pool for server-side
-/// RDMA operations.  Each provider manages its own worker lifecycle — mock uses
-/// a simple thread pool, cuobj pre-allocates per-worker channels and buffers.
+/// Returns a bounded-concurrency worker pool.  Each of `workers` threads
+/// calls `open_channel` on the underlying provider, bounding concurrent
+/// RDMA transfers to `workers`.
 ///
 /// `provider` must be one of:
-/// - `"mock"`   → engine wrapping a [`MockRdmaProvider`] (requires `engine` feature)
-/// - `"rdma"`  → [`RdmaPlugin`] (requires `rdma-client`/`rdma-server` features)
+/// - `"mock"`   → pool around [`MockRdmaProvider`] (requires `engine` feature)
+/// - `"rdma"`  → pool around [`RdmaPlugin`] (requires `rdma-server` feature)
 /// - `"auto"`  → tries `"rdma"` first, falls back to `"mock"`
 ///
-/// The engine is returned as `Box<dyn RdmaEngine>` so callers work through the
-/// trait — concrete engine types are not part of the public API.
-pub fn create_engine(
+/// Returned as `Box<dyn RdmaServerProvider>` — use the trait for all operations.
+#[cfg(feature = "engine")]
+pub fn create_worker_pool(
     provider: &str,
     debug: bool,
     cfg: &RdmaServerConfig,
-) -> Result<Box<dyn crate::engine::RdmaEngine>, RdmaError> {
-    match provider {
+    workers: usize,
+) -> Result<Box<dyn RdmaServerProvider>, RdmaError> {
+    let inner: Arc<dyn RdmaServerProvider> = match provider {
         "mock" => {
-            #[cfg(feature = "engine")]
-            {
-                if debug {
-                    info!("[rdma] Using MockRdmaEngine");
-                }
-                let inner = Arc::new(MockRdmaProvider::new(debug, &cfg.shm_path, cfg.buf_size));
-                let workers = cfg.pool_count.max(1);
-                Ok(Box::new(mock_engine::MockRdmaEngine::new(inner, workers))
-                    as Box<dyn crate::engine::RdmaEngine>)
-            }
-            #[cfg(not(feature = "engine"))]
-            {
-                let _ = (debug, cfg);
-                Err(RdmaError::ProviderUnavailable {
-                    provider: provider.to_owned(),
-                    reason: "compiled without the `engine` feature".into(),
-                })
-            }
+            if debug { info!("[rdma] MockRdmaProvider in pool ({workers} workers)"); }
+            Arc::new(MockRdmaProvider::new(debug, &cfg.shm_path, cfg.buf_size))
         }
         "rdma" => {
-            #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
+            #[cfg(feature = "rdma-server")]
             {
                 let plugin = RdmaPlugin::new_server(cfg)?;
-                if debug {
-                    info!("[rdma] Using RdmaPlugin engine ({} workers)", plugin.worker_count());
-                }
-                Ok(Box::new(plugin) as Box<dyn crate::engine::RdmaEngine>)
+                if debug { info!("[rdma] RdmaPlugin in pool ({workers} workers)"); }
+                Arc::new(plugin) as Arc<dyn RdmaServerProvider>
             }
-            #[cfg(not(any(feature = "rdma-client", feature = "rdma-server")))]
+            #[cfg(not(feature = "rdma-server"))]
             {
-                let _ = (debug, cfg);
-                Err(RdmaError::ProviderUnavailable {
+                let _ = (debug, cfg, workers);
+                return Err(RdmaError::ProviderUnavailable {
                     provider: provider.to_owned(),
-                    reason: "compiled without `rdma-client` or `rdma-server` features".into(),
-                })
+                    reason: "compiled without `rdma-server` feature".into(),
+                });
             }
         }
-        "auto" => match create_engine("rdma", debug, cfg) {
-            Ok(e) => Ok(e),
-            Err(_) => create_engine("mock", debug, cfg),
+        "auto" => {
+            match create_worker_pool("rdma", debug, cfg, workers) {
+                Ok(p) => return Ok(p),
+                Err(_) => return create_worker_pool("mock", debug, cfg, workers),
+            }
         }
-        other => Err(RdmaError::ProviderUnavailable {
+        other => return Err(RdmaError::ProviderUnavailable {
             provider: other.to_owned(),
             reason: "unknown provider (valid: mock, rdma, auto)".to_owned(),
         }),
-    }
+    };
+    Ok(Box::new(worker_pool::RdmaWorkerPool::new(inner, workers)))
 }

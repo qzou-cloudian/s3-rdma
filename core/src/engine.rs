@@ -1,23 +1,11 @@
-//! Generic RDMA engine trait.
+//! Engine module — re-exports nothing.
 //!
-//! An engine is a bounded worker pool for server-side RDMA operations.
-//! Each provider implements its own engine, optimized for its backend —
-//! mock uses a simple thread pool, cuobj pre-allocates channels and buffers
-//! per worker.
+//! Engine functionality is accessed through [`crate::RdmaServerProvider`]:
+//! - `worker_count()` — number of workers (1 = no engine, > 1 = engine)
+//! - `open_channel()` — canonical server API (shared by engines and direct providers)
 //!
-//! The trait extends [`RdmaServerProvider`] so any engine can be used
-//! wherever server-side RDMA operations are needed.
-
-use crate::provider::RdmaServerProvider;
-
-/// Generic RDMA engine: a bounded worker pool for server-side RDMA transfers.
-///
-/// Each provider implements its own engine.  The trait extends
-/// [`RdmaServerProvider`] with engine-specific queries.
-///
-/// Concrete engine types (`MockRdmaEngine`, `CuObjEngine`) are not part of
-/// the public API — use this trait to work with any engine generically.
-pub trait RdmaEngine: RdmaServerProvider {
-    /// Number of worker threads in the pool.
-    fn worker_count(&self) -> usize;
-}
+//! Set `pool_count > 0` in [`crate::provider::RdmaServerConfig`] when calling
+//! [`crate::create_provider`] to get an engine-backed provider.
+//!
+//! Concrete engine types (`MockRdmaEngine`, `CuObjEngine`) live in their
+//! respective crates and are not part of the public API.

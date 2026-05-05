@@ -34,7 +34,7 @@ use std::sync::{Mutex, OnceLock};
 use tracing::debug;
 
 use crate::error::RdmaError;
-use crate::provider::{RdmaCompletionCallback, RdmaCompletionResult, RdmaClientProvider, RdmaServerProvider, RdmaProvider, rdma_status_to_error_code, RDMA_REQUIRED_ALIGNMENT, TelemState, TelemetryConfig, TelemLevel};
+use crate::provider::{RdmaServerChannel, RdmaClientChannel, RdmaClientProvider, RdmaCompletionCallback, RdmaCompletionResult, RdmaServerProvider, RdmaProvider, rdma_status_to_error_code, RDMA_REQUIRED_ALIGNMENT, TelemState, TelemetryConfig, TelemLevel};
 
 /// Base directory for shared-memory files.
 const SHM_DIR: &str = "/dev/shm";
@@ -76,6 +76,185 @@ impl ShmEntry {
         libc::munmap(self.shm_ptr, self.size);
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MockChannel
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct MockChannel {
+    key:       Vec<u8>,
+    token:     Vec<u8>,
+    shm_dir:   String,
+    shm_name:  String,
+    op:        String,
+    token_size: usize,
+    token_offset: usize,
+    buf_size:  usize,
+    debug:     bool,
+}
+
+unsafe impl Send for MockChannel {}
+unsafe impl Sync for MockChannel {}
+
+impl MockChannel {
+    fn dbg(&self, msg: &str) {
+        if self.debug { tracing::debug!("[MockChannel] {msg}"); }
+    }
+}
+
+impl RdmaServerChannel for MockChannel {
+    fn key(&self)   -> &[u8] { &self.key }
+    fn token(&self) -> &[u8] { &self.token }
+    fn buf_size(&self) -> usize { self.buf_size }
+
+    fn handle_put(&self, buf: &mut [u8], offset: usize, size: usize) -> Result<usize, RdmaError> {
+        if self.op != "PUT" {
+            return Err(RdmaError::TransferFailed(format!("expected PUT token, got {}", self.op)));
+        }
+        let read_size = if size > 0 { size } else { self.token_size };
+        let path = format!("{}/{}", self.shm_dir, self.shm_name);
+        self.dbg(&format!("handle_put shm={} offset={offset} size={read_size}", self.shm_name));
+        let mut file = std::fs::File::open(&path)
+            .map_err(|e| RdmaError::TransferFailed(format!("open {path}: {e}")))?;
+        let file_len = file.metadata()
+            .map_err(|e| RdmaError::TransferFailed(format!("metadata {path}: {e}")))?
+            .len() as usize;
+        use std::io::{Seek, SeekFrom, Read};
+        let start = offset.min(file_len);
+        let end = (offset + read_size).min(file_len);
+        let want = end.saturating_sub(start);
+        let n = want.min(buf.len());
+        file.seek(SeekFrom::Start(start as u64)).map_err(|e| RdmaError::TransferFailed(format!("seek {path}: {e}")))?;
+        file.read_exact(&mut buf[..n]).map_err(|e| RdmaError::TransferFailed(format!("read {path}: {e}")))?;
+        Ok(n)
+    }
+
+    fn handle_get(&self, data: &[u8], offset: usize) -> Result<usize, RdmaError> {
+        if self.op != "GET" {
+            return Err(RdmaError::TransferFailed(format!("expected GET token, got {}", self.op)));
+        }
+        let remaining_cap = self.token_size.saturating_sub(offset);
+        let write_len = data.len().min(remaining_cap);
+        let write_start = self.token_offset + offset;
+        let path = format!("{}/{}", self.shm_dir, self.shm_name);
+        self.dbg(&format!("handle_get shm={} write={write_len}/{} write_start={write_start}", self.shm_name, data.len()));
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = OpenOptions::new().write(true).open(&path)
+            .map_err(|e| RdmaError::TransferFailed(format!("open {path}: {e}")))?;
+        file.seek(SeekFrom::Start(write_start as u64)).map_err(|e| RdmaError::TransferFailed(format!("seek {path}: {e}")))?;
+        file.write_all(&data[..write_len]).map_err(|e| RdmaError::TransferFailed(format!("write {path}: {e}")))?;
+        Ok(write_len)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MockClientChannel
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct MockClientChannel {
+    key:       Vec<u8>,
+    ptr:       *mut u8,
+    size:      usize,
+    shm_dir:   String,
+    shm_name:  String,
+    shm_ptr:   *mut libc::c_void,
+    debug:     bool,
+    /// Whether the SHM has already been cleaned up by process_rdma_reply.
+    cleaned:   std::sync::atomic::AtomicBool,
+}
+
+unsafe impl Send for MockClientChannel {}
+unsafe impl Sync for MockClientChannel {}
+
+impl MockClientChannel {
+    fn dbg(&self, msg: &str) {
+        if self.debug { tracing::debug!("[MockClientChannel] {msg}"); }
+    }
+}
+
+impl RdmaClientChannel for MockClientChannel {
+    fn key(&self)  -> &[u8] { &self.key }
+    fn ptr(&self)  -> *const u8 { self.ptr }
+    fn size(&self) -> usize { self.size }
+    fn get_max_transfer_size(&self) -> usize { usize::MAX }
+
+    fn prepare_put_token(&self, offset: usize, size: usize) -> Result<Vec<u8>, RdmaError> {
+        self.dbg(&format!("prepare_put_token offset={offset} size={size}"));
+        unsafe { std::ptr::copy_nonoverlapping(self.ptr.add(offset), self.shm_ptr as *mut u8, size); }
+        if unsafe { libc::msync(self.shm_ptr, size, libc::MS_SYNC) } != 0 {
+            let e = std::io::Error::last_os_error();
+            return Err(RdmaError::TokenGenerationFailed {
+                key: String::from_utf8_lossy(&self.key).into_owned(),
+                reason: format!("msync shm={} failed: {e}", self.shm_name),
+            });
+        }
+        let token = format!(
+            "RDMA_PUT_{}_{size}_{offset}_key_{}",
+            self.shm_name,
+            String::from_utf8_lossy(&self.key),
+        ).into_bytes();
+        Ok(token)
+    }
+
+    fn prepare_get_token(&self, offset: usize, size: usize) -> Result<Vec<u8>, RdmaError> {
+        self.dbg(&format!("prepare_get_token offset={offset} size={size}"));
+        let token = format!(
+            "RDMA_GET_{}_{size}_{offset}_key_{}",
+            self.shm_name,
+            String::from_utf8_lossy(&self.key),
+        ).into_bytes();
+        Ok(token)
+    }
+
+    fn process_rdma_reply(
+        &self, status: u16, request_token: &[u8], transferred: usize, cb: RdmaCompletionCallback,
+    ) -> Result<(), RdmaError> {
+        let error_code = rdma_status_to_error_code(status);
+        if error_code != 0 {
+            cb(RdmaCompletionResult { error_code, reply_token: vec![] });
+            return Ok(());
+        }
+
+        let (op, _shm_name, _size, token_offset) = match MockRdmaProvider::parse_token(request_token) {
+            Ok(t) => t,
+            Err(e) => {
+                cb(RdmaCompletionResult { error_code: -1, reply_token: vec![] });
+                return Err(e);
+            }
+        };
+
+        if op == "GET" && transferred > 0 {
+            let available = self.size.saturating_sub(token_offset);
+            let copy_len = transferred.min(available);
+            if copy_len > 0 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (self.shm_ptr as *const u8).add(token_offset),
+                        self.ptr, copy_len,
+                    );
+                }
+            }
+        }
+
+        self.cleanup_shm();
+        cb(RdmaCompletionResult { error_code: 0, reply_token: vec![] });
+        Ok(())
+    }
+}
+
+impl MockClientChannel {
+    fn cleanup_shm(&self) {
+        if self.cleaned.swap(true, std::sync::atomic::Ordering::Relaxed) { return; }
+        self.dbg(&format!("cleanup shm={}", self.shm_name));
+        unsafe { libc::munmap(self.shm_ptr, self.size); }
+        let path = format!("{}/{}", self.shm_dir, self.shm_name);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+impl Drop for MockClientChannel {
+    fn drop(&mut self) { self.cleanup_shm(); }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -169,6 +348,43 @@ impl RdmaClientProvider for MockRdmaProvider {
         let ok = !ptr.is_null() && size > 0 && (ptr as usize).is_multiple_of(RDMA_REQUIRED_ALIGNMENT);
         self.dbg(&format!("is_memory_suitable ptr={ptr:p} size={size} -> {ok}"));
         ok
+    }
+
+    fn bind(&self, ptr: *mut u8, size: usize, key: &[u8]) -> Result<Box<dyn RdmaClientChannel>, RdmaError> {
+        self.dbg(&format!("bind ptr={ptr:p} size={size} key={}", String::from_utf8_lossy(key)));
+        if !(ptr as usize).is_multiple_of(RDMA_REQUIRED_ALIGNMENT) {
+            return Err(RdmaError::MemoryNotSuitable { ptr: ptr as usize, size });
+        }
+        let shm_name = format!("rdma-{}-{:x}", std::process::id(), ptr as usize);
+        let path = format!("{}/{shm_name}", self.shm_dir);
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true)
+            .open(&path)
+            .map_err(|e| RdmaError::MemoryRegistrationFailed {
+                ptr: ptr as usize, size,
+                reason: format!("create {path}: {e}"),
+            })?;
+        file.set_len(size as u64).map_err(|e| RdmaError::MemoryRegistrationFailed {
+            ptr: ptr as usize, size,
+            reason: format!("resize {path}: {e}"),
+        })?;
+        let shm_ptr = unsafe {
+            libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE,
+                       libc::MAP_SHARED, file.as_raw_fd(), 0)
+        };
+        drop(file);
+        if shm_ptr == libc::MAP_FAILED {
+            let _ = std::fs::remove_file(&path);
+            return Err(RdmaError::MemoryRegistrationFailed {
+                ptr: ptr as usize, size,
+                reason: format!("mmap {path}: {}", std::io::Error::last_os_error()),
+            });
+        }
+        Ok(Box::new(MockClientChannel {
+            key: key.to_vec(), ptr, size,
+            shm_dir: self.shm_dir.clone(), shm_name, shm_ptr,
+            debug: self.debug,
+            cleaned: std::sync::atomic::AtomicBool::new(false),
+        }))
     }
 
     fn register_memory(&self, ptr: *mut u8, size: usize) -> Result<(), RdmaError> {
@@ -375,156 +591,20 @@ impl RdmaServerProvider for MockRdmaProvider {
         if self.buf_size > 0 { self.buf_size } else { usize::MAX }
     }
 
-    fn handle_put(
-        &self,
-        _s3_key: &[u8],
-        token: &[u8],
-        buf: &mut [u8],
-        offset: usize,
-        size: usize,
-    ) -> Result<usize, RdmaError> {
-        let (op, shm_name, token_size, _token_offset) = Self::parse_token(token)?;
-        if op != "PUT" {
-            return Err(RdmaError::TransferFailed(format!("expected PUT token, got {op}")));
-        }
-        let read_size = if size > 0 { size } else { token_size };
-        let path = format!("{}/{shm_name}", self.shm_dir);
-        self.dbg(&format!("handle_put shm={shm_name} offset={offset} size={read_size}"));
-
-        let mut file = std::fs::File::open(&path)
-            .map_err(|e| RdmaError::TransferFailed(format!("open {path}: {e}")))?;
-        let file_len = file.metadata()
-            .map_err(|e| RdmaError::TransferFailed(format!("metadata {path}: {e}")))?
-            .len() as usize;
-
-        use std::io::{Seek, SeekFrom, Read};
-        let start = offset.min(file_len);
-        let end = (offset + read_size).min(file_len);
-        let want = end.saturating_sub(start);
-        let n = want.min(buf.len());
-        file.seek(SeekFrom::Start(start as u64))
-            .map_err(|e| RdmaError::TransferFailed(format!("seek {path}: {e}")))?;
-        file.read_exact(&mut buf[..n])
-            .map_err(|e| RdmaError::TransferFailed(format!("read {path}: {e}")))?;
-        Ok(n)
-    }
-
-    fn handle_get(
-        &self,
-        _s3_key: &[u8],
-        data: &[u8],
-        token: &[u8],
-        offset: usize,
-    ) -> Result<usize, RdmaError> {
-        let (op, shm_name, capacity, token_offset) = Self::parse_token(token)?;
-        if op != "GET" {
-            return Err(RdmaError::TransferFailed(format!("expected GET token, got {op}")));
-        }
-        let remaining_cap = capacity.saturating_sub(offset);
-        let write_len = data.len().min(remaining_cap);
-        let write_start = token_offset + offset;
-        let path = format!("{}/{shm_name}", self.shm_dir);
-        self.dbg(&format!(
-            "handle_get shm={shm_name} write={write_len}/{} write_start={write_start}",
-            data.len()
-        ));
-
-        use std::io::{Seek, SeekFrom, Write};
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .map_err(|e| RdmaError::TransferFailed(format!("open {path}: {e}")))?;
-        file.seek(SeekFrom::Start(write_start as u64))
-            .map_err(|e| RdmaError::TransferFailed(format!("seek {path}: {e}")))?;
-        file.write_all(&data[..write_len])
-            .map_err(|e| RdmaError::TransferFailed(format!("write {path}: {e}")))?;
-
-        Ok(write_len)
-    }
-
-    unsafe fn handle_put_zc(
-        &self,
-        _s3_key:       &[u8],
-        token:         &[u8],
-        offset:        usize,
-        size:          usize,
-        write_fn:      crate::ffi::RdmaIoWriteFn,
-        write_fn_data: *mut std::ffi::c_void,
-    ) -> Result<usize, RdmaError> {
-        let (op, shm_name, token_size, _token_offset) = Self::parse_token(token)?;
-        if op != "PUT" {
-            return Err(RdmaError::TransferFailed(format!("expected PUT token, got {op}")));
-        }
-        let read_size = if size > 0 { size } else { token_size };
-        let path = format!("{}/{shm_name}", self.shm_dir);
-        self.dbg(&format!("handle_put_zc shm={shm_name} offset={offset} size={read_size}"));
-
-        let mut file = std::fs::File::open(&path)
-            .map_err(|e| RdmaError::TransferFailed(format!("open {path}: {e}")))?;
-        let file_len = file.metadata()
-            .map_err(|e| RdmaError::TransferFailed(format!("metadata {path}: {e}")))?
-            .len() as usize;
-
-        use std::io::{Seek, SeekFrom, Read};
-        let start = offset.min(file_len);
-        let end = (offset + read_size).min(file_len);
-        let want = end.saturating_sub(start);
-        let mut buf = vec![0u8; want];
-        file.seek(SeekFrom::Start(start as u64))
-            .map_err(|e| RdmaError::TransferFailed(format!("seek {path}: {e}")))?;
-        file.read_exact(&mut buf)
-            .map_err(|e| RdmaError::TransferFailed(format!("read {path}: {e}")))?;
-
-        let n = unsafe {
-            write_fn(write_fn_data, buf.as_ptr() as *const std::ffi::c_void, buf.len())
-        };
-        if n < 0 {
-            return Err(RdmaError::TransferFailed(format!("write_fn returned {n}")));
-        }
-        Ok(n as usize)
-    }
-
-    unsafe fn handle_get_zc(
-        &self,
-        _s3_key:      &[u8],
-        token:        &[u8],
-        offset:       usize,
-        read_fn:      crate::ffi::RdmaIoReadFn,
-        read_fn_data: *mut std::ffi::c_void,
-    ) -> Result<usize, RdmaError> {
-        let (op, shm_name, capacity, token_offset) = Self::parse_token(token)?;
-        if op != "GET" {
-            return Err(RdmaError::TransferFailed(format!("expected GET token, got {op}")));
-        }
-        let remaining_cap = capacity.saturating_sub(offset);
-        let buf_cap = if self.buf_size > 0 { remaining_cap.min(self.buf_size) } else { remaining_cap };
-        let mut buf = vec![0u8; buf_cap];
-
-        let n = unsafe {
-            read_fn(read_fn_data, buf.as_mut_ptr() as *mut std::ffi::c_void, buf_cap)
-        };
-        if n < 0 {
-            return Err(RdmaError::TransferFailed(format!("read_fn returned {n}")));
-        }
-        let read_bytes = n as usize;
-        let write_len = read_bytes.min(remaining_cap);
-        let write_start = token_offset + offset;
-        let path = format!("{}/{shm_name}", self.shm_dir);
-        self.dbg(&format!(
-            "handle_get_zc shm={shm_name} write={write_len} write_start={write_start}"
-        ));
-
-        use std::io::{Seek, SeekFrom, Write};
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .map_err(|e| RdmaError::TransferFailed(format!("open {path}: {e}")))?;
-        file.seek(SeekFrom::Start(write_start as u64))
-            .map_err(|e| RdmaError::TransferFailed(format!("seek {path}: {e}")))?;
-        file.write_all(&buf[..write_len])
-            .map_err(|e| RdmaError::TransferFailed(format!("write {path}: {e}")))?;
-
-        Ok(write_len)
+    fn open_channel(&self, key: &[u8], token: &[u8]) -> Result<Box<dyn RdmaServerChannel>, RdmaError> {
+        let (op, shm_name, token_size, token_offset) = Self::parse_token(token)?;
+        self.dbg(&format!("open_channel key={} shm={shm_name}", String::from_utf8_lossy(key)));
+        Ok(Box::new(MockChannel {
+            key:       key.to_vec(),
+            token:     token.to_vec(),
+            shm_dir:   self.shm_dir.clone(),
+            shm_name:  shm_name.to_owned(),
+            op:        op.to_owned(),
+            token_size,
+            token_offset,
+            buf_size:  if self.buf_size > 0 { self.buf_size } else { usize::MAX },
+            debug:     self.debug,
+        }))
     }
 
     // ── Telemetry (delegated to TelemState) ──────────────────────────────────

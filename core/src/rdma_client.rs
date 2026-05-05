@@ -12,8 +12,6 @@
 //! 3. `/lib64/`, `/usr/lib64/` (common CUDA/cuObject install locations).
 
 #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
-use crate::engine::RdmaEngine;
-#[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
 use crate::provider::{TelemetryConfig, TelemLevel};
 
 #[cfg(feature = "rdma-client")]
@@ -413,7 +411,6 @@ pub struct RdmaPlugin {
     #[cfg(feature = "rdma-server")]
     server: Option<crate::rdma_server::RdmaPluginServer>,
     buf_size:   usize,
-    pool_count: usize,
 }
 
 #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
@@ -426,7 +423,6 @@ impl std::fmt::Debug for RdmaPlugin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RdmaPlugin")
             .field("buf_size", &self.buf_size)
-            .field("pool_count", &self.pool_count)
             .finish()
     }
 }
@@ -445,7 +441,6 @@ impl RdmaPlugin {
                 #[cfg(feature = "rdma-server")]
                 server: None,
                 buf_size:   0,
-                pool_count: 0,
             })
         }
         #[cfg(not(feature = "rdma-client"))]
@@ -467,7 +462,6 @@ impl RdmaPlugin {
                 client: None,
                 server: Some(server),
                 buf_size:   cfg.buf_size,
-                pool_count: cfg.pool_count,
             })
         }
         #[cfg(not(feature = "rdma-server"))]
@@ -486,7 +480,6 @@ impl RdmaPlugin {
     /// (not a hard error); the server role is still available.
     /// If the server plugin fails, `Err` is returned.
     pub fn new_both(cfg: &crate::provider::RdmaServerConfig) -> Result<Self, crate::RdmaError> {
-        #[allow(unused_mut)]
         let mut ep = Self::new_server(cfg)?;
         #[cfg(feature = "rdma-client")]
         {
@@ -649,6 +642,17 @@ impl crate::provider::RdmaServerProvider for RdmaPlugin {
         self.buf_size
     }
 
+    fn open_channel(&self, key: &[u8], token: &[u8])
+        -> Result<Box<dyn crate::provider::RdmaServerChannel>, crate::RdmaError>
+    {
+        #[cfg(feature = "rdma-server")]
+        if let Some(s) = &self.server {
+            return s.open_channel(key, token);
+        }
+        let _ = (key, token);
+        Err(crate::RdmaError::OperationNotSupported("rdma server not loaded".into()))
+    }
+
     fn handle_put(
         &self,
         s3_key: &[u8],
@@ -748,11 +752,6 @@ impl crate::provider::RdmaServerProvider for RdmaPlugin {
         let _ = level;
         Err(crate::RdmaError::OperationNotSupported("rdma server not loaded".into()))
     }
-}
-
-#[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
-impl RdmaEngine for RdmaPlugin {
-    fn worker_count(&self) -> usize { self.pool_count }
 }
 
 #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
