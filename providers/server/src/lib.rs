@@ -26,6 +26,8 @@ mod mock;
 
 #[cfg(feature = "cuobj")]
 mod rdma;
+#[cfg(feature = "cuobj")]
+mod rdma_engine;
 
 // ── Named entry point ─────────────────────────────────────────────────────────
 

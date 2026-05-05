@@ -1,24 +1,25 @@
 //! cuObject RDMA server backend — NVIDIA SDK hardware implementation.
 //!
-//! Implements `handle_put` and `handle_get` (memcpy path).
-//! Zero-copy `handle_put_zc` / `handle_get_zc` are compiled into `hsg-rdma`
-//! (the gateway binary) and are not exported here.
+//! Uses [`CuObjEngine`] as the worker pool.  Each worker pre-allocates a
+//! channel and an RDMA-registered buffer at startup; channels are freed at
+//! worker exit.  Channels are not shared between threads.
 
 use std::ffi::{c_void, CStr};
 use std::os::raw::c_char;
 use std::sync::{Arc, OnceLock};
 
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use cuobj::server::CuObjServer;
 use s3_rdma::ffi::{ByteCursor, CTelemetryConfig, RdmaServerInitParams, RdmaServerVtable};
-use s3_rdma::provider::DEFAULT_RDMA_BUF_SIZE;
+use s3_rdma::provider::{DEFAULT_RDMA_BUF_SIZE, RdmaServerProvider};
+
+use crate::rdma_engine::CuObjEngine;
 
 static PROVIDER_NAME: &[u8] = b"s3-rdma-server\0";
 
 struct ServerProvider {
-    server:   Arc<CuObjServer>,
-    buf_size: usize,
+    engine: CuObjEngine,
 }
 
 unsafe impl Send for ServerProvider {}
@@ -67,14 +68,17 @@ unsafe extern "C" fn c_init(params: *const RdmaServerInitParams, _ctx: *mut *mut
         }
     };
 
-    let buf_size = if p.buf_size > 0 { p.buf_size } else { DEFAULT_RDMA_BUF_SIZE };
+    let buf_size   = if p.buf_size > 0 { p.buf_size } else { DEFAULT_RDMA_BUF_SIZE };
+    let pool_count = p.pool_count.max(1);
+    let engine     = CuObjEngine::new(srv, pool_count, buf_size);
+
     info!(
-        "[s3-rdma-server] listening {addr}:{port}, buf={mb}MiB",
+        "[s3-rdma-server] listening {addr}:{port}, workers={pool_count}, buf={mb}MiB",
         port = p.listen_port,
         mb   = buf_size / (1024 * 1024),
     );
 
-    if PROVIDER.set(Some(Box::new(ServerProvider { server: srv, buf_size }))).is_err() {
+    if PROVIDER.set(Some(Box::new(ServerProvider { engine }))).is_err() {
         error!("[s3-rdma-server] c_init: called more than once");
         return -1;
     }
@@ -82,8 +86,9 @@ unsafe extern "C" fn c_init(params: *const RdmaServerInitParams, _ctx: *mut *mut
 }
 
 unsafe extern "C" fn c_cleanup(_ctx: *mut c_void) {
-    // INTENTIONAL NO-OP: the CuObjServer singleton lives for the process
-    // lifetime.  cuobj_srv_destroy is called implicitly when the process exits.
+    // Drop the engine — closes channel, joins workers, frees per-worker
+    // channels and buffers.
+    let _ = PROVIDER.set(None);
 }
 
 unsafe extern "C" fn c_handle_put(
@@ -99,39 +104,15 @@ unsafe extern "C" fn c_handle_put(
         return -1;
     }
     let Some(p) = get_provider() else { return -1 };
-
     let key_bytes   = unsafe { (*s3_key).as_slice() };
     let token_bytes = unsafe { (*token).as_slice() };
-    let key_str   = match std::str::from_utf8(key_bytes)   { Ok(s) => s, Err(_) => return -1 };
-    let token_str = match std::str::from_utf8(token_bytes) { Ok(s) => s, Err(_) => return -1 };
 
-    let channel = match p.server.alloc_channel() {
-        Ok(ch) => ch,
+    let buf_cap = p.engine.buf_size();
+    let mut buf_slice = unsafe { std::slice::from_raw_parts_mut(buf, buf_cap) };
+    match p.engine.handle_put(key_bytes, token_bytes, &mut buf_slice, offset, size) {
+        Ok(n) => { unsafe { *out_transferred = n; } 0 }
         Err(e) => {
-            error!("[s3-rdma-server] handle_put({key_str}): alloc_channel: {e}");
-            return -1;
-        }
-    };
-    let rdma_buf = match p.server.alloc_buffer(p.buf_size) {
-        Ok(b)  => b,
-        Err(e) => {
-            error!("[s3-rdma-server] handle_put({key_str}): alloc buffer: {e}");
-            return -1;
-        }
-    };
-
-    let buf_cap = if size > 0 { size } else { rdma_buf.len() };
-    match p.server.handle_put(key_str, &rdma_buf, offset as u64, buf_cap, token_str, &channel) {
-        Ok(n) => {
-            let copy_len = n.min(buf_cap);
-            unsafe {
-                std::ptr::copy_nonoverlapping(rdma_buf.as_ptr(), buf, copy_len);
-                *out_transferred = copy_len;
-            }
-            0
-        }
-        Err(e) => {
-            error!("[s3-rdma-server] handle_put({key_str}): {e}");
+            error!("[s3-rdma-server] handle_put: {e}");
             -1
         }
     }
@@ -149,46 +130,65 @@ unsafe extern "C" fn c_handle_get(
         return -1;
     }
     let Some(p) = get_provider() else { return -1 };
-
-    let key_bytes   = unsafe { (*s3_key).as_slice() };
-    let data_bytes  = unsafe { (*data).as_slice() };
+    let key_bytes  = unsafe { (*s3_key).as_slice() };
+    let data_bytes = unsafe { (*data).as_slice() };
     let token_bytes = unsafe { (*token).as_slice() };
-    let key_str   = match std::str::from_utf8(key_bytes)   { Ok(s) => s, Err(_) => return -1 };
-    let token_str = match std::str::from_utf8(token_bytes) { Ok(s) => s, Err(_) => return -1 };
 
-    let channel = match p.server.alloc_channel() {
-        Ok(ch) => ch,
+    match p.engine.handle_get(key_bytes, data_bytes, token_bytes, offset) {
+        Ok(n) => { unsafe { *out_written = n; } 0 }
         Err(e) => {
-            error!("[s3-rdma-server] handle_get({key_str}): alloc_channel: {e}");
-            return -1;
+            error!("[s3-rdma-server] handle_get: {e}");
+            -1
         }
-    };
-    let rdma_buf = match p.server.alloc_buffer(p.buf_size) {
-        Ok(b)  => b,
-        Err(e) => {
-            error!("[s3-rdma-server] handle_get({key_str}): alloc buffer: {e}");
-            return -1;
-        }
-    };
-
-    let n = data_bytes.len().min(rdma_buf.len());
-    if data_bytes.len() > rdma_buf.len() {
-        warn!(
-            "[s3-rdma-server] handle_get({key_str}): data ({}) > rdma_buf ({}), truncating",
-            data_bytes.len(), rdma_buf.len()
-        );
     }
-    unsafe {
-        std::ptr::copy_nonoverlapping(data_bytes.as_ptr(), rdma_buf.as_ptr() as *mut u8, n);
-    }
+}
 
-    match p.server.handle_get(key_str, &rdma_buf, offset as u64, n, token_str, &channel) {
-        Ok(written) => {
-            unsafe { *out_written = written; }
-            0
-        }
+unsafe extern "C" fn c_handle_put_zc(
+    _ctx:            *mut c_void,
+    s3_key:          *const ByteCursor,
+    token:           *const ByteCursor,
+    offset:          usize,
+    size:            usize,
+    write_fn:        s3_rdma::ffi::RdmaIoWriteFn,
+    write_fn_data:   *mut c_void,
+    out_transferred: *mut usize,
+) -> i32 {
+    if s3_key.is_null() || token.is_null() || out_transferred.is_null() {
+        return -1;
+    }
+    let Some(p) = get_provider() else { return -1 };
+    let key_bytes   = unsafe { (*s3_key).as_slice() };
+    let token_bytes = unsafe { (*token).as_slice() };
+
+    match unsafe { p.engine.handle_put_zc(key_bytes, token_bytes, offset, size, write_fn, write_fn_data) } {
+        Ok(n) => { unsafe { *out_transferred = n; } 0 }
         Err(e) => {
-            error!("[s3-rdma-server] handle_get({key_str}): {e}");
+            error!("[s3-rdma-server] handle_put_zc: {e}");
+            -1
+        }
+    }
+}
+
+unsafe extern "C" fn c_handle_get_zc(
+    _ctx:          *mut c_void,
+    s3_key:        *const ByteCursor,
+    token:         *const ByteCursor,
+    offset:        usize,
+    read_fn:       s3_rdma::ffi::RdmaIoReadFn,
+    read_fn_data:  *mut c_void,
+    out_written:   *mut usize,
+) -> i32 {
+    if s3_key.is_null() || token.is_null() || out_written.is_null() {
+        return -1;
+    }
+    let Some(p) = get_provider() else { return -1 };
+    let key_bytes   = unsafe { (*s3_key).as_slice() };
+    let token_bytes = unsafe { (*token).as_slice() };
+
+    match unsafe { p.engine.handle_get_zc(key_bytes, token_bytes, offset, read_fn, read_fn_data) } {
+        Ok(n) => { unsafe { *out_written = n; } 0 }
+        Err(e) => {
+            error!("[s3-rdma-server] handle_get_zc: {e}");
             -1
         }
     }
@@ -232,13 +232,13 @@ unsafe extern "C" fn c_set_telem_level(_: *mut c_void, level: u32) -> i32 {
 
 static VTABLE: RdmaServerVtable = RdmaServerVtable {
     provider_name:    PROVIDER_NAME.as_ptr() as *const c_char,
-    provider_version: 3,
+    provider_version: 4,
     init:             Some(c_init),
     cleanup:          Some(c_cleanup),
     handle_put:       Some(c_handle_put),
     handle_get:       Some(c_handle_get),
-    handle_put_zc:    None, // zero-copy path lives in hsg-rdma (gateway binary)
-    handle_get_zc:    None, // zero-copy path lives in hsg-rdma (gateway binary)
+    handle_put_zc:    Some(c_handle_put_zc),
+    handle_get_zc:    Some(c_handle_get_zc),
     supports_telemetry: Some(c_supports_telemetry),
     setup_telemetry:    Some(c_setup_telemetry),
     shutdown_telemetry: Some(c_shutdown_telemetry),

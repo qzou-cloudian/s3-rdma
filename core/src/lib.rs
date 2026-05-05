@@ -17,7 +17,7 @@
 //!   from one instance
 //! - [`RdmaPluginClient`] / [`RdmaPluginServer`] — focused single-role
 //!   wrappers (require `rdma-client` / `rdma-server` feature respectively)
-//! - [`RdmaEngine`] — fixed-size worker pool wrapping any provider (feature `engine`)
+//! - [`RdmaEngine`] — trait for provider-specific worker pools (feature `engine`)
 //!
 //! ## Choosing the right trait
 //!
@@ -54,8 +54,9 @@
 
 pub(crate) mod rdma_client;
 pub(crate) mod rdma_server;
-#[cfg(feature = "engine")]
 pub mod engine;
+#[cfg(feature = "engine")]
+pub mod mock_engine;
 pub mod error;
 pub mod ffi;
 pub mod mock;
@@ -85,7 +86,7 @@ pub use token::RdmaToken;
 pub use pool::{BufferPool, BufferPoolBuilder, BufferPoolError, OwnedBufferGuard};
 
 #[cfg(feature = "engine")]
-pub use engine::{RdmaEngine, RdmaEngineConfig};
+pub use engine::RdmaEngine;
 
 #[cfg(feature = "rdma-client")]
 pub use rdma_client::RdmaPluginClient;
@@ -216,3 +217,70 @@ pub fn create_server_provider(
         .map(|p| p as Arc<dyn RdmaServerProvider>)
 }
 
+/// Build a `Box<dyn RdmaEngine>` for the named provider.
+///
+/// Constructs a provider-specific engine: a bounded worker pool for server-side
+/// RDMA operations.  Each provider manages its own worker lifecycle — mock uses
+/// a simple thread pool, cuobj pre-allocates per-worker channels and buffers.
+///
+/// `provider` must be one of:
+/// - `"mock"`   → engine wrapping a [`MockRdmaProvider`] (requires `engine` feature)
+/// - `"rdma"`  → [`RdmaPlugin`] (requires `rdma-client`/`rdma-server` features)
+/// - `"auto"`  → tries `"rdma"` first, falls back to `"mock"`
+///
+/// The engine is returned as `Box<dyn RdmaEngine>` so callers work through the
+/// trait — concrete engine types are not part of the public API.
+pub fn create_engine(
+    provider: &str,
+    debug: bool,
+    cfg: &RdmaServerConfig,
+) -> Result<Box<dyn crate::engine::RdmaEngine>, RdmaError> {
+    match provider {
+        "mock" => {
+            #[cfg(feature = "engine")]
+            {
+                if debug {
+                    info!("[rdma] Using MockRdmaEngine");
+                }
+                let inner = Arc::new(MockRdmaProvider::new(debug, &cfg.shm_path, cfg.buf_size));
+                let workers = cfg.pool_count.max(1);
+                Ok(Box::new(mock_engine::MockRdmaEngine::new(inner, workers))
+                    as Box<dyn crate::engine::RdmaEngine>)
+            }
+            #[cfg(not(feature = "engine"))]
+            {
+                let _ = (debug, cfg);
+                Err(RdmaError::ProviderUnavailable {
+                    provider: provider.to_owned(),
+                    reason: "compiled without the `engine` feature".into(),
+                })
+            }
+        }
+        "rdma" => {
+            #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
+            {
+                let plugin = RdmaPlugin::new_server(cfg)?;
+                if debug {
+                    info!("[rdma] Using RdmaPlugin engine ({} workers)", plugin.worker_count());
+                }
+                Ok(Box::new(plugin) as Box<dyn crate::engine::RdmaEngine>)
+            }
+            #[cfg(not(any(feature = "rdma-client", feature = "rdma-server")))]
+            {
+                let _ = (debug, cfg);
+                Err(RdmaError::ProviderUnavailable {
+                    provider: provider.to_owned(),
+                    reason: "compiled without `rdma-client` or `rdma-server` features".into(),
+                })
+            }
+        }
+        "auto" => match create_engine("rdma", debug, cfg) {
+            Ok(e) => Ok(e),
+            Err(_) => create_engine("mock", debug, cfg),
+        }
+        other => Err(RdmaError::ProviderUnavailable {
+            provider: other.to_owned(),
+            reason: "unknown provider (valid: mock, rdma, auto)".to_owned(),
+        }),
+    }
+}

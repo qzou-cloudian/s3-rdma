@@ -12,6 +12,8 @@
 //! 3. `/lib64/`, `/usr/lib64/` (common CUDA/cuObject install locations).
 
 #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
+use crate::engine::RdmaEngine;
+#[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
 use crate::provider::{TelemetryConfig, TelemLevel};
 
 #[cfg(feature = "rdma-client")]
@@ -410,7 +412,8 @@ pub struct RdmaPlugin {
     client: Option<real::RdmaPluginClient>,
     #[cfg(feature = "rdma-server")]
     server: Option<crate::rdma_server::RdmaPluginServer>,
-    buf_size: usize,
+    buf_size:   usize,
+    pool_count: usize,
 }
 
 #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
@@ -423,6 +426,7 @@ impl std::fmt::Debug for RdmaPlugin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RdmaPlugin")
             .field("buf_size", &self.buf_size)
+            .field("pool_count", &self.pool_count)
             .finish()
     }
 }
@@ -440,7 +444,8 @@ impl RdmaPlugin {
                 client: Some(client),
                 #[cfg(feature = "rdma-server")]
                 server: None,
-                buf_size: 0,
+                buf_size:   0,
+                pool_count: 0,
             })
         }
         #[cfg(not(feature = "rdma-client"))]
@@ -461,7 +466,8 @@ impl RdmaPlugin {
                 #[cfg(feature = "rdma-client")]
                 client: None,
                 server: Some(server),
-                buf_size: cfg.buf_size,
+                buf_size:   cfg.buf_size,
+                pool_count: cfg.pool_count,
             })
         }
         #[cfg(not(feature = "rdma-server"))]
@@ -742,6 +748,11 @@ impl crate::provider::RdmaServerProvider for RdmaPlugin {
         let _ = level;
         Err(crate::RdmaError::OperationNotSupported("rdma server not loaded".into()))
     }
+}
+
+#[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
+impl RdmaEngine for RdmaPlugin {
+    fn worker_count(&self) -> usize { self.pool_count }
 }
 
 #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
