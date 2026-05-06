@@ -107,7 +107,7 @@ impl RdmaServerChannel for SyncChannel {
     }
 
     fn handle_get(
-        &self, offset: usize,
+        &self, offset: usize, _size: usize,
         read: Box<dyn FnOnce(&mut [u8]) -> usize + Send + '_>,
     ) -> Result<usize, RdmaError> {
         let guard = self.get_buffer()?;

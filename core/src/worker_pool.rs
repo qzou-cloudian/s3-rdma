@@ -40,21 +40,20 @@ pub(crate) enum ClientWorkItem {
 
 enum ServerWorkItem {
     Put {
-        key:           Vec<u8>,
-        token:         Vec<u8>,
-        offset:        usize,
-        size:          usize,
-        write_fn:      usize,
-        write_fn_data: usize,
-        result_tx:     SyncSender<Result<usize, String>>,
+        key:       Vec<u8>,
+        token:     Vec<u8>,
+        offset:    usize,
+        size:      usize,
+        write:     usize,  // Box<Box<dyn FnOnce(&[u8]) -> Result<usize, RdmaError> + Send>> as *mut _ as usize
+        result_tx: SyncSender<Result<usize, String>>,
     },
     Get {
-        key:           Vec<u8>,
-        token:         Vec<u8>,
-        offset:        usize,
-        read_fn:       usize,
-        read_fn_data:  usize,
-        result_tx:     SyncSender<Result<usize, String>>,
+        key:       Vec<u8>,
+        token:     Vec<u8>,
+        offset:    usize,
+        size:      usize,
+        read:      usize,  // Box<Box<dyn FnOnce(&mut [u8]) -> usize + Send>> as *mut _ as usize
+        result_tx: SyncSender<Result<usize, String>>,
     },
 }
 
@@ -108,21 +107,19 @@ fn server_worker_main(
             Err(_) => break,
         };
         match work {
-            ServerWorkItem::Put { key, token, offset, size, write_fn, write_fn_data, result_tx } => {
-                let write_fn: RdmaIoWriteFn = unsafe { std::mem::transmute(write_fn) };
-                let write_fn_data = write_fn_data as *mut std::ffi::c_void;
+            ServerWorkItem::Put { key, token, offset, size, write, result_tx } => {
+                let write = *unsafe { Box::from_raw(write as *mut Box<dyn FnOnce(&[u8]) -> Result<usize, RdmaError> + Send>) };
                 let r = (|| -> Result<usize, RdmaError> {
                     let ch = RdmaServerProvider::open_channel(provider.as_ref(), &key, &token)?;
-                    unsafe { ch.handle_put(offset, size, write_fn, write_fn_data) }
+                    ch.handle_put(offset, size, write)
                 })().map_err(|e| e.to_string());
                 let _ = result_tx.send(r);
             }
-            ServerWorkItem::Get { key, token, offset, read_fn, read_fn_data, result_tx } => {
-                let read_fn: RdmaIoReadFn = unsafe { std::mem::transmute(read_fn) };
-                let read_fn_data = read_fn_data as *mut std::ffi::c_void;
+            ServerWorkItem::Get { key, token, offset, size, read, result_tx } => {
+                let read = *unsafe { Box::from_raw(read as *mut Box<dyn FnOnce(&mut [u8]) -> usize + Send>) };
                 let r = (|| -> Result<usize, RdmaError> {
                     let ch = RdmaServerProvider::open_channel(provider.as_ref(), &key, &token)?;
-                    unsafe { ch.handle_get(offset, read_fn, read_fn_data) }
+                    ch.handle_get(offset, size, read)
                 })().map_err(|e| e.to_string());
                 let _ = result_tx.send(r);
             }
@@ -191,32 +188,30 @@ impl RdmaServerChannel for PoolServerChannel {
     fn token(&self) -> &[u8] { &self.token }
     fn buf_size(&self) -> usize { 0 }
 
-    unsafe fn handle_put(
+    fn handle_put(
         &self, offset: usize, size: usize,
-        write_fn: RdmaIoWriteFn, write_fn_data: *mut std::ffi::c_void,
+        write: Box<dyn FnOnce(&[u8]) -> Result<usize, RdmaError> + Send + '_>,
     ) -> Result<usize, RdmaError> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.sender.send(ServerWorkItem::Put {
             key: self.key.clone(), token: self.token.clone(),
             offset, size,
-            write_fn: write_fn as usize,
-            write_fn_data: write_fn_data as usize,
+            write: Box::into_raw(Box::new(write)) as usize,
             result_tx: tx,
         }).map_err(|e| RdmaError::TransferFailed(e.to_string()))?;
         rx.recv().map_err(|e| RdmaError::TransferFailed(e.to_string()))?
             .map_err(RdmaError::TransferFailed)
     }
 
-    unsafe fn handle_get(
-        &self, offset: usize,
-        read_fn: RdmaIoReadFn, read_fn_data: *mut std::ffi::c_void,
+    fn handle_get(
+        &self, offset: usize, size: usize,
+        read: Box<dyn FnOnce(&mut [u8]) -> usize + Send + '_>,
     ) -> Result<usize, RdmaError> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.sender.send(ServerWorkItem::Get {
             key: self.key.clone(), token: self.token.clone(),
-            offset,
-            read_fn: read_fn as usize,
-            read_fn_data: read_fn_data as usize,
+            offset, size,
+            read: Box::into_raw(Box::new(read)) as usize,
             result_tx: tx,
         }).map_err(|e| RdmaError::TransferFailed(e.to_string()))?;
         rx.recv().map_err(|e| RdmaError::TransferFailed(e.to_string()))?

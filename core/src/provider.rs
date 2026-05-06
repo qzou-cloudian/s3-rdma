@@ -498,9 +498,11 @@ pub trait RdmaServerChannel: Send + Sync {
     /// written into it.
     ///
     /// `offset` is the byte offset into the client's registered buffer.
+    /// `size` is the number of bytes to transfer (0 = use token capacity).
     fn handle_get(
         &self,
         offset: usize,
+        size:   usize,
         read:   Box<dyn FnOnce(&mut [u8]) -> usize + Send + '_>,
     ) -> Result<usize, crate::error::RdmaError>;
 
