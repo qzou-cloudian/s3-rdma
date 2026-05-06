@@ -1,6 +1,7 @@
 /target/
 **/*.rs.bk
 /Cargo.lock
+*.log
 
 # Java build output
 bindings/java/target/

@@ -397,7 +397,7 @@ impl PyMockRdmaProvider {
 ///
 /// Equivalent to ``RdmaProvider(provider="cuobj", role=role)`` with a
 /// simpler constructor.  Raises ``RuntimeError`` if the cuObj plugin
-/// (``libs3rdmacuobjclient.so`` / ``libs3rdmacuobjserver.so``) cannot be
+/// (``libs3rdmaclient.so`` / ``libs3rdmaserver.so``) cannot be
 /// found at runtime.
 ///
 /// Example (client role)::

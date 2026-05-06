@@ -8,7 +8,7 @@
 //!
 //! Supported provider names:
 //! - `"mock"`   — shared-memory simulation, always available (feature `mock`)
-//! - `"rdma"` — cuObject RDMA hardware backend (feature `cuobj`)
+//! - `"cuobj"` — cuObject RDMA hardware backend (feature `cuobj`)
 //! - anything else → returns `NULL`
 //!
 //! Adding a new backend (e.g. UCX): add a Cargo feature, implement shims in a
@@ -50,7 +50,7 @@ pub unsafe extern "C" fn s3_rdma_get_server_vtable(
         #[cfg(feature = "mock")]
         "mock" => mock::vtable(),
         #[cfg(feature = "cuobj")]
-        "rdma" => rdma::vtable(),
+        "cuobj" => rdma::vtable(),
         _ => std::ptr::null(),
     }
 }

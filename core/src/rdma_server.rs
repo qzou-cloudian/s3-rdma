@@ -69,7 +69,7 @@ mod real {
                 )
             })?;
 
-            let provider_name = CString::new("rdma").unwrap();
+            let provider_name = CString::new("cuobj").unwrap();
             let vtable: *const RdmaServerVtable = unsafe {
                 let get_vtable: Symbol<GetNamedServerVtableFn> = lib
                     .get(b"s3_rdma_get_server_vtable\0")
@@ -77,7 +77,7 @@ mod real {
                 let ptr = get_vtable(provider_name.as_ptr());
                 if ptr.is_null() {
                     return Err(RdmaError::RdmaPluginLoadFailed(
-                        "s3_rdma_get_server_vtable(\"rdma\") returned null".into()
+                        "s3_rdma_get_server_vtable(\"cuobj\") returned null".into()
                     ));
                 }
                 ptr

@@ -108,15 +108,20 @@ use tracing::info;
 
 pub use error::RdmaError;
 
+/// Provider name constants for [`create_provider`].
+pub const PROVIDER_AUTO: &str = "auto";
+pub const PROVIDER_CUOBJ: &str = "cuobj";
+pub const PROVIDER_MOCK: &str = "mock";
+
 /// Returns a one-line summary of compiled-in RDMA providers and their runtime
-/// availability, e.g. `"RDMA providers: rdma (available), mock"`.
+/// availability, e.g. `"RDMA providers: cuobj (available), mock"`.
 pub fn rdma_provider_info() -> String {
     let mut entries: Vec<String> = Vec::new();
 
     #[cfg(feature = "rdma-client")]
     {
         let status = if rdma_available() { "available" } else { "unavailable" };
-        entries.push(format!("rdma ({status})"));
+        entries.push(format!("cuobj ({status})"));
     }
 
     entries.push("mock".into());
@@ -128,8 +133,8 @@ pub fn rdma_provider_info() -> String {
 ///
 /// `provider` must be one of:
 /// - `"mock"`   → [`MockRdmaProvider`]
-/// - `"rdma"`  → [`RdmaPlugin`] (requires `rdma-client`/`rdma-server` features)
-/// - `"auto"`  → tries `"rdma"` first, falls back to `"mock"`
+/// - `"cuobj"`  → [`RdmaPlugin`] (requires `rdma-client`/`rdma-server` features)
+/// - `"auto"`  → tries `"cuobj"` first, falls back to `"mock"`
 ///
 /// `role` specifies which capabilities to initialise:
 /// - [`RdmaRole::Client`]  — client methods (register/token/reply) only
@@ -152,7 +157,7 @@ pub fn create_provider(
             }
             Arc::new(MockRdmaProvider::new(debug, &cfg.shm_path, cfg.buf_size))
         }
-        "rdma" => {
+        "cuobj" => {
             let result: Result<Arc<dyn RdmaProvider>, RdmaError>;
             #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
             {
@@ -182,15 +187,15 @@ pub fn create_provider(
             result?
         }
         "auto" => {
-            // Try rdma first; fall back to mock on any error.
-            match create_provider("rdma", debug, role, cfg) {
+            // Try cuobj first; fall back to mock on any error.
+            match create_provider("cuobj", debug, role, cfg) {
                 Ok(ep) => return Ok(ep),
                 Err(_) => return create_provider("mock", debug, role, cfg),
             }
         }
         other => return Err(RdmaError::ProviderUnavailable {
             provider: other.to_owned(),
-            reason: "unknown provider (valid: mock, rdma, auto)".to_owned(),
+            reason: "unknown provider (valid: mock, cuobj, auto)".to_owned(),
         }),
     };
     Ok(ep)
@@ -231,8 +236,8 @@ pub fn create_server_provider(
 ///
 /// `provider` must be one of:
 /// - `"mock"`   → pool around [`MockRdmaProvider`] (requires `engine` feature)
-/// - `"rdma"`  → pool around [`RdmaPlugin`] (requires `rdma-server` feature)
-/// - `"auto"`  → tries `"rdma"` first, falls back to `"mock"`
+/// - `"cuobj"`  → pool around [`RdmaPlugin`] (requires `rdma-server` feature)
+/// - `"auto"`  → tries `"cuobj"` first, falls back to `"mock"`
 ///
 /// Returned as `Box<dyn RdmaServerProvider>` — use the trait for all operations.
 pub fn create_worker_pool(
@@ -246,7 +251,7 @@ pub fn create_worker_pool(
             if debug { info!("[rdma] MockRdmaProvider in pool ({workers} workers)"); }
             Arc::new(MockRdmaProvider::new(debug, &cfg.shm_path, cfg.buf_size))
         }
-        "rdma" => {
+        "cuobj" => {
             #[cfg(feature = "rdma-server")]
             {
                 let plugin = RdmaPlugin::new_server(cfg)?;
@@ -263,14 +268,14 @@ pub fn create_worker_pool(
             }
         }
         "auto" => {
-            match create_worker_pool("rdma", debug, cfg, workers) {
+            match create_worker_pool("cuobj", debug, cfg, workers) {
                 Ok(p) => return Ok(p),
                 Err(_) => return create_worker_pool("mock", debug, cfg, workers),
             }
         }
         other => return Err(RdmaError::ProviderUnavailable {
             provider: other.to_owned(),
-            reason: "unknown provider (valid: mock, rdma, auto)".to_owned(),
+            reason: "unknown provider (valid: mock, cuobj, auto)".to_owned(),
         }),
     };
     Ok(Box::new(worker_pool::RdmaWorkerPool::new(inner, workers)))

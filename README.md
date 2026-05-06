@@ -222,7 +222,7 @@ Two separate plugins are loaded at runtime:
 |----------|-----------|-------------|
 | `s3_rdma_get_server_vtable()` | Server | `RdmaServerVtable` — used by the gateway |
 
-Both `.so` files accept a backend name parameter (e.g. `"rdma"` for cuObject hardware, `"mock"` for testing). Plugins are loaded at runtime via `libloading` — no compile-time SDK dependency. The host searches for the plugin in this order:
+Both `.so` files accept a backend name parameter (e.g. `"cuobj"` for cuObject hardware, `"mock"` for testing). Plugins are loaded at runtime via `libloading` — no compile-time SDK dependency. The host searches for the plugin in this order:
 
 1. Standard dynamic-linker paths (`LD_LIBRARY_PATH`, RPATH, ldconfig cache)
 2. Directory alongside the running executable
@@ -240,10 +240,10 @@ let ep: Arc<dyn RdmaProvider> = create_provider("auto", true, RdmaRole::Both, &c
 let ep: Arc<dyn RdmaClientProvider> = create_client_provider("mock", false, &cfg)?;
 
 // Server-only
-let ep: Arc<dyn RdmaServerProvider> = create_server_provider("rdma", false, &cfg)?;
+let ep: Arc<dyn RdmaServerProvider> = create_server_provider("cuobj", false, &cfg)?;
 ```
 
-`"auto"` tries the `"rdma"` plugin first, then falls back to `"mock"`.
+`"auto"` tries the `"cuobj"` plugin first, then falls back to `"mock"`.
 
 ---
 

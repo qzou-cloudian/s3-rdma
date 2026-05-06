@@ -83,7 +83,7 @@ The `rdma-client` and `rdma-server` features enable runtime loading of `.so` plu
 - **`providers/client/`** → `libs3rdmaclient.so` exports `s3_rdma_get_client_vtable(name)` → returns `*const RdmaProviderVtable`
 - **`providers/server/`** → `libs3rdmaserver.so` exports `s3_rdma_get_server_vtable(name)` → returns `*const RdmaServerVtable`
 
-Each plugin accepts a backend name string (`"mock"` or `"rdma"`) and routes to the corresponding implementation. The `"mock"` backend in `providers/client/src/mock.rs` delegates to `MockRdmaProvider`; the `"rdma"` backend in `providers/client/src/rdma.rs` uses the `cuobj` crate for real NVIDIA hardware.
+Each plugin accepts a backend name string (`"mock"` or `"cuobj"`) and routes to the corresponding implementation. The `"mock"` backend in `providers/client/src/mock.rs` delegates to `MockRdmaProvider`; the `"cuobj"` backend in `providers/client/src/rdma.rs` uses the `cuobj` crate for real NVIDIA hardware.
 
 Plugin search order: `LD_LIBRARY_PATH` → executable dir → `/lib64/` → `/usr/lib64/`. This means the main binary has **no compile-time dependency** on any RDMA SDK.
 
@@ -99,7 +99,7 @@ Plugin search order: `LD_LIBRARY_PATH` → executable dir → `/lib64/` → `/us
 
 ### Provider factory functions (core/src/lib.rs)
 
-`create_provider(name, debug, role, cfg)` returns `Arc<dyn RdmaProvider>`. Name can be `"mock"`, `"rdma"`, or `"auto"` (tries rdma first, falls back to mock). There are also `create_client_provider` and `create_server_provider` convenience wrappers.
+`create_provider(name, debug, role, cfg)` returns `Arc<dyn RdmaProvider>`. Name can be `"mock"`, `"cuobj"`, or `"auto"` (tries cuobj first, falls back to mock). There are also `create_client_provider` and `create_server_provider` convenience wrappers.
 
 ### Key supporting types
 

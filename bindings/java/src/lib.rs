@@ -2,7 +2,7 @@
 //!
 //! Exposes the unified `RdmaProvider` Java class backed by
 //! `Box<Arc<dyn RdmaProvider>>`, supporting client, server, and both roles
-//! with any provider (`"mock"`, `"rdma"`, `"auto"`).
+//! with any provider (`"mock"`, `"cuobj"`, `"auto"`).
 
 use std::sync::Arc;
 

@@ -64,7 +64,7 @@ mod real {
     /// RDMA client provider that loads `libs3rdmaclient.so` at runtime and
     /// calls through the exported [`RdmaProviderVtable`].
     ///
-    /// The plugin is queried for the `"rdma"` backend name; the `.so` routes
+    /// The plugin is queried for the `"cuobj"` backend name; the `.so` routes
     /// this to whichever hardware backend it was compiled with (currently cuObj).
     pub struct RdmaPluginClient {
         // Order matters: ctx/vtable must be dropped (logically) before _lib
@@ -97,7 +97,7 @@ mod real {
                 )
             })?;
 
-            let provider_name = CString::new("rdma").unwrap();
+            let provider_name = CString::new("cuobj").unwrap();
             let vtable: *const RdmaProviderVtable = unsafe {
                 let get_vtable: Symbol<GetNamedClientVtableFn> = lib
                     .get(b"s3_rdma_get_client_vtable\0")
@@ -105,7 +105,7 @@ mod real {
                 let ptr = get_vtable(provider_name.as_ptr());
                 if ptr.is_null() {
                     return Err(RdmaError::RdmaPluginLoadFailed(
-                        "s3_rdma_get_client_vtable(\"rdma\") returned null".into()
+                        "s3_rdma_get_client_vtable(\"cuobj\") returned null".into()
                     ));
                 }
                 ptr
@@ -412,7 +412,7 @@ impl RdmaPlugin {
         #[cfg(not(feature = "rdma-client"))]
         {
             Err(crate::RdmaError::ProviderUnavailable {
-                provider: "rdma".into(),
+                provider: "cuobj".into(),
                 reason: "compiled without the `rdma-client` feature".into(),
             })
         }
@@ -434,7 +434,7 @@ impl RdmaPlugin {
         {
             let _ = cfg;
             Err(crate::RdmaError::ProviderUnavailable {
-                provider: "rdma".into(),
+                provider: "cuobj".into(),
                 reason: "compiled without the `rdma-server` feature".into(),
             })
         }
@@ -458,7 +458,7 @@ impl RdmaPlugin {
 #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
 impl crate::provider::RdmaClientProvider for RdmaPlugin {
     fn name(&self) -> &str { "RdmaPlugin" }
-    fn protocol(&self) -> &str { "rdma" }
+    fn protocol(&self) -> &str { "cuobj" }
 
     fn is_memory_suitable(&self, ptr: *const u8, size: usize) -> bool {
         #[cfg(feature = "rdma-client")]
