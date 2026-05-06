@@ -92,9 +92,9 @@ impl RdmaServerChannel for SyncChannel {
     fn token(&self) -> &[u8] { &self.token }
     fn buf_size(&self) -> usize { self.buf_size }
 
-    unsafe fn handle_put(
+    fn handle_put(
         &self, offset: usize, size: usize,
-        write_fn: s3_rdma::ffi::RdmaIoWriteFn, write_fn_data: *mut std::ffi::c_void,
+        write: Box<dyn FnOnce(&[u8]) -> Result<usize, RdmaError> + Send + '_>,
     ) -> Result<usize, RdmaError> {
         let guard = self.get_buffer()?;
         let b = guard.as_ref().unwrap();
@@ -102,26 +102,20 @@ impl RdmaServerChannel for SyncChannel {
         let ts = std::str::from_utf8(&self.token).unwrap_or("");
         let n = b.handle_put(ks, offset, size, ts, Some(self.channel_id))
             .map_err(|e| RdmaError::TransferFailed(format!("{e:?}")))?;
-        let wr = write_fn(write_fn_data, b.as_ptr() as *const std::ffi::c_void, n);
-        if wr < 0 {
-            return Err(RdmaError::TransferFailed(format!("write_fn returned {wr}")));
-        }
-        Ok(wr as usize)
+        let buf = unsafe { std::slice::from_raw_parts(b.as_ptr(), n) };
+        write(buf)
     }
 
-    unsafe fn handle_get(
+    fn handle_get(
         &self, offset: usize,
-        read_fn: s3_rdma::ffi::RdmaIoReadFn, read_fn_data: *mut std::ffi::c_void,
+        read: Box<dyn FnOnce(&mut [u8]) -> usize + Send + '_>,
     ) -> Result<usize, RdmaError> {
         let guard = self.get_buffer()?;
         let b = guard.as_ref().unwrap();
         let ks = std::str::from_utf8(&self.key).unwrap_or("");
         let ts = std::str::from_utf8(&self.token).unwrap_or("");
-        let n = read_fn(read_fn_data, b.as_ptr() as *mut std::ffi::c_void, b.len());
-        if n < 0 {
-            return Err(RdmaError::TransferFailed(format!("read_fn returned {n}")));
-        }
-        let n = n as usize;
+        let buf = unsafe { std::slice::from_raw_parts_mut(b.as_ptr() as *mut u8, b.len()) };
+        let n = read(buf);
         b.handle_get(ks, offset, n, ts, Some(self.channel_id))
             .map_err(|e| RdmaError::TransferFailed(format!("{e:?}")))
     }

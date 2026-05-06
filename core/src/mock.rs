@@ -98,9 +98,9 @@ impl RdmaServerChannel for MockChannel {
     fn token(&self) -> &[u8] { &self.token }
     fn buf_size(&self) -> usize { self.buf_size }
 
-    unsafe fn handle_put(
+    fn handle_put(
         &self, offset: usize, size: usize,
-        write_fn: crate::ffi::RdmaIoWriteFn, write_fn_data: *mut std::ffi::c_void,
+        write: Box<dyn FnOnce(&[u8]) -> Result<usize, RdmaError> + Send + '_>,
     ) -> Result<usize, RdmaError> {
         if self.op != "PUT" {
             return Err(RdmaError::TransferFailed(format!("expected PUT token, got {}", self.op)));
@@ -120,28 +120,19 @@ impl RdmaServerChannel for MockChannel {
         let mut buf = vec![0u8; want];
         file.seek(SeekFrom::Start(start as u64)).map_err(|e| RdmaError::TransferFailed(format!("seek {path}: {e}")))?;
         file.read_exact(&mut buf).map_err(|e| RdmaError::TransferFailed(format!("read {path}: {e}")))?;
-        let n = buf.len();
-        let written = write_fn(write_fn_data, buf.as_ptr() as *const std::ffi::c_void, n);
-        if written < 0 {
-            return Err(RdmaError::TransferFailed(format!("write_fn returned {written}")));
-        }
-        Ok(written as usize)
+        write(&buf)
     }
 
-    unsafe fn handle_get(
+    fn handle_get(
         &self, offset: usize,
-        read_fn: crate::ffi::RdmaIoReadFn, read_fn_data: *mut std::ffi::c_void,
+        read: Box<dyn FnOnce(&mut [u8]) -> usize + Send + '_>,
     ) -> Result<usize, RdmaError> {
         if self.op != "GET" {
             return Err(RdmaError::TransferFailed(format!("expected GET token, got {}", self.op)));
         }
         let capacity = self.token_size.saturating_sub(offset);
         let mut buf = vec![0u8; capacity];
-        let n = read_fn(read_fn_data, buf.as_mut_ptr() as *mut std::ffi::c_void, capacity);
-        if n < 0 {
-            return Err(RdmaError::TransferFailed(format!("read_fn returned {n}")));
-        }
-        let n = n as usize;
+        let n = read(&mut buf);
         let write_start = self.token_offset + offset;
         let path = format!("{}/{}", self.shm_dir, self.shm_name);
         self.dbg(&format!("handle_get shm={} write={n}/{} write_start={write_start}", self.shm_name, capacity));
@@ -509,17 +500,10 @@ mod tests {
             Box::new(|token: &[u8]| {
                 let srv = server.open_channel(b"key", token).unwrap();
                 let mut out: Vec<u8> = Vec::with_capacity(4096);
-                let n = unsafe {
-                    extern "C" fn write_cb(d: *mut std::ffi::c_void, b: *const std::ffi::c_void, n: usize) -> isize {
-                        unsafe {
-                            let out = &mut *(d as *mut Vec<u8>);
-                            let src = std::slice::from_raw_parts(b as *const u8, n);
-                            out.extend_from_slice(src);
-                            n as isize
-                        }
-                    }
-                    srv.handle_put(0, 4096, write_cb, &mut out as *mut Vec<u8> as *mut std::ffi::c_void)
-                }.unwrap();
+                let n = srv.handle_put(0, 4096, Box::new(|data: &[u8]| {
+                    out.extend_from_slice(data);
+                    Ok(data.len())
+                })).unwrap();
                 assert_eq!(&out[..5], b"hello");
                 Ok((200, n))
             }),
@@ -532,18 +516,11 @@ mod tests {
             Box::new(|token: &[u8]| {
                 let srv = server.open_channel(b"key", token).unwrap();
                 let payload: &[u8] = b"world";
-                let n = unsafe {
-                    extern "C" fn read_cb(d: *mut std::ffi::c_void, b: *mut std::ffi::c_void, cap: usize) -> isize {
-                        unsafe {
-                            let src = &*(d as *const &[u8]);
-                            let dst = std::slice::from_raw_parts_mut(b as *mut u8, cap);
-                            let n = src.len().min(cap);
-                            dst[..n].copy_from_slice(&src[..n]);
-                            n as isize
-                        }
-                    }
-                    srv.handle_get(0, read_cb, &payload as *const &[u8] as *mut std::ffi::c_void)
-                }.unwrap();
+                let n = srv.handle_get(0, Box::new(|buf: &mut [u8]| {
+                    let n = payload.len().min(buf.len());
+                    buf[..n].copy_from_slice(&payload[..n]);
+                    n
+                })).unwrap();
                 Ok((200, n))
             }),
             Box::new(|data: &[u8]| received.extend_from_slice(data)),
@@ -563,17 +540,10 @@ mod tests {
             Box::new(|token: &[u8]| {
                 let srv = server.open_channel(b"key", token).unwrap();
                 let mut out: Vec<u8> = Vec::with_capacity(4096);
-                let n = unsafe {
-                    extern "C" fn write_cb(d: *mut std::ffi::c_void, b: *const std::ffi::c_void, n: usize) -> isize {
-                        unsafe {
-                            let out = &mut *(d as *mut Vec<u8>);
-                            let src = std::slice::from_raw_parts(b as *const u8, n);
-                            out.extend_from_slice(src);
-                            n as isize
-                        }
-                    }
-                    srv.handle_put(0, 4096, write_cb, &mut out as *mut Vec<u8> as *mut std::ffi::c_void)
-                }.unwrap();
+                let n = srv.handle_put(0, 4096, Box::new(|data: &[u8]| {
+                    out.extend_from_slice(data);
+                    Ok(data.len())
+                })).unwrap();
                 Ok((200, n))
             }),
         ).unwrap();
@@ -595,17 +565,10 @@ mod tests {
             Box::new(|token: &[u8]| {
                 let srv = server.open_channel(b"key", token).unwrap();
                 let mut out: Vec<u8> = Vec::with_capacity(4096);
-                let n = unsafe {
-                    extern "C" fn write_cb(d: *mut std::ffi::c_void, b: *const std::ffi::c_void, n: usize) -> isize {
-                        unsafe {
-                            let out = &mut *(d as *mut Vec<u8>);
-                            let src = std::slice::from_raw_parts(b as *const u8, n);
-                            out.extend_from_slice(src);
-                            n as isize
-                        }
-                    }
-                    srv.handle_put(0, 4096, write_cb, &mut out as *mut Vec<u8> as *mut std::ffi::c_void)
-                }.unwrap();
+                let n = srv.handle_put(0, 4096, Box::new(|data: &[u8]| {
+                    out.extend_from_slice(data);
+                    Ok(data.len())
+                })).unwrap();
                 assert_eq!(&out[..3], b"foo");
                 Ok((200, n))
             }),
@@ -618,18 +581,11 @@ mod tests {
             Box::new(|token: &[u8]| {
                 let srv = server.open_channel(b"key", token).unwrap();
                 let payload: &[u8] = b"bar";
-                let n = unsafe {
-                    extern "C" fn read_cb(d: *mut std::ffi::c_void, b: *mut std::ffi::c_void, cap: usize) -> isize {
-                        unsafe {
-                            let src = &*(d as *const &[u8]);
-                            let dst = std::slice::from_raw_parts_mut(b as *mut u8, cap);
-                            let n = src.len().min(cap);
-                            dst[..n].copy_from_slice(&src[..n]);
-                            n as isize
-                        }
-                    }
-                    srv.handle_get(0, read_cb, &payload as *const &[u8] as *mut std::ffi::c_void)
-                }.unwrap();
+                let n = srv.handle_get(0, Box::new(|buf: &mut [u8]| {
+                    let n = payload.len().min(buf.len());
+                    buf[..n].copy_from_slice(&payload[..n]);
+                    n
+                })).unwrap();
                 Ok((200, n))
             }),
             Box::new(|data: &[u8]| received.extend_from_slice(data)),
