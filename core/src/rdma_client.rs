@@ -19,7 +19,6 @@ mod real {
     use std::ffi::{c_void, CString};
 
     use libloading::{Library, Symbol};
-    use tracing::error;
 
     use crate::error::RdmaError;
     use crate::ffi::{ByteCursor, CTelemetryConfig, GetNamedClientVtableFn, RdmaProviderVtable};
@@ -164,6 +163,57 @@ mod real {
             Ok(*boxed)
         }
 
+        // ── Telemetry ────────────────────────────────────────────────────────
+
+        pub fn supports_telemetry(&self) -> bool {
+            self.vtable().supports_telemetry
+                .map(|f| unsafe { f(self.ctx) } != 0)
+                .unwrap_or(false)
+        }
+
+        pub fn setup_telemetry(&self, config: &TelemetryConfig) -> Result<(), RdmaError> {
+            let f = self.vtable().setup_telemetry.ok_or_else(|| {
+                RdmaError::TelemetryError("setup_telemetry not implemented".into())
+            })?;
+            let log_file = config.log_file.as_ref()
+                .and_then(|s| std::ffi::CString::new(s.as_str()).ok());
+            let c_cfg = CTelemetryConfig {
+                use_otel: config.use_otel as i32,
+                log_file: log_file.as_ref().map(|cs| cs.as_ptr()).unwrap_or(std::ptr::null()),
+                level: config.level as u32,
+            };
+            let rc = unsafe { f(self.ctx, &c_cfg) };
+            if rc != 0 {
+                Err(RdmaError::TelemetryError(format!("setup_telemetry returned {rc}")))
+            } else {
+                Ok(())
+            }
+        }
+
+        pub fn shutdown_telemetry(&self) -> Result<(), RdmaError> {
+            let f = self.vtable().shutdown_telemetry.ok_or_else(|| {
+                RdmaError::TelemetryError("shutdown_telemetry not implemented".into())
+            })?;
+            let rc = unsafe { f(self.ctx) };
+            if rc != 0 {
+                Err(RdmaError::TelemetryError(format!("shutdown_telemetry returned {rc}")))
+            } else {
+                Ok(())
+            }
+        }
+
+        pub fn set_telem_level(&self, level: TelemLevel) -> Result<(), RdmaError> {
+            let f = self.vtable().set_telem_level.ok_or_else(|| {
+                RdmaError::TelemetryError("set_telem_level not implemented".into())
+            })?;
+            let rc = unsafe { f(self.ctx, level as u32) };
+            if rc != 0 {
+                Err(RdmaError::TelemetryError(format!("set_telem_level returned {rc}")))
+            } else {
+                Ok(())
+            }
+        }
+
     // ── Availability probe ────────────────────────────────────────────────────
 
     /// Returns `true` if the RDMA client provider plugin can be loaded
@@ -181,8 +231,13 @@ mod real {
 
 #[cfg(feature = "rdma-client")]
 pub use real::RdmaPluginClient;
+
+/// Returns `true` if the RDMA client plugin (`libs3rdmaclient.so`) can be
+/// loaded at runtime.
 #[cfg(feature = "rdma-client")]
-pub use real::is_available as rdma_available;
+pub fn rdma_available() -> bool {
+    real::RdmaPluginClient::is_available()
+}
 
 // ── RdmaPlugin ────────────────────────────────────────────────────────────
 

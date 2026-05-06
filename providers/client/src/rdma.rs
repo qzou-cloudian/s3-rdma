@@ -60,7 +60,7 @@ impl RdmaClientChannel for CuObjClientChannel {
                 key: String::from_utf8_lossy(&self.key).into_owned(),
                 reason: format!("{e:?}"),
             })?;
-        Ok(RdmaPutHandle { token, offset, size })
+        Ok(RdmaPutHandle::new(token, offset, size))
     }
 
     fn prepare_get(&self, offset: usize, size: usize) -> Result<RdmaGetHandle, RdmaError> {
@@ -69,7 +69,7 @@ impl RdmaClientChannel for CuObjClientChannel {
                 key: String::from_utf8_lossy(&self.key).into_owned(),
                 reason: format!("{e:?}"),
             })?;
-        Ok(RdmaGetHandle { token, offset, size })
+        Ok(RdmaGetHandle::new(token, offset, size))
     }
 
     fn complete_put(&self, handle: RdmaPutHandle, rdma_status: u16, _transferred: usize) -> Result<(), RdmaError> {

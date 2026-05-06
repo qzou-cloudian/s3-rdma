@@ -211,6 +211,12 @@ pub struct RdmaGetHandle {
 }
 
 impl RdmaPutHandle {
+    /// Create a new handle.  Used by provider implementations that construct
+    /// handles in external crates (e.g. the `s3-rdma-client` plugin crate).
+    pub fn new(token: Vec<u8>, offset: usize, size: usize) -> Self {
+        Self { token, offset, size }
+    }
+
     /// Opaque token bytes for the `x-amz-rdma-token` HTTP header.
     pub fn token(&self) -> &[u8] { &self.token }
 
@@ -222,6 +228,12 @@ impl RdmaPutHandle {
 }
 
 impl RdmaGetHandle {
+    /// Create a new handle.  Used by provider implementations that construct
+    /// handles in external crates (e.g. the `s3-rdma-client` plugin crate).
+    pub fn new(token: Vec<u8>, offset: usize, size: usize) -> Self {
+        Self { token, offset, size }
+    }
+
     /// Opaque token bytes for the `x-amz-rdma-token` HTTP header.
     pub fn token(&self) -> &[u8] { &self.token }
 
