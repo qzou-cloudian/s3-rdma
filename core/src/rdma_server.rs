@@ -77,7 +77,7 @@ mod real {
                 let ptr = get_vtable(provider_name.as_ptr());
                 if ptr.is_null() {
                     return Err(RdmaError::RdmaPluginLoadFailed(
-                        format!("s3_rdma_get_server_vtable(\"rdma\") returned null")
+                        "s3_rdma_get_server_vtable(\"rdma\") returned null".into()
                     ));
                 }
                 ptr

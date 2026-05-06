@@ -341,21 +341,6 @@ pub trait RdmaClientProvider: Send + Sync {
         Ok(())
     }
 
-    /// Header name for the outbound RDMA token (default: `x-amz-rdma-token`).
-    fn rdma_token_header_name(&self) -> &[u8] {
-        RDMA_TOKEN_HEADER.as_bytes()
-    }
-
-    /// Header name for the server RDMA reply status (default: `x-amz-rdma-reply`).
-    fn rdma_reply_header_name(&self) -> &[u8] {
-        RDMA_REPLY_HEADER.as_bytes()
-    }
-
-    /// Header name for the RDMA byte-count (default: `x-amz-rdma-bytes`).
-    fn rdma_bytes_header_name(&self) -> &[u8] {
-        RDMA_BYTES_HEADER.as_bytes()
-    }
-
     /// Human-readable name of this provider implementation (e.g. `"MockRdmaProvider"`).
     ///
     /// Default: `"unknown"`.  Providers should override this for logging and debugging.

@@ -10,7 +10,6 @@ use std::sync::OnceLock;
 use tracing::error;
 
 use s3_rdma::ffi::{ByteCursor, RdmaCompletionFn, RdmaProviderVtable};
-use s3_rdma::provider::{RDMA_BYTES_HEADER, RDMA_REPLY_HEADER, RDMA_TOKEN_HEADER};
 use s3_rdma::{MockRdmaProvider, RdmaClientProvider};
 
 static PROVIDER_NAME: &[u8] = b"s3-rdma-mock\0";
@@ -118,18 +117,6 @@ unsafe extern "C" fn c_process_reply_token(
     0
 }
 
-unsafe extern "C" fn c_rdma_token_header_name(_: *mut c_void) -> ByteCursor {
-    ByteCursor::from_slice(RDMA_TOKEN_HEADER.as_bytes())
-}
-
-unsafe extern "C" fn c_rdma_reply_header_name(_: *mut c_void) -> ByteCursor {
-    ByteCursor::from_slice(RDMA_REPLY_HEADER.as_bytes())
-}
-
-unsafe extern "C" fn c_rdma_bytes_header_name(_: *mut c_void) -> ByteCursor {
-    ByteCursor::from_slice(RDMA_BYTES_HEADER.as_bytes())
-}
-
 static VTABLE: RdmaProviderVtable = RdmaProviderVtable {
     provider_name:          PROVIDER_NAME.as_ptr() as *const c_char,
     provider_version:       1,
@@ -142,9 +129,6 @@ static VTABLE: RdmaProviderVtable = RdmaProviderVtable {
     prepare_put_token:      Some(c_prepare_put_token),
     prepare_get_token:      Some(c_prepare_get_token),
     process_reply_token:    Some(c_process_reply_token),
-    rdma_token_header_name: Some(c_rdma_token_header_name),
-    rdma_reply_header_name: Some(c_rdma_reply_header_name),
-    rdma_bytes_header_name: Some(c_rdma_bytes_header_name),
     supports_telemetry:    None,
     setup_telemetry:       None,
     shutdown_telemetry:    None,

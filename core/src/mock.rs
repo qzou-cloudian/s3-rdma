@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use tracing::debug;
 
@@ -38,18 +38,6 @@ use crate::provider::{RdmaServerChannel, RdmaClientChannel, RdmaClientProvider, 
 
 /// Base directory for shared-memory files.
 const SHM_DIR: &str = "/dev/shm";
-
-static TOKEN_HEADER: OnceLock<String> = OnceLock::new();
-static REPLY_HEADER: OnceLock<String> = OnceLock::new();
-
-fn env_header(lock: &'static OnceLock<String>, var: &str, default: &'static str) -> &'static str {
-    lock.get_or_init(|| {
-        std::env::var(var)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| default.to_owned())
-    })
-}
 
 struct ShmEntry {
     /// Basename, e.g. `rdma-12345-7fab12340000`.
@@ -275,8 +263,6 @@ pub struct MockRdmaProvider {
     shm_dir:  String,
     buf_size: usize,
     registered: Mutex<HashMap<usize, ShmEntry>>,
-    token_header: &'static str,
-    reply_header: &'static str,
     telem: TelemState,
 }
 
@@ -303,8 +289,6 @@ impl MockRdmaProvider {
             shm_dir: shm_dir.into(),
             buf_size,
             registered: Mutex::new(HashMap::new()),
-            token_header: env_header(&TOKEN_HEADER, "CUOBJ_RDMA_TOKEN_HEADER_NAME", "x-amz-rdma-token"),
-            reply_header: env_header(&REPLY_HEADER, "CUOBJ_RDMA_REPLY_HEADER_NAME", "x-amz-rdma-reply"),
             telem: TelemState::new(),
         }
     }
@@ -565,9 +549,6 @@ impl RdmaClientProvider for MockRdmaProvider {
         callback(RdmaCompletionResult { error_code: 0, reply_token: vec![] });
         Ok(())
     }
-
-    fn rdma_token_header_name(&self) -> &[u8] { self.token_header.as_bytes() }
-    fn rdma_reply_header_name(&self) -> &[u8] { self.reply_header.as_bytes() }
 
     // ── Telemetry (delegated to TelemState) ──────────────────────────────────
 

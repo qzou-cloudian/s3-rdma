@@ -14,7 +14,7 @@ crate-type = ["cdylib"]
 default = ["mock"]
 mock    = []
 # cuObject RDMA hardware backend
-cuobj   = ["dep:cuobj", "s3-rdma/buffer-pool"]
+cuobj   = ["dep:cuobj"]
 
 [dependencies]
 tracing = "0.1"

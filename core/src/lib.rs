@@ -62,7 +62,6 @@
 
 pub(crate) mod rdma_client;
 pub(crate) mod rdma_server;
-pub mod engine;
 pub mod error;
 pub mod ffi;
 pub mod mock;
@@ -70,7 +69,6 @@ pub mod mock;
 pub mod pool;
 pub mod provider;
 pub mod token;
-#[cfg(feature = "engine")]
 pub mod worker_pool;
 #[cfg(feature = "pyo3")]
 mod python;
@@ -90,7 +88,6 @@ pub use rdma_client::RdmaPlugin;
 pub use provider::RdmaServerConfig;
 pub use token::RdmaToken;
 
-#[cfg(feature = "engine")]
 pub use worker_pool::RdmaWorkerPool;
 
 #[cfg(feature = "buffer-pool")]
@@ -238,7 +235,6 @@ pub fn create_server_provider(
 /// - `"auto"`  → tries `"rdma"` first, falls back to `"mock"`
 ///
 /// Returned as `Box<dyn RdmaServerProvider>` — use the trait for all operations.
-#[cfg(feature = "engine")]
 pub fn create_worker_pool(
     provider: &str,
     debug: bool,

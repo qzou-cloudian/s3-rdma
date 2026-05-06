@@ -141,13 +141,6 @@ pub struct RdmaProviderVtable {
         *mut c_void, Option<RdmaCompletionFn>,
     ) -> i32>,
 
-    /// Name of the outbound RDMA token header (e.g. `x-amz-rdma-token`).
-    pub rdma_token_header_name: Option<unsafe extern "C" fn(*mut c_void) -> ByteCursor>,
-    /// Name of the server reply header (e.g. `x-amz-rdma-reply`).
-    pub rdma_reply_header_name: Option<unsafe extern "C" fn(*mut c_void) -> ByteCursor>,
-    /// Name of the byte-count header (e.g. `x-amz-rdma-bytes`).
-    pub rdma_bytes_header_name: Option<unsafe extern "C" fn(*mut c_void) -> ByteCursor>,
-
     // ── Telemetry ────────────────────────────────────────────────────────────
 
     /// Returns `1` if this provider supports telemetry.

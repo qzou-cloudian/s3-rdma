@@ -105,7 +105,7 @@ mod real {
                 let ptr = get_vtable(provider_name.as_ptr());
                 if ptr.is_null() {
                     return Err(RdmaError::RdmaPluginLoadFailed(
-                        format!("s3_rdma_get_client_vtable(\"rdma\") returned null")
+                        "s3_rdma_get_client_vtable(\"rdma\") returned null".into()
                     ));
                 }
                 ptr
@@ -285,40 +285,6 @@ mod real {
                 reply_token: vec![],
             });
             Ok(())
-        }
-
-        pub fn rdma_token_header_name(&self) -> &[u8] {
-            let Some(f) = self.vtable().rdma_token_header_name else {
-                return crate::provider::RDMA_TOKEN_HEADER.as_bytes();
-            };
-            let cursor = unsafe { f(self.ctx) };
-            if cursor.ptr.is_null() {
-                return crate::provider::RDMA_TOKEN_HEADER.as_bytes();
-            }
-            // SAFETY: returned ByteCursor points into static string in the .so.
-            unsafe { std::slice::from_raw_parts(cursor.ptr, cursor.len) }
-        }
-
-        pub fn rdma_reply_header_name(&self) -> &[u8] {
-            let Some(f) = self.vtable().rdma_reply_header_name else {
-                return crate::provider::RDMA_REPLY_HEADER.as_bytes();
-            };
-            let cursor = unsafe { f(self.ctx) };
-            if cursor.ptr.is_null() {
-                return crate::provider::RDMA_REPLY_HEADER.as_bytes();
-            }
-            unsafe { std::slice::from_raw_parts(cursor.ptr, cursor.len) }
-        }
-
-        pub fn rdma_bytes_header_name(&self) -> &[u8] {
-            let Some(f) = self.vtable().rdma_bytes_header_name else {
-                return crate::provider::RDMA_BYTES_HEADER.as_bytes();
-            };
-            let cursor = unsafe { f(self.ctx) };
-            if cursor.ptr.is_null() {
-                return crate::provider::RDMA_BYTES_HEADER.as_bytes();
-            }
-            unsafe { std::slice::from_raw_parts(cursor.ptr, cursor.len) }
         }
 
         // ── Telemetry ────────────────────────────────────────────────────────
@@ -573,30 +539,6 @@ impl crate::provider::RdmaClientProvider for RdmaPlugin {
         }
         let _ = (rdma_status, request_token, transferred, callback);
         Err(crate::RdmaError::OperationNotSupported("rdma client not loaded".into()))
-    }
-
-    fn rdma_token_header_name(&self) -> &[u8] {
-        #[cfg(feature = "rdma-client")]
-        if let Some(c) = &self.client {
-            return c.rdma_token_header_name();
-        }
-        crate::provider::RDMA_TOKEN_HEADER.as_bytes()
-    }
-
-    fn rdma_reply_header_name(&self) -> &[u8] {
-        #[cfg(feature = "rdma-client")]
-        if let Some(c) = &self.client {
-            return c.rdma_reply_header_name();
-        }
-        crate::provider::RDMA_REPLY_HEADER.as_bytes()
-    }
-
-    fn rdma_bytes_header_name(&self) -> &[u8] {
-        #[cfg(feature = "rdma-client")]
-        if let Some(c) = &self.client {
-            return c.rdma_bytes_header_name();
-        }
-        crate::provider::RDMA_BYTES_HEADER.as_bytes()
     }
 
     // ── Telemetry ────────────────────────────────────────────────────────────

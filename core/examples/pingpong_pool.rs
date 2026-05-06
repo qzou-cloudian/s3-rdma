@@ -2,7 +2,7 @@
 //!
 //! Same flow as pingpong.rs, but server ops dispatch through a 2-worker pool.
 //!
-//!   cargo run --example pingpong_pool --features engine --manifest-path core/Cargo.toml
+//!   cargo run --example pingpong_pool --manifest-path core/Cargo.toml
 
 use std::alloc::{Layout, alloc, dealloc};
 use std::sync::Arc;

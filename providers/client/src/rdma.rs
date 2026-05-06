@@ -10,7 +10,7 @@ use tracing::error;
 use cuobj::client::RegisteredBuffer;
 use cuobj::{CuObjClient, CuObjClientError, CuObjRdmaToken};
 use s3_rdma::ffi::{ByteCursor, CTelemetryConfig, RdmaCompletionFn, RdmaProviderVtable};
-use s3_rdma::provider::{RDMA_BYTES_HEADER, RDMA_REPLY_HEADER, RDMA_REQUIRED_ALIGNMENT, RDMA_TOKEN_HEADER};
+use s3_rdma::provider::RDMA_REQUIRED_ALIGNMENT;
 
 static PROVIDER_NAME: &[u8] = b"s3-rdma\0";
 
@@ -246,18 +246,6 @@ unsafe extern "C" fn c_process_reply_token(
     0
 }
 
-unsafe extern "C" fn c_rdma_token_header_name(_: *mut c_void) -> ByteCursor {
-    ByteCursor::from_slice(RDMA_TOKEN_HEADER.as_bytes())
-}
-
-unsafe extern "C" fn c_rdma_reply_header_name(_: *mut c_void) -> ByteCursor {
-    ByteCursor::from_slice(RDMA_REPLY_HEADER.as_bytes())
-}
-
-unsafe extern "C" fn c_rdma_bytes_header_name(_: *mut c_void) -> ByteCursor {
-    ByteCursor::from_slice(RDMA_BYTES_HEADER.as_bytes())
-}
-
 // ── Telemetry callbacks ──────────────────────────────────────────────────────
 
 unsafe extern "C" fn c_supports_telemetry(_: *mut c_void) -> i32 { 1 }
@@ -306,9 +294,6 @@ static VTABLE: RdmaProviderVtable = RdmaProviderVtable {
     prepare_put_token:      Some(c_prepare_put_token),
     prepare_get_token:      Some(c_prepare_get_token),
     process_reply_token:    Some(c_process_reply_token),
-    rdma_token_header_name: Some(c_rdma_token_header_name),
-    rdma_reply_header_name: Some(c_rdma_reply_header_name),
-    rdma_bytes_header_name: Some(c_rdma_bytes_header_name),
     supports_telemetry:    Some(c_supports_telemetry),
     setup_telemetry:       Some(c_setup_telemetry),
     shutdown_telemetry:    Some(c_shutdown_telemetry),

@@ -4,7 +4,7 @@
 //! concurrency, then using the channel-based API.
 //!
 //! Run with:
-//!   cargo run --example mock_engine --features engine --manifest-path core/Cargo.toml
+//!   cargo run --example mock_engine --manifest-path core/Cargo.toml
 
 use std::alloc::{Layout, alloc, dealloc};
 use std::sync::Arc;

@@ -61,17 +61,30 @@ fn open_channel_sync(p: &ServerProvider, key: &[u8], token: &[u8])
         RdmaError::TransferFailed(format!("alloc_channel: {e:?}"))
     })?;
     let cid = ch.id(); std::mem::forget(ch);
-    let buf = PersistentBuffer::new(p.server.clone(), p.buf_size).map_err(|e| {
-        p.server.free_channel_by_id(cid);
-        RdmaError::TransferFailed(format!("PersistentBuffer: {e:?}"))
-    })?;
-    Ok(Box::new(SyncChannel { server: p.server.clone(), key: key.to_vec(),
-        token: token.to_vec(), buffer: buf, channel_id: cid, buf_size: p.buf_size }))
+    Ok(Box::new(SyncChannel {
+        server: p.server.clone(), key: key.to_vec(), token: token.to_vec(),
+        channel_id: cid, buf_size: p.buf_size,
+        buffer: std::sync::Mutex::new(None),
+    }))
 }
 
 struct SyncChannel {
     server: Arc<CuObjServer>, key: Vec<u8>, token: Vec<u8>,
-    buffer: PersistentBuffer, channel_id: u16, buf_size: usize,
+    channel_id: u16, buf_size: usize,
+    /// Allocated lazily — only for handle_put/handle_get, not ZC.
+    buffer: std::sync::Mutex<Option<PersistentBuffer>>,
+}
+
+impl SyncChannel {
+    fn get_buffer(&self) -> Result<std::sync::MutexGuard<'_, Option<PersistentBuffer>>, RdmaError> {
+        let mut g = self.buffer.lock().unwrap();
+        if g.is_none() {
+            let buf = PersistentBuffer::new(self.server.clone(), self.buf_size)
+                .map_err(|e| RdmaError::TransferFailed(format!("PersistentBuffer: {e:?}")))?;
+            *g = Some(buf);
+        }
+        Ok(g)
+    }
 }
 
 impl RdmaServerChannel for SyncChannel {
@@ -80,21 +93,25 @@ impl RdmaServerChannel for SyncChannel {
     fn buf_size(&self) -> usize { self.buf_size }
 
     fn handle_put(&self, buf: &mut [u8], offset: usize, size: usize) -> Result<usize, RdmaError> {
+        let guard = self.get_buffer()?;
+        let b = guard.as_ref().unwrap();
         let ks = std::str::from_utf8(&self.key).unwrap_or("");
         let ts = std::str::from_utf8(&self.token).unwrap_or("");
-        let n = self.buffer.handle_put(ks, offset, size, ts, Some(self.channel_id))
+        let n = b.handle_put(ks, offset, size, ts, Some(self.channel_id))
             .map_err(|e| RdmaError::TransferFailed(format!("{e:?}")))?;
         let cl = n.min(buf.len());
-        unsafe { std::ptr::copy_nonoverlapping(self.buffer.as_ptr(), buf.as_mut_ptr(), cl); }
+        unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), buf.as_mut_ptr(), cl); }
         Ok(cl)
     }
 
     fn handle_get(&self, data: &[u8], offset: usize) -> Result<usize, RdmaError> {
+        let guard = self.get_buffer()?;
+        let b = guard.as_ref().unwrap();
         let ks = std::str::from_utf8(&self.key).unwrap_or("");
         let ts = std::str::from_utf8(&self.token).unwrap_or("");
-        let cl = data.len().min(self.buffer.len());
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.buffer.as_ptr() as *mut u8, cl); }
-        self.buffer.handle_get(ks, offset, cl, ts, Some(self.channel_id))
+        let cl = data.len().min(b.len());
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), b.as_ptr() as *mut u8, cl); }
+        b.handle_get(ks, offset, cl, ts, Some(self.channel_id))
             .map_err(|e| RdmaError::TransferFailed(format!("{e:?}")))
     }
 }
@@ -255,12 +272,66 @@ mod tests {
 
     #[test]
     fn provider_init_and_cleanup() {
-        // Simulate what c_init does.
         let srv = Arc::new(CuObjServer::new("10.50.132.250", 4432).expect("CuObjServer::new"));
         assert!(srv.is_connected());
         let p = Box::new(ServerProvider { server: srv, buf_size: 4096 });
         drop(p);
         println!("provider init/cleanup: OK");
+    }
+
+    #[test]
+    fn cuobj_connectivity() {
+        let srv = Arc::new(CuObjServer::new("10.50.132.250", 4433).expect("CuObjServer::new"));
+        assert!(srv.is_connected(), "RDMA fabric not connected");
+        let ch = srv.alloc_channel().expect("alloc_channel");
+        let id = ch.id();
+        assert_ne!(id, u16::MAX);
+        std::mem::forget(ch);
+        srv.free_channel_by_id(id);
+        println!("cuobj connectivity: OK");
+    }
+
+    #[test]
+    fn server_multiple_channels() {
+        let srv = Arc::new(CuObjServer::new("10.50.132.250", 4434).expect("CuObjServer::new"));
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            let ch = srv.alloc_channel().expect("alloc");
+            let id = ch.id();
+            assert_ne!(id, u16::MAX);
+            assert!(!ids.contains(&id), "duplicate channel id");
+            std::mem::forget(ch);
+            ids.push(id);
+        }
+        for id in &ids { srv.free_channel_by_id(*id); }
+        println!("server {} channels: OK", ids.len());
+    }
+
+    #[test]
+    fn server_persistent_buffer_lifecycle() {
+        let srv = Arc::new(CuObjServer::new("10.50.132.250", 4435).expect("CuObjServer::new"));
+        let ch = srv.alloc_channel().expect("alloc");
+        let cid = ch.id(); std::mem::forget(ch);
+        let buf = PersistentBuffer::new(Arc::clone(&srv), 4096).expect("PersistentBuffer::new");
+        assert_eq!(buf.len(), 4096);
+        assert!(!buf.as_ptr().is_null());
+        drop(buf);
+        srv.free_channel_by_id(cid);
+        println!("persistent buffer lifecycle: OK");
+    }
+
+    #[test]
+    fn server_register_existing_buffer() {
+        use std::alloc::{Layout, alloc, dealloc};
+        let srv = Arc::new(CuObjServer::new("10.50.132.250", 4436).expect("CuObjServer::new"));
+        let layout = Layout::from_size_align(4096, 4096).unwrap();
+        let ptr = unsafe { alloc(layout) };
+        let rbuf = srv.register_existing_buffer(ptr, 4096)
+            .expect("register_existing_buffer");
+        assert!(!rbuf.is_null());
+        srv.deregister_buffer(rbuf);
+        unsafe { dealloc(ptr, layout) };
+        println!("register existing buffer: OK");
     }
 }
 

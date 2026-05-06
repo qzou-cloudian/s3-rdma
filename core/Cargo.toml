@@ -19,10 +19,6 @@ pyo3     = ["dep:pyo3", "pyo3/extension-module"]
 # Generic pre-registered RDMA buffer pool (works with any RdmaProvider:
 # bytes/mock/cuobj).  Adds crossbeam-queue and tokio::sync deps.
 buffer-pool = ["dep:crossbeam-queue", "dep:tokio"]
-# Fixed-size worker-pool engine that wraps any RdmaProvider and dispatches
-# server-side operations (handle_put/get and ZC variants) to N worker threads.
-# No external dependencies beyond std.
-engine = []
 
 [dependencies]
 tracing       = "0.1"

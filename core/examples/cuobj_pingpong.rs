@@ -12,10 +12,10 @@
 //!
 //! Then run (in separate terminals, or use `&`):
 //!   LD_LIBRARY_PATH=target/debug:/usr/local/lib:/usr/local/cuda/targets/x86_64-linux/lib \
-//!   cargo run --example cuobj_pingpong --features "rdma-client,rdma-server,engine,buffer-pool" -- server
+//!   cargo run --example cuobj_pingpong --features "rdma-client,rdma-server" -- server
 //!
 //!   LD_LIBRARY_PATH=target/debug:/usr/local/lib:/usr/local/cuda/targets/x86_64-linux/lib \
-//!   cargo run --example cuobj_pingpong --features "rdma-client,rdma-server,engine,buffer-pool" -- client
+//!   cargo run --example cuobj_pingpong --features "rdma-client,rdma-server" -- client
 
 // ── server ───────────────────────────────────────────────────────────────────
 

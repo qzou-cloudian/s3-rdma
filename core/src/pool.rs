@@ -229,7 +229,7 @@ impl BufferPool {
     // ── Internal ─────────────────────────────────────────────────────────────
 
     pub(crate) fn release(&self, idx: usize) {
-        self.free_queue.push(idx).ok().expect("double-release of buffer slot");
+        self.free_queue.push(idx).expect("double-release of buffer slot");
         self.sem.add_permits(1);
         let _g = self.parking_mu.lock().unwrap();
         self.parking_cv.notify_one();
@@ -333,14 +333,11 @@ impl Drop for OwnedBufferGuard {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Builder for [`BufferPool`].  Obtain via [`BufferPool::builder()`].
+#[derive(Default)]
 pub struct BufferPoolBuilder {
     count:     usize,
     size:      usize,
     registrar: Option<Arc<dyn BufferRegistrar>>,
-}
-
-impl Default for BufferPoolBuilder {
-    fn default() -> Self { Self { count: 0, size: 0, registrar: None } }
 }
 
 impl BufferPoolBuilder {
@@ -399,7 +396,7 @@ impl BufferPoolBuilder {
                 std::ptr::null_mut()
             };
             slots.push(Slot { ptr, size: self.size, layout, reg_handle });
-            free_queue.push(i).ok().expect("ArrayQueue capacity exceeded during build");
+            free_queue.push(i).expect("ArrayQueue capacity exceeded during build");
         }
 
         Ok(BufferPool {
