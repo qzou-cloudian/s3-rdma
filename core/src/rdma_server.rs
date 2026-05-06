@@ -133,10 +133,25 @@ mod real {
         pub fn open_channel(&self, key: &[u8], token: &[u8])
             -> Result<Box<dyn crate::provider::RdmaServerChannel>, RdmaError>
         {
-            Err(RdmaError::OperationNotSupported(
-                "open_channel: not supported by rdma server plugin".into(),
-            ))
+            let Some(f) = self.vtable().open_channel else {
+                return Err(RdmaError::OperationNotSupported(
+                    "open_channel: not supported by rdma server plugin".into(),
+                ));
+            };
+            let kc = ByteCursor::from_slice(key);
+            let tc = ByteCursor::from_slice(token);
+            let mut out: *mut c_void = std::ptr::null_mut();
+            let rc = unsafe { f(self.ctx, &kc, &tc, &mut out) };
+            if rc != 0 {
+                return Err(RdmaError::TransferFailed(format!("open_channel returned {rc}")));
+            }
+            // Unwrap double-box: C side returns Box<Box<dyn RdmaServerChannel>>.
+            let boxed: Box<Box<dyn crate::provider::RdmaServerChannel>> =
+                unsafe { Box::from_raw(out as *mut Box<dyn crate::provider::RdmaServerChannel>) };
+            Ok(*boxed)
         }
+
+        fn _old_open_channel_stub() {}
 
         /// Delegates to the plugin's `handle_put` vtable entry.
         ///

@@ -347,6 +347,16 @@ pub struct RdmaServerVtable {
     /// Set telemetry log-path flags.
     /// Returns 0 on success, non-zero on failure.
     pub set_telem_level: Option<unsafe extern "C" fn(*mut c_void, level: u32) -> i32>,
+
+    /// Open an RdmaServerChannel for key+token.
+    /// On success, *out_channel receives a heap-allocated Box<dyn RdmaServerChannel>.
+    /// Returns 0 on success, non-zero on failure.
+    pub open_channel: Option<unsafe extern "C" fn(
+        ctx: *mut c_void,
+        key: *const ByteCursor,
+        token: *const ByteCursor,
+        out_channel: *mut *mut c_void,
+    ) -> i32>,
 }
 
 // SAFETY: vtable contains only function pointers and a static string pointer,

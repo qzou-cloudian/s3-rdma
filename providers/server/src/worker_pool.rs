@@ -187,6 +187,15 @@ fn worker_main(
     srv.free_channel_by_id(channel_id);
 }
 
+/// Parse `remote_start = base_vaddr + offset` from a cuobj token.
+fn token_remote_start(token: &[u8], offset: usize) -> u64 {
+    let s = match std::str::from_utf8(token) { Ok(s) => s, Err(_) => return 0 };
+    let vaddr = s.split(':').next()
+        .and_then(|h| u64::from_str_radix(h, 16).ok())
+        .unwrap_or(0);
+    vaddr + offset as u64
+}
+
 fn submit_one(
     handle: *mut c_void, rbuf: *mut c_void, channel_id: u16,
     buf_ptr: usize, host_ptr: *const u8, buf_len: usize,
@@ -195,35 +204,39 @@ fn submit_one(
     let h = buf_ptr as *mut c_void;
     match work {
         WorkItem::Put { key, token, offset, size, buf_ptr: pb, buf_len: bl, result_tx, .. } => {
+            let rs = token_remote_start(token, *offset);
             let ks = std::ffi::CString::new(key.as_slice()).unwrap_or_default();
             let ts = std::ffi::CString::new(token.as_slice()).unwrap_or_default();
-            let rc = unsafe { cuobj_srv_handle_put_async_rbuf(handle, ks.as_ptr(), rbuf, 0, *size, ts.as_ptr(), channel_id, h) };
+            let rc = unsafe { cuobj_srv_handle_put_async_rbuf(handle, ks.as_ptr(), rbuf, rs, *size, ts.as_ptr(), channel_id, h) };
             if rc != 0 { let _ = result_tx.send(Err(format!("submit err {rc}"))); }
             (result_tx.clone(), None, *pb, *bl)
         }
         WorkItem::Get { key, data_ptr, data_len, token, offset, result_tx, .. } => {
+            let rs = token_remote_start(token, *offset);
             let cl = (*data_len).min(buf_len);
             unsafe { std::ptr::copy_nonoverlapping(*data_ptr as *const u8, host_ptr as *mut u8, cl); }
             let ks = std::ffi::CString::new(key.as_slice()).unwrap_or_default();
             let ts = std::ffi::CString::new(token.as_slice()).unwrap_or_default();
-            let rc = unsafe { cuobj_srv_handle_get_async_rbuf(handle, ks.as_ptr(), rbuf, 0, cl, ts.as_ptr(), channel_id, h) };
+            let rc = unsafe { cuobj_srv_handle_get_async_rbuf(handle, ks.as_ptr(), rbuf, rs, cl, ts.as_ptr(), channel_id, h) };
             if rc != 0 { let _ = result_tx.send(Err(format!("submit err {rc}"))); }
             (result_tx.clone(), None, 0, 0)
         }
         WorkItem::PutZc { key, token, offset, size, write_fn, write_fn_data, result_tx } => {
+            let rs = token_remote_start(token, *offset);
             let ks = std::ffi::CString::new(key.as_slice()).unwrap_or_default();
             let ts = std::ffi::CString::new(token.as_slice()).unwrap_or_default();
-            let rc = unsafe { cuobj_srv_handle_put_async_rbuf(handle, ks.as_ptr(), rbuf, 0, *size, ts.as_ptr(), channel_id, h) };
+            let rc = unsafe { cuobj_srv_handle_put_async_rbuf(handle, ks.as_ptr(), rbuf, rs, *size, ts.as_ptr(), channel_id, h) };
             if rc != 0 { let _ = result_tx.send(Err(format!("submit err {rc}"))); }
             (result_tx.clone(), Some((*write_fn, write_fn_data.0)), 0, 0)
         }
         WorkItem::GetZc { key, token, offset, read_fn, read_fn_data, result_tx } => {
+            let rs = token_remote_start(token, *offset);
             let n = unsafe { read_fn(read_fn_data.0, host_ptr as *mut c_void, buf_len) };
             if n < 0 { let _ = result_tx.send(Err(format!("read_fn returned {n}"))); }
             let wn = n as usize;
             let ks = std::ffi::CString::new(key.as_slice()).unwrap_or_default();
             let ts = std::ffi::CString::new(token.as_slice()).unwrap_or_default();
-            let rc = unsafe { cuobj_srv_handle_get_async_rbuf(handle, ks.as_ptr(), rbuf, 0, wn, ts.as_ptr(), channel_id, h) };
+            let rc = unsafe { cuobj_srv_handle_get_async_rbuf(handle, ks.as_ptr(), rbuf, rs, wn, ts.as_ptr(), channel_id, h) };
             if rc != 0 { let _ = result_tx.send(Err(format!("submit err {rc}"))); }
             (result_tx.clone(), None, 0, 0)
         }
@@ -233,6 +246,7 @@ fn submit_one(
 // ── CuObjWorkerPool ─────────────────────────────────────────────────────────
 
 pub struct CuObjWorkerPool {
+    #[allow(dead_code)]
     pool:    Arc<s3_rdma::pool::BufferPool>,
     buf_size: usize,
     sender:  Option<std::sync::mpsc::Sender<WorkItem>>,
@@ -313,3 +327,124 @@ impl RdmaServerChannel for PoolChannel {
         dispatch(&self.sender, WorkItem::GetZc{key:self.key.clone(),token:self.token.clone(),offset:o,read_fn:rf,read_fn_data:SendPtr(rd),result_tx:unsafe{std::mem::zeroed()}})
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cuobj::server::CuObjServer;
+    use s3_rdma::pool::{BufferPool, BufferRegistrar};
+
+    struct TestRegistrar { server: Arc<CuObjServer> }
+
+    impl BufferRegistrar for TestRegistrar {
+        fn register(&self, ptr: *mut u8, size: usize) -> Result<*mut c_void, RdmaError> {
+            self.server.register_existing_buffer(ptr, size)
+                .ok_or_else(|| RdmaError::MemoryRegistrationFailed {
+                    ptr: ptr as usize, size, reason: "null".into(),
+                })
+        }
+        fn deregister(&self, _ptr: *mut u8, handle: *mut c_void) {
+            self.server.deregister_buffer(handle);
+        }
+    }
+
+    #[test]
+    fn cuobj_connectivity() {
+        let srv = Arc::new(CuObjServer::new("10.50.132.250", 4421).expect("CuObjServer::new"));
+        assert!(srv.is_connected(), "RDMA fabric not connected");
+        let ch = srv.alloc_channel().expect("alloc_channel");
+        let id = ch.id();
+        assert_ne!(id, u16::MAX);
+        // Don't let Channel::drop auto-free — we free manually via the test.
+        std::mem::forget(ch);
+        srv.free_channel_by_id(id);
+        println!("cuobj connectivity: OK");
+    }
+
+    #[test]
+    fn buffer_pool_with_cuobj_registrar() {
+        let srv = Arc::new(CuObjServer::new("10.50.132.250", 4423).expect("CuObjServer::new"));
+        let reg: Arc<dyn BufferRegistrar> = Arc::new(TestRegistrar { server: Arc::clone(&srv) });
+        let pool = Arc::new(BufferPool::builder().count(4).size(4096)
+            .with_registrar(Some(reg)).build().expect("build"));
+        assert_eq!(pool.capacity(), 4);
+        let guard = pool.acquire_owned_blocking();
+        assert!(!guard.as_ptr().is_null());
+        assert!(!guard.reg_handle().is_null());
+        drop(guard);
+        println!("buffer pool with cuobj: OK");
+    }
+
+    #[test]
+    fn worker_pool_create_and_drop() {
+        let srv = Arc::new(CuObjServer::new("10.50.132.250", 4422).expect("CuObjServer::new"));
+        let reg: Arc<dyn BufferRegistrar> = Arc::new(TestRegistrar { server: Arc::clone(&srv) });
+        let pool = Arc::new(BufferPool::builder().count(4).size(4096)
+            .with_registrar(Some(reg)).build().expect("build"));
+        let wp = CuObjWorkerPool::new(Arc::clone(&srv), pool, 2, 4096);
+        assert_eq!(wp.buf_size(), 4096);
+        drop(wp);
+        println!("worker pool create/drop: OK");
+    }
+
+    #[test]
+    fn buf_pool_all_buffers_registered() {
+        let srv = Arc::new(CuObjServer::new("10.50.132.250", 4424).expect("CuObjServer::new"));
+        let reg: Arc<dyn BufferRegistrar> = Arc::new(TestRegistrar { server: Arc::clone(&srv) });
+        let count = 8;
+        let pool = Arc::new(BufferPool::builder().count(count).size(4096)
+            .with_registrar(Some(reg)).build().expect("build"));
+        assert_eq!(pool.capacity(), count);
+
+        // Verify every buffer has a valid registration handle.
+        let mut guards = Vec::new();
+        for i in 0..count {
+            let g = pool.acquire_owned_blocking();
+            assert!(!g.as_ptr().is_null(), "slot {i}: null ptr");
+            assert!(!g.reg_handle().is_null(), "slot {i}: null reg_handle");
+            guards.push(g);
+        }
+        assert_eq!(pool.available(), 0, "pool should be exhausted");
+        drop(guards);
+        assert_eq!(pool.available(), count, "all buffers returned");
+        println!("buf pool {count} registered: OK");
+    }
+
+    #[test]
+    fn server_multiple_channels() {
+        let srv = Arc::new(CuObjServer::new("10.50.132.250", 4425).expect("CuObjServer::new"));
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let ch = srv.alloc_channel().expect("alloc");
+            let id = ch.id();
+            assert_ne!(id, u16::MAX, "channel {i}: INVALID");
+            assert!(!ids.contains(&id), "channel {i}: duplicate id {id}");
+            std::mem::forget(ch);
+            ids.push(id);
+        }
+        let count = ids.len();
+        for id in &ids {
+            srv.free_channel_by_id(*id);
+        }
+        println!("server {count}/4 channels: OK");
+    }
+
+    #[test]
+    fn server_persistent_buffer_lifecycle() {
+        use cuobj::PersistentBuffer;
+        let srv = Arc::new(CuObjServer::new("10.50.132.250", 4426).expect("CuObjServer::new"));
+        let ch = srv.alloc_channel().expect("alloc");
+        let cid = ch.id(); std::mem::forget(ch);
+
+        let buf = PersistentBuffer::new(Arc::clone(&srv), 4096).expect("PersistentBuffer::new");
+        assert_eq!(buf.len(), 4096);
+        assert!(!buf.as_ptr().is_null());
+
+        drop(buf); // deregisters
+        srv.free_channel_by_id(cid);
+        println!("persistent buffer lifecycle: OK");
+    }
+}
+

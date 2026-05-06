@@ -84,6 +84,7 @@ static VTABLE: RdmaServerVtable = RdmaServerVtable {
     setup_telemetry:    None,
     shutdown_telemetry: None,
     set_telem_level:    None,
+    open_channel:       None,
 };
 
 pub fn vtable() -> *const RdmaServerVtable {

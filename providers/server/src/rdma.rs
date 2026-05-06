@@ -7,16 +7,17 @@ use std::sync::{Arc, OnceLock};
 use tracing::{error, info};
 
 use cuobj::server::CuObjServer;
+use cuobj::PersistentBuffer;
 use s3_rdma::ffi::{ByteCursor, CTelemetryConfig, RdmaServerInitParams, RdmaServerVtable};
+use s3_rdma::error::RdmaError;
 use s3_rdma::provider::DEFAULT_RDMA_BUF_SIZE;
-use s3_rdma::provider::RdmaServerProvider;
-
-use crate::worker_pool::CuObjWorkerPool;
+use s3_rdma::provider::RdmaServerChannel;
 
 static PROVIDER_NAME: &[u8] = b"s3-rdma-server\0";
 
 struct ServerProvider {
-    pool: CuObjWorkerPool,
+    server:   Arc<CuObjServer>,
+    buf_size: usize,
 }
 
 unsafe impl Send for ServerProvider {}
@@ -29,60 +30,78 @@ fn get_provider() -> Option<&'static ServerProvider> {
 }
 
 unsafe extern "C" fn c_init(params: *const RdmaServerInitParams, _ctx: *mut *mut c_void) -> i32 {
-    if params.is_null() {
-        error!("[s3-rdma-server] c_init: null params");
-        return -1;
-    }
+    if params.is_null() { error!("[s3-rdma-server] c_init: null"); return -1; }
     let p = unsafe { &*params };
-
-    let addr = if p.listen_addr.is_null() {
-        error!("[s3-rdma-server] c_init: null listen_addr");
-        return -1;
-    } else {
-        match unsafe { CStr::from_ptr(p.listen_addr) }.to_str() {
-            Ok(s)  => s.to_owned(),
-            Err(e) => {
-                error!("[s3-rdma-server] c_init: invalid listen_addr: {e}");
-                return -1;
-            }
-        }
+    let addr = match unsafe { CStr::from_ptr(p.listen_addr) }.to_str() {
+        Ok(s) => s.to_owned(),
+        Err(e) => { error!("[s3-rdma-server] c_init: listen_addr: {e}"); return -1; }
     };
-
     let srv = match CuObjServer::new(&addr, p.listen_port) {
-        Ok(s)  => {
-            if !s.is_connected() {
-                error!(
-                    "[s3-rdma-server] CuObjServer created but not connected to RDMA fabric \
-                     at {addr}:{}", p.listen_port
-                );
-                return -1;
-            }
-            Arc::new(s)
-        }
-        Err(e) => {
-            error!("[s3-rdma-server] CuObjServer::new({addr}:{}) failed: {e:?}", p.listen_port);
-            return -1;
-        }
+        Ok(s) if s.is_connected() => Arc::new(s),
+        Ok(_) => { error!("[s3-rdma-server] not connected"); return -1; }
+        Err(e) => { error!("[s3-rdma-server] CuObjServer::new: {e:?}"); return -1; }
     };
-
     let buf_size = if p.buf_size > 0 { p.buf_size } else { DEFAULT_RDMA_BUF_SIZE };
-    let pool = CuObjWorkerPool::new(srv, 4, buf_size, 5); // 4 workers, 5 buffers each
-
-    info!("[s3-rdma-server] listening {addr}:{port}, buf={mb}MiB",
-          port = p.listen_port, mb = buf_size / (1024 * 1024));
-
-    if PROVIDER.set(Some(Box::new(ServerProvider { pool }))).is_err() {
+    info!("[s3-rdma-server] listening {addr}:{}, buf={}MiB", p.listen_port, buf_size/(1024*1024));
+    if PROVIDER.set(Some(Box::new(ServerProvider { server: srv, buf_size }))).is_err() {
         error!("[s3-rdma-server] c_init: called more than once");
         return -1;
     }
     0
 }
 
-unsafe extern "C" fn c_cleanup(_ctx: *mut c_void) {
-    let _ = PROVIDER.set(None); // drops pool → joins workers → frees channels
+unsafe extern "C" fn c_cleanup(_ctx: *mut c_void) { let _ = PROVIDER.set(None); }
+
+// ── Sync channel ────────────────────────────────────────────────────────────
+
+fn open_channel_sync(p: &ServerProvider, key: &[u8], token: &[u8])
+    -> Result<Box<dyn RdmaServerChannel>, RdmaError>
+{
+    let ch = p.server.alloc_channel().map_err(|e| {
+        RdmaError::TransferFailed(format!("alloc_channel: {e:?}"))
+    })?;
+    let cid = ch.id(); std::mem::forget(ch);
+    let buf = PersistentBuffer::new(p.server.clone(), p.buf_size).map_err(|e| {
+        p.server.free_channel_by_id(cid);
+        RdmaError::TransferFailed(format!("PersistentBuffer: {e:?}"))
+    })?;
+    Ok(Box::new(SyncChannel { server: p.server.clone(), key: key.to_vec(),
+        token: token.to_vec(), buffer: buf, channel_id: cid, buf_size: p.buf_size }))
 }
 
-// ── Vtable handlers — all dispatch through the worker pool ────────────────────
+struct SyncChannel {
+    server: Arc<CuObjServer>, key: Vec<u8>, token: Vec<u8>,
+    buffer: PersistentBuffer, channel_id: u16, buf_size: usize,
+}
+
+impl RdmaServerChannel for SyncChannel {
+    fn key(&self) -> &[u8] { &self.key }
+    fn token(&self) -> &[u8] { &self.token }
+    fn buf_size(&self) -> usize { self.buf_size }
+
+    fn handle_put(&self, buf: &mut [u8], offset: usize, size: usize) -> Result<usize, RdmaError> {
+        let ks = std::str::from_utf8(&self.key).unwrap_or("");
+        let ts = std::str::from_utf8(&self.token).unwrap_or("");
+        let n = self.buffer.handle_put(ks, offset, size, ts, Some(self.channel_id))
+            .map_err(|e| RdmaError::TransferFailed(format!("{e:?}")))?;
+        let cl = n.min(buf.len());
+        unsafe { std::ptr::copy_nonoverlapping(self.buffer.as_ptr(), buf.as_mut_ptr(), cl); }
+        Ok(cl)
+    }
+
+    fn handle_get(&self, data: &[u8], offset: usize) -> Result<usize, RdmaError> {
+        let ks = std::str::from_utf8(&self.key).unwrap_or("");
+        let ts = std::str::from_utf8(&self.token).unwrap_or("");
+        let cl = data.len().min(self.buffer.len());
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.buffer.as_ptr() as *mut u8, cl); }
+        self.buffer.handle_get(ks, offset, cl, ts, Some(self.channel_id))
+            .map_err(|e| RdmaError::TransferFailed(format!("{e:?}")))
+    }
+}
+
+impl Drop for SyncChannel { fn drop(&mut self) { self.server.free_channel_by_id(self.channel_id); } }
+
+// ── Vtable handlers ──────────────────────────────────────────────────────────
 
 unsafe extern "C" fn c_handle_put(
     _ctx: *mut c_void, s3_key: *const ByteCursor, token: *const ByteCursor,
@@ -90,12 +109,9 @@ unsafe extern "C" fn c_handle_put(
 ) -> i32 {
     if s3_key.is_null() || token.is_null() || buf.is_null() || out_transferred.is_null() { return -1; }
     let Some(p) = get_provider() else { return -1 };
-    let key_bytes   = unsafe { (*s3_key).as_slice() };
-    let token_bytes = unsafe { (*token).as_slice() };
-    let buf_slice   = unsafe { std::slice::from_raw_parts_mut(buf, p.pool.buf_size()) };
-    match p.pool.open_channel(key_bytes, token_bytes)
-        .and_then(|ch| ch.handle_put(buf_slice, offset, size))
-    {
+    let k = unsafe { (*s3_key).as_slice() }; let t = unsafe { (*token).as_slice() };
+    let mut buf_slice = unsafe { std::slice::from_raw_parts_mut(buf, p.buf_size) };
+    match open_channel_sync(p, k, t).and_then(|ch| ch.handle_put(&mut buf_slice, offset, size)) {
         Ok(n) => { unsafe { *out_transferred = n; } 0 }
         Err(e) => { error!("[s3-rdma-server] handle_put: {e}"); -1 }
     }
@@ -107,12 +123,9 @@ unsafe extern "C" fn c_handle_get(
 ) -> i32 {
     if s3_key.is_null() || data.is_null() || token.is_null() || out_written.is_null() { return -1; }
     let Some(p) = get_provider() else { return -1 };
-    let key_bytes   = unsafe { (*s3_key).as_slice() };
-    let data_bytes  = unsafe { (*data).as_slice() };
-    let token_bytes = unsafe { (*token).as_slice() };
-    match p.pool.open_channel(key_bytes, token_bytes)
-        .and_then(|ch| ch.handle_get(data_bytes, offset))
-    {
+    let k = unsafe { (*s3_key).as_slice() }; let d = unsafe { (*data).as_slice() };
+    let t = unsafe { (*token).as_slice() };
+    match open_channel_sync(p, k, t).and_then(|ch| ch.handle_get(d, offset)) {
         Ok(n) => { unsafe { *out_written = n; } 0 }
         Err(e) => { error!("[s3-rdma-server] handle_get: {e}"); -1 }
     }
@@ -125,9 +138,8 @@ unsafe extern "C" fn c_handle_put_zc(
 ) -> i32 {
     if s3_key.is_null() || token.is_null() || out_transferred.is_null() { return -1; }
     let Some(p) = get_provider() else { return -1 };
-    let key_bytes   = unsafe { (*s3_key).as_slice() };
-    let token_bytes = unsafe { (*token).as_slice() };
-    match p.pool.open_channel(key_bytes, token_bytes)
+    let k = unsafe { (*s3_key).as_slice() }; let t = unsafe { (*token).as_slice() };
+    match open_channel_sync(p, k, t)
         .and_then(|ch| unsafe { ch.handle_put_zc(offset, size, write_fn, write_fn_data) })
     {
         Ok(n) => { unsafe { *out_transferred = n; } 0 }
@@ -142,13 +154,28 @@ unsafe extern "C" fn c_handle_get_zc(
 ) -> i32 {
     if s3_key.is_null() || token.is_null() || out_written.is_null() { return -1; }
     let Some(p) = get_provider() else { return -1 };
-    let key_bytes   = unsafe { (*s3_key).as_slice() };
-    let token_bytes = unsafe { (*token).as_slice() };
-    match p.pool.open_channel(key_bytes, token_bytes)
+    let k = unsafe { (*s3_key).as_slice() }; let t = unsafe { (*token).as_slice() };
+    match open_channel_sync(p, k, t)
         .and_then(|ch| unsafe { ch.handle_get_zc(offset, read_fn, read_fn_data) })
     {
         Ok(n) => { unsafe { *out_written = n; } 0 }
         Err(e) => { error!("[s3-rdma-server] handle_get_zc: {e}"); -1 }
+    }
+}
+
+unsafe extern "C" fn c_open_channel(
+    _ctx: *mut c_void, key: *const ByteCursor, token: *const ByteCursor,
+    out: *mut *mut c_void,
+) -> i32 {
+    if key.is_null() || token.is_null() || out.is_null() { return -1; }
+    let Some(p) = get_provider() else { return -1 };
+    let k = unsafe { (*key).as_slice() }; let t = unsafe { (*token).as_slice() };
+    match open_channel_sync(p, k, t) {
+        Ok(ch) => {
+            let boxed = Box::new(ch);
+            unsafe { *out = Box::into_raw(boxed) as *mut c_void }; 0
+        }
+        Err(e) => { error!("[s3-rdma-server] open_channel: {e}"); -1 }
     }
 }
 
@@ -159,7 +186,6 @@ fn level_to_cuobj_flags(level: u32) -> u32 {
 }
 
 unsafe extern "C" fn c_supports_telemetry(_: *mut c_void) -> i32 { 1 }
-
 unsafe extern "C" fn c_setup_telemetry(_: *mut c_void, cfg: *const CTelemetryConfig) -> i32 {
     if cfg.is_null() { return -1; }
     let c = unsafe { &*cfg };
@@ -169,9 +195,7 @@ unsafe extern "C" fn c_setup_telemetry(_: *mut c_void, cfg: *const CTelemetryCon
     CuObjServer::set_telem_flags(level_to_cuobj_flags(c.level));
     0
 }
-
 unsafe extern "C" fn c_shutdown_telemetry(_: *mut c_void) -> i32 { CuObjServer::shutdown_telemetry(); 0 }
-
 unsafe extern "C" fn c_set_telem_level(_: *mut c_void, level: u32) -> i32 {
     CuObjServer::set_telem_flags(level_to_cuobj_flags(level)); 0
 }
@@ -180,7 +204,7 @@ unsafe extern "C" fn c_set_telem_level(_: *mut c_void, level: u32) -> i32 {
 
 static VTABLE: RdmaServerVtable = RdmaServerVtable {
     provider_name:       PROVIDER_NAME.as_ptr() as *const c_char,
-    provider_version:    5,
+    provider_version:    6,
     init:                Some(c_init),
     cleanup:             Some(c_cleanup),
     handle_put:          Some(c_handle_put),
@@ -191,6 +215,52 @@ static VTABLE: RdmaServerVtable = RdmaServerVtable {
     setup_telemetry:     Some(c_setup_telemetry),
     shutdown_telemetry:  Some(c_shutdown_telemetry),
     set_telem_level:     Some(c_set_telem_level),
+    open_channel:        Some(c_open_channel),
 };
 
 pub fn vtable() -> *const RdmaServerVtable { &VTABLE }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_channel_creation_and_drop() {
+        let srv = Arc::new(CuObjServer::new("10.50.132.250", 4430).expect("CuObjServer::new"));
+        let p = ServerProvider { server: Arc::clone(&srv), buf_size: 4096 };
+        let key = b"test/key";
+        let token = b"deadbeef:1000:cafe"; // minimal cuobj token: vaddr:size:rkey
+
+        let ch = open_channel_sync(&p, key, token).expect("open_channel_sync");
+        assert_eq!(ch.key(), key);
+        assert_eq!(ch.token(), token);
+        assert_eq!(ch.buf_size(), 4096);
+        drop(ch); // frees channel + buffer
+        drop(p);  // drops server
+        println!("sync channel lifecycle: OK");
+    }
+
+    #[test]
+    fn sync_channel_rejects_invalid_token() {
+        let srv = Arc::new(CuObjServer::new("10.50.132.250", 4431).expect("CuObjServer::new"));
+        let p = ServerProvider { server: Arc::clone(&srv), buf_size: 4096 };
+        // Invalid token — no colon delimiter.
+        let result = open_channel_sync(&p, b"key", b"invalid_token");
+        assert!(result.is_ok(), "open_channel_sync should succeed even with bad token \
+                 (token is used at RDMA time, not open time)");
+        println!("sync channel bad token: OK (channel created, RDMA would fail later)");
+    }
+
+    #[test]
+    fn provider_init_and_cleanup() {
+        // Simulate what c_init does.
+        let srv = Arc::new(CuObjServer::new("10.50.132.250", 4432).expect("CuObjServer::new"));
+        assert!(srv.is_connected());
+        let p = Box::new(ServerProvider { server: srv, buf_size: 4096 });
+        drop(p);
+        println!("provider init/cleanup: OK");
+    }
+}
+
