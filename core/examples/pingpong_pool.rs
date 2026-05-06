@@ -4,59 +4,75 @@
 //!
 //!   cargo run --example pingpong_pool --manifest-path core/Cargo.toml
 
-use std::alloc::{Layout, alloc, dealloc};
+use std::ffi::c_void;
 use std::sync::Arc;
 
 use s3_rdma::mock::MockRdmaProvider;
-use s3_rdma::provider::{RdmaClientProvider, RdmaServerProvider, RDMA_REQUIRED_ALIGNMENT};
+use s3_rdma::provider::{RdmaClientProvider, RdmaServerProvider};
 use s3_rdma::worker_pool::RdmaWorkerPool;
 
 fn main() {
     println!("=== ping-pong (2-worker pool) ===\n");
 
     let size = 4096;
-    let layout = Layout::from_size_align(size, RDMA_REQUIRED_ALIGNMENT).unwrap();
-    let ptr = unsafe { alloc(layout) };
-    let data = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
     let key = b"bucket/pingpong.dat";
 
-    // Client: same as single-threaded.
     let client = MockRdmaProvider::new(false, "/dev/shm", 4096);
-    let ch = client.bind(ptr, size, key).unwrap();
-    println!("client: buffer {ptr:p}, {} bytes", size);
+    let ch = client.bind(size, key).unwrap();
+    let data = unsafe { std::slice::from_raw_parts_mut(ch.ptr() as *mut u8, ch.size()) };
+    println!("client: buffer {:p}, {} bytes", ch.ptr(), size);
 
-    // Server: wrapped in 2-worker pool.
-    let server: Arc<dyn RdmaServerProvider> = Arc::new(MockRdmaProvider::new(false, "/dev/shm", 4096));
-    let pool = RdmaWorkerPool::new(server, 2);
+    let provider = Arc::new(MockRdmaProvider::new(false, "/dev/shm", 4096));
+    let pool = RdmaWorkerPool::builder()
+        .client_workers(1)
+        .server_workers(2)
+        .provider(provider)
+        .build().unwrap();
 
     // ── PUT through pool ────────────────────────────────────────────────────
 
-    let payload = b"ping";
-    unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), ptr, payload.len()); }
-    let put_token = ch.prepare_put_token(0, size).unwrap();
+    data[..4].copy_from_slice(b"ping");
+    let put = ch.prepare_put(0, size).unwrap();
 
-    let mut put_buf = vec![0u8; size];
-    let srv_ch = pool.open_channel(key, &put_token).unwrap();
-    let n = srv_ch.handle_put(&mut put_buf, 0, size).unwrap();
-    println!("PUT:  received {} bytes: '{}'",
-             n, std::str::from_utf8(&put_buf[..payload.len()]).unwrap());
+    let mut put_buf: Vec<u8> = Vec::with_capacity(size);
+    let srv_ch = pool.open_channel(key, put.token()).unwrap();
+
+    unsafe extern "C" fn put_write(user_data: *mut c_void, buf: *const c_void, n: usize) -> isize {
+        let out = &mut *(user_data as *mut Vec<u8>);
+        let src = std::slice::from_raw_parts(buf as *const u8, n);
+        out.extend_from_slice(src);
+        n as isize
+    }
+    let n = unsafe {
+        srv_ch.handle_put(0, size, put_write, &mut put_buf as *mut Vec<u8> as *mut c_void)
+    }.unwrap();
+    println!("PUT:  received {} bytes: '{}'", n, std::str::from_utf8(&put_buf[..4]).unwrap());
 
     // ── GET through pool ────────────────────────────────────────────────────
 
-    let get_token = ch.prepare_get_token(0, size).unwrap();
-    let srv_ch = pool.open_channel(key, &get_token).unwrap();
-    let n = srv_ch.handle_get(b"pong", 0).unwrap();
+    let get = ch.prepare_get(0, size).unwrap();
+    let srv_ch = pool.open_channel(key, get.token()).unwrap();
+
+    unsafe extern "C" fn get_read(user_data: *mut c_void, buf: *mut c_void, capacity: usize) -> isize {
+        let src = &*(user_data as *const &[u8]);
+        let dst = std::slice::from_raw_parts_mut(buf as *mut u8, capacity);
+        let n = src.len().min(capacity);
+        dst[..n].copy_from_slice(&src[..n]);
+        n as isize
+    }
+    let pong: &[u8] = b"pong";
+    let n = unsafe {
+        srv_ch.handle_get(0, get_read, &pong as *const &[u8] as *mut c_void)
+    }.unwrap();
     println!("GET:  written {} bytes", n);
 
-    ch.process_rdma_reply(200, &get_token, n, Box::new(|r| assert_eq!(r.error_code, 0))).unwrap();
+    ch.complete_get(get, 200, n).unwrap();
     assert_eq!(&data[..4], b"pong");
     println!("      client buffer: '{}'", std::str::from_utf8(&data[..4]).unwrap());
 
     // ── Cleanup ─────────────────────────────────────────────────────────────
 
-    ch.process_rdma_reply(200, &put_token, 4096, Box::new(|_| {})).unwrap();
+    ch.complete_put(put, 200, 4096).unwrap();
     drop(ch);
-    // pool drops here — joins workers
-    unsafe { dealloc(ptr, layout); }
     println!("\nping-pong (pool) OK.");
 }

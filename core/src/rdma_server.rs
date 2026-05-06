@@ -153,68 +153,7 @@ mod real {
 
         fn _old_open_channel_stub() {}
 
-        /// Delegates to the plugin's `handle_put` vtable entry.
-        ///
-        /// The plugin performs an RDMA_READ from the client's buffer into its
-        /// internal pool slot, then copies the transferred bytes into the
-        /// caller-provided `buf`.  Returns the number of bytes written.
-        pub fn handle_put(
-            &self,
-            s3_key: &[u8],
-            token: &[u8],
-            buf: &mut [u8],
-            offset: usize,
-            size: usize,
-        ) -> Result<usize, RdmaError> {
-            let f = self.vtable().handle_put.ok_or_else(|| {
-                RdmaError::TransferFailed("handle_put not implemented in rdma plugin".into())
-            })?;
-            let key_cursor   = ByteCursor::from_slice(s3_key);
-            let token_cursor = ByteCursor::from_slice(token);
-            let mut transferred: usize = 0;
-            let rc = unsafe {
-                f(self.ctx, &key_cursor, &token_cursor,
-                  buf.as_mut_ptr(), offset, size, &mut transferred)
-            };
-            if rc != 0 {
-                return Err(RdmaError::TransferFailed(
-                    format!("rdma server handle_put returned {rc}")
-                ));
-            }
-            Ok(transferred)
-        }
-
-        /// Delegates to the plugin's `handle_get` vtable entry.
-        ///
-        /// Copies `data` into a pool slot and performs an RDMA_WRITE into the
-        /// client's registered buffer via `token`.  Returns the number of bytes
-        /// successfully written.
-        pub fn handle_get(
-            &self,
-            s3_key: &[u8],
-            data: &[u8],
-            token: &[u8],
-            offset: usize,
-        ) -> Result<usize, RdmaError> {
-            let f = self.vtable().handle_get.ok_or_else(|| {
-                RdmaError::TransferFailed("handle_get not implemented in rdma plugin".into())
-            })?;
-            let key_cursor   = ByteCursor::from_slice(s3_key);
-            let data_cursor  = ByteCursor::from_slice(data);
-            let token_cursor = ByteCursor::from_slice(token);
-            let mut written: usize = 0;
-            let rc = unsafe {
-                f(self.ctx, &key_cursor, &data_cursor, &token_cursor, offset, &mut written)
-            };
-            if rc != 0 {
-                return Err(RdmaError::TransferFailed(
-                    format!("rdma server handle_get returned {rc}")
-                ));
-            }
-            Ok(written)
-        }
-
-        /// Zero-copy RDMA PUT: delegates to the plugin's `handle_put_zc` entry.
+        /// Zero-copy RDMA PUT: delegates to the plugin's `handle_put` entry.
         ///
         /// The plugin RDMA_READs from the client buffer into its internal
         /// RDMA-registered slot, then invokes `write_fn(write_fn_data, ptr, n)`
@@ -223,7 +162,7 @@ mod real {
         /// # Safety
         /// `write_fn_data` must remain valid for the duration of the call.
         /// `write_fn` must be thread-safe (called from a plugin worker thread).
-        pub unsafe fn handle_put_zc(
+        pub unsafe fn handle_put(
             &self,
             s3_key:        &[u8],
             token:         &[u8],
@@ -232,8 +171,8 @@ mod real {
             write_fn:      crate::ffi::RdmaIoWriteFn,
             write_fn_data: *mut std::ffi::c_void,
         ) -> Result<usize, RdmaError> {
-            let f = self.vtable().handle_put_zc.ok_or_else(|| {
-                RdmaError::TransferFailed("handle_put_zc not implemented in rdma plugin".into())
+            let f = self.vtable().handle_put.ok_or_else(|| {
+                RdmaError::TransferFailed("handle_put not implemented in rdma plugin".into())
             })?;
             let key_cursor   = ByteCursor::from_slice(s3_key);
             let token_cursor = ByteCursor::from_slice(token);
@@ -244,13 +183,13 @@ mod real {
             };
             if rc != 0 {
                 return Err(RdmaError::TransferFailed(
-                    format!("rdma server handle_put_zc returned {rc}")
+                    format!("rdma server handle_put returned {rc}")
                 ));
             }
             Ok(transferred)
         }
 
-        /// Zero-copy RDMA GET: delegates to the plugin's `handle_get_zc` entry.
+        /// Zero-copy RDMA GET: delegates to the plugin's `handle_get` entry.
         ///
         /// The plugin calls `read_fn(read_fn_data, ptr, capacity)` to fill its
         /// RDMA-registered slot directly from storage, then RDMA_WRITEs the
@@ -259,7 +198,7 @@ mod real {
         /// # Safety
         /// `read_fn_data` must remain valid for the duration of the call.
         /// `read_fn` must be thread-safe (called from a plugin worker thread).
-        pub unsafe fn handle_get_zc(
+        pub unsafe fn handle_get(
             &self,
             s3_key:       &[u8],
             token:        &[u8],
@@ -267,8 +206,8 @@ mod real {
             read_fn:      crate::ffi::RdmaIoReadFn,
             read_fn_data: *mut std::ffi::c_void,
         ) -> Result<usize, RdmaError> {
-            let f = self.vtable().handle_get_zc.ok_or_else(|| {
-                RdmaError::TransferFailed("handle_get_zc not implemented in rdma plugin".into())
+            let f = self.vtable().handle_get.ok_or_else(|| {
+                RdmaError::TransferFailed("handle_get not implemented in rdma plugin".into())
             })?;
             let key_cursor   = ByteCursor::from_slice(s3_key);
             let token_cursor = ByteCursor::from_slice(token);
@@ -279,7 +218,7 @@ mod real {
             };
             if rc != 0 {
                 return Err(RdmaError::TransferFailed(
-                    format!("rdma server handle_get_zc returned {rc}")
+                    format!("rdma server handle_get returned {rc}")
                 ));
             }
             Ok(written)

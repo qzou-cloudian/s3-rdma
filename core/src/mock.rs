@@ -10,22 +10,24 @@
 //! ```
 //! `shm-name` is `rdma-{pid}-{buf_ptr_hex}` (hyphens only, no underscores).
 //!
-//! ## Client lifecycle ([`MockRdmaProvider`])
+//! ## Client lifecycle (channel API)
 //! | Step | Client calls | Effect |
 //! |------|-------------|--------|
-//! | 1 | `register_memory(ptr, size)` | Creates `/dev/shm/{shm-name}`, `mmap`s it |
-//! | 2 | `prepare_put_token(…)` | Copies `ptr[offset..offset+size]` → shm, returns token |
-//! | 2 | `prepare_get_token(…)` | Returns token (shm left empty; relay will fill it) |
+//! | 1 | `provider.bind(ptr, size, key)` | Creates channel; registers buffer and SHM |
+//! | 2 | `ch.prepare_put(offset, size)` | Copies `ptr[offset..offset+size]` → shm, returns `RdmaPutHandle` |
+//! | 2 | `ch.prepare_get(offset, size)` | Returns `RdmaGetHandle` (shm left empty; relay will fill it) |
 //! | 3 | *(HTTP exchange)* | Relay reads or writes the shm file |
-//! | 4 | `process_rdma_reply(status, request_token, transferred, cb)` | For GET: copies shm → `ptr`; cleans up shm |
-//! | 5 | `deregister_memory(ptr)` | Cleans up if not already done by step 4 |
+//! | 4 | `ch.complete_put(handle, status, n)` / `ch.complete_get(handle, status, n)` | For GET: copies shm → `ptr`; cleans up shm |
+//! | 5 | `drop(ch)` | Deregisters; cleans up SHM if not already done |
 //!
-//! ## Server lifecycle ([`MockRdmaProvider`])
+//! ## Server lifecycle
 //! | Step | Server calls | Effect |
 //! |------|-------------|--------|
-//! | 1 | `handle_put(token, size)` | Opens `/dev/shm/{shm-name}`, reads `size` bytes |
-//! | 2 | `handle_get(data, token)` | Opens `/dev/shm/{shm-name}`, writes `data` |
+//! | 1 | `provider.open_channel(key, token)` | Opens an `RdmaServerChannel` |
+//! | 2 | `ch.handle_put(buf, offset, size)` | Reads from SHM into `buf` |
+//! | 2 | `ch.handle_get(data, offset)` | Writes `data` into SHM |
 
+use std::alloc::Layout;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
@@ -34,7 +36,7 @@ use std::sync::Mutex;
 use tracing::debug;
 
 use crate::error::RdmaError;
-use crate::provider::{RdmaServerChannel, RdmaClientChannel, RdmaClientProvider, RdmaCompletionCallback, RdmaCompletionResult, RdmaServerProvider, RdmaProvider, rdma_status_to_error_code, RDMA_REQUIRED_ALIGNMENT, TelemState, TelemetryConfig, TelemLevel};
+use crate::provider::{RdmaServerChannel, RdmaClientChannel, RdmaPutHandle, RdmaGetHandle, RdmaClientProvider, DEFAULT_RDMA_BUF_SIZE, RdmaServerProvider, RdmaProvider, RDMA_REQUIRED_ALIGNMENT, TelemState, TelemetryConfig, TelemLevel};
 
 /// Base directory for shared-memory files.
 const SHM_DIR: &str = "/dev/shm";
@@ -96,7 +98,10 @@ impl RdmaServerChannel for MockChannel {
     fn token(&self) -> &[u8] { &self.token }
     fn buf_size(&self) -> usize { self.buf_size }
 
-    fn handle_put(&self, buf: &mut [u8], offset: usize, size: usize) -> Result<usize, RdmaError> {
+    unsafe fn handle_put(
+        &self, offset: usize, size: usize,
+        write_fn: crate::ffi::RdmaIoWriteFn, write_fn_data: *mut std::ffi::c_void,
+    ) -> Result<usize, RdmaError> {
         if self.op != "PUT" {
             return Err(RdmaError::TransferFailed(format!("expected PUT token, got {}", self.op)));
         }
@@ -112,27 +117,40 @@ impl RdmaServerChannel for MockChannel {
         let start = offset.min(file_len);
         let end = (offset + read_size).min(file_len);
         let want = end.saturating_sub(start);
-        let n = want.min(buf.len());
+        let mut buf = vec![0u8; want];
         file.seek(SeekFrom::Start(start as u64)).map_err(|e| RdmaError::TransferFailed(format!("seek {path}: {e}")))?;
-        file.read_exact(&mut buf[..n]).map_err(|e| RdmaError::TransferFailed(format!("read {path}: {e}")))?;
-        Ok(n)
+        file.read_exact(&mut buf).map_err(|e| RdmaError::TransferFailed(format!("read {path}: {e}")))?;
+        let n = buf.len();
+        let written = write_fn(write_fn_data, buf.as_ptr() as *const std::ffi::c_void, n);
+        if written < 0 {
+            return Err(RdmaError::TransferFailed(format!("write_fn returned {written}")));
+        }
+        Ok(written as usize)
     }
 
-    fn handle_get(&self, data: &[u8], offset: usize) -> Result<usize, RdmaError> {
+    unsafe fn handle_get(
+        &self, offset: usize,
+        read_fn: crate::ffi::RdmaIoReadFn, read_fn_data: *mut std::ffi::c_void,
+    ) -> Result<usize, RdmaError> {
         if self.op != "GET" {
             return Err(RdmaError::TransferFailed(format!("expected GET token, got {}", self.op)));
         }
-        let remaining_cap = self.token_size.saturating_sub(offset);
-        let write_len = data.len().min(remaining_cap);
+        let capacity = self.token_size.saturating_sub(offset);
+        let mut buf = vec![0u8; capacity];
+        let n = read_fn(read_fn_data, buf.as_mut_ptr() as *mut std::ffi::c_void, capacity);
+        if n < 0 {
+            return Err(RdmaError::TransferFailed(format!("read_fn returned {n}")));
+        }
+        let n = n as usize;
         let write_start = self.token_offset + offset;
         let path = format!("{}/{}", self.shm_dir, self.shm_name);
-        self.dbg(&format!("handle_get shm={} write={write_len}/{} write_start={write_start}", self.shm_name, data.len()));
+        self.dbg(&format!("handle_get shm={} write={n}/{} write_start={write_start}", self.shm_name, capacity));
         use std::io::{Seek, SeekFrom, Write};
         let mut file = OpenOptions::new().write(true).open(&path)
             .map_err(|e| RdmaError::TransferFailed(format!("open {path}: {e}")))?;
         file.seek(SeekFrom::Start(write_start as u64)).map_err(|e| RdmaError::TransferFailed(format!("seek {path}: {e}")))?;
-        file.write_all(&data[..write_len]).map_err(|e| RdmaError::TransferFailed(format!("write {path}: {e}")))?;
-        Ok(write_len)
+        file.write_all(&buf[..n]).map_err(|e| RdmaError::TransferFailed(format!("write {path}: {e}")))?;
+        Ok(n)
     }
 }
 
@@ -148,8 +166,11 @@ struct MockClientChannel {
     shm_name:  String,
     shm_ptr:   *mut libc::c_void,
     debug:     bool,
-    /// Whether the SHM has already been cleaned up by process_rdma_reply.
     cleaned:   std::sync::atomic::AtomicBool,
+    owned_shm: bool,
+    /// Layout for freeing `ptr` when owned (from `bind`).  `None` when
+    /// the buffer is externally owned (from `bind_registered`).
+    layout:    Option<std::alloc::Layout>,
 }
 
 unsafe impl Send for MockClientChannel {}
@@ -167,8 +188,8 @@ impl RdmaClientChannel for MockClientChannel {
     fn size(&self) -> usize { self.size }
     fn get_max_transfer_size(&self) -> usize { usize::MAX }
 
-    fn prepare_put_token(&self, offset: usize, size: usize) -> Result<Vec<u8>, RdmaError> {
-        self.dbg(&format!("prepare_put_token offset={offset} size={size}"));
+    fn prepare_put(&self, offset: usize, size: usize) -> Result<RdmaPutHandle, RdmaError> {
+        self.dbg(&format!("prepare_put offset={offset} size={size}"));
         unsafe { std::ptr::copy_nonoverlapping(self.ptr.add(offset), self.shm_ptr as *mut u8, size); }
         if unsafe { libc::msync(self.shm_ptr, size, libc::MS_SYNC) } != 0 {
             let e = std::io::Error::last_os_error();
@@ -182,51 +203,43 @@ impl RdmaClientChannel for MockClientChannel {
             self.shm_name,
             String::from_utf8_lossy(&self.key),
         ).into_bytes();
-        Ok(token)
+        Ok(RdmaPutHandle { token, offset, size })
     }
 
-    fn prepare_get_token(&self, offset: usize, size: usize) -> Result<Vec<u8>, RdmaError> {
-        self.dbg(&format!("prepare_get_token offset={offset} size={size}"));
+    fn prepare_get(&self, offset: usize, size: usize) -> Result<RdmaGetHandle, RdmaError> {
+        self.dbg(&format!("prepare_get offset={offset} size={size}"));
         let token = format!(
             "RDMA_GET_{}_{size}_{offset}_key_{}",
             self.shm_name,
             String::from_utf8_lossy(&self.key),
         ).into_bytes();
-        Ok(token)
+        Ok(RdmaGetHandle { token, offset, size })
     }
 
-    fn process_rdma_reply(
-        &self, status: u16, request_token: &[u8], transferred: usize, cb: RdmaCompletionCallback,
+    fn complete_put(
+        &self, _handle: RdmaPutHandle, rdma_status: u16, _transferred: usize,
     ) -> Result<(), RdmaError> {
-        let error_code = rdma_status_to_error_code(status);
-        if error_code != 0 {
-            cb(RdmaCompletionResult { error_code, reply_token: vec![] });
-            return Ok(());
+        if (200..300).contains(&rdma_status) { Ok(()) }
+        else { Err(RdmaError::TransferFailed(format!("RDMA PUT reply status={rdma_status}"))) }
+    }
+
+    fn complete_get(
+        &self, handle: RdmaGetHandle, rdma_status: u16, transferred: usize,
+    ) -> Result<(), RdmaError> {
+        if !(200..300).contains(&rdma_status) {
+            return Err(RdmaError::TransferFailed(format!("RDMA GET reply status={rdma_status}")));
         }
-
-        let (op, _shm_name, _size, token_offset) = match MockRdmaProvider::parse_token(request_token) {
-            Ok(t) => t,
-            Err(e) => {
-                cb(RdmaCompletionResult { error_code: -1, reply_token: vec![] });
-                return Err(e);
-            }
-        };
-
-        if op == "GET" && transferred > 0 {
-            let available = self.size.saturating_sub(token_offset);
-            let copy_len = transferred.min(available);
-            if copy_len > 0 {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        (self.shm_ptr as *const u8).add(token_offset),
-                        self.ptr, copy_len,
-                    );
-                }
+        let token_offset = handle.offset();
+        let available = self.size.saturating_sub(token_offset);
+        let copy_len = transferred.min(available);
+        if copy_len > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (self.shm_ptr as *const u8).add(token_offset),
+                    self.ptr, copy_len,
+                );
             }
         }
-
-        self.cleanup_shm();
-        cb(RdmaCompletionResult { error_code: 0, reply_token: vec![] });
         Ok(())
     }
 }
@@ -234,6 +247,7 @@ impl RdmaClientChannel for MockClientChannel {
 impl MockClientChannel {
     fn cleanup_shm(&self) {
         if self.cleaned.swap(true, std::sync::atomic::Ordering::Relaxed) { return; }
+        if !self.owned_shm { return; }
         self.dbg(&format!("cleanup shm={}", self.shm_name));
         unsafe { libc::munmap(self.shm_ptr, self.size); }
         let path = format!("{}/{}", self.shm_dir, self.shm_name);
@@ -242,7 +256,12 @@ impl MockClientChannel {
 }
 
 impl Drop for MockClientChannel {
-    fn drop(&mut self) { self.cleanup_shm(); }
+    fn drop(&mut self) {
+        self.cleanup_shm();
+        if let Some(layout) = self.layout {
+            unsafe { std::alloc::dealloc(self.ptr, layout); }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -304,6 +323,40 @@ impl MockRdmaProvider {
         }
     }
 
+    /// Register a buffer by creating an SHM file and mmap'ing it.
+    /// Internal helper used by `bind`.
+    fn register_shm(&self, ptr: *mut u8, size: usize) -> Result<(), RdmaError> {
+        let name = format!("rdma-{}-{:x}", std::process::id(), ptr as usize);
+        let path = format!("{}/{name}", self.shm_dir);
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true)
+            .open(&path)
+            .map_err(|e| RdmaError::MemoryRegistrationFailed {
+                ptr: ptr as usize, size,
+                reason: format!("create {path}: {e}"),
+            })?;
+        file.set_len(size as u64).map_err(|e| RdmaError::MemoryRegistrationFailed {
+            ptr: ptr as usize, size,
+            reason: format!("resize {path}: {e}"),
+        })?;
+        let shm_ptr = unsafe {
+            libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE,
+                       libc::MAP_SHARED, file.as_raw_fd(), 0)
+        };
+        drop(file);
+        if shm_ptr == libc::MAP_FAILED {
+            let _ = std::fs::remove_file(&path);
+            return Err(RdmaError::MemoryRegistrationFailed {
+                ptr: ptr as usize, size,
+                reason: format!("mmap {path}: {}", std::io::Error::last_os_error()),
+            });
+        }
+        self.registered.lock().unwrap().insert(
+            ptr as usize,
+            ShmEntry { name, path, shm_ptr, buf_ptr: ptr, size },
+        );
+        Ok(())
+    }
+
     fn parse_token(token: &[u8]) -> Result<(&str, &str, usize, usize), RdmaError> {
         let s = std::str::from_utf8(token).map_err(|e| {
             RdmaError::TransferFailed(format!("token is not valid UTF-8: {e}"))
@@ -327,227 +380,55 @@ impl MockRdmaProvider {
 impl RdmaClientProvider for MockRdmaProvider {
     fn name(&self) -> &str { "MockRdmaProvider" }
     fn protocol(&self) -> &str { "mock" }
+    fn buf_size(&self) -> usize { DEFAULT_RDMA_BUF_SIZE }
 
-    fn is_memory_suitable(&self, ptr: *const u8, size: usize) -> bool {
-        let ok = !ptr.is_null() && size > 0 && (ptr as usize).is_multiple_of(RDMA_REQUIRED_ALIGNMENT);
-        self.dbg(&format!("is_memory_suitable ptr={ptr:p} size={size} -> {ok}"));
-        ok
-    }
-
-    fn bind(&self, ptr: *mut u8, size: usize, key: &[u8]) -> Result<Box<dyn RdmaClientChannel>, RdmaError> {
-        self.dbg(&format!("bind ptr={ptr:p} size={size} key={}", String::from_utf8_lossy(key)));
-        if !(ptr as usize).is_multiple_of(RDMA_REQUIRED_ALIGNMENT) {
-            return Err(RdmaError::MemoryNotSuitable { ptr: ptr as usize, size });
-        }
-        let shm_name = format!("rdma-{}-{:x}", std::process::id(), ptr as usize);
-        let path = format!("{}/{shm_name}", self.shm_dir);
-        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true)
-            .open(&path)
+    fn bind(&self, size: usize, key: &[u8]) -> Result<Box<dyn RdmaClientChannel>, RdmaError> {
+        self.dbg(&format!("bind size={size} key={}", String::from_utf8_lossy(key)));
+        let layout = Layout::from_size_align(size, RDMA_REQUIRED_ALIGNMENT)
             .map_err(|e| RdmaError::MemoryRegistrationFailed {
-                ptr: ptr as usize, size,
-                reason: format!("create {path}: {e}"),
+                ptr: 0, size,
+                reason: format!("layout: {e}"),
             })?;
-        file.set_len(size as u64).map_err(|e| RdmaError::MemoryRegistrationFailed {
-            ptr: ptr as usize, size,
-            reason: format!("resize {path}: {e}"),
-        })?;
-        let shm_ptr = unsafe {
-            libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE,
-                       libc::MAP_SHARED, file.as_raw_fd(), 0)
-        };
-        drop(file);
-        if shm_ptr == libc::MAP_FAILED {
-            let _ = std::fs::remove_file(&path);
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        if ptr.is_null() {
             return Err(RdmaError::MemoryRegistrationFailed {
-                ptr: ptr as usize, size,
-                reason: format!("mmap {path}: {}", std::io::Error::last_os_error()),
+                ptr: 0, size,
+                reason: "alloc returned null".into(),
             });
         }
+        self.register_shm(ptr, size)?;
         Ok(Box::new(MockClientChannel {
             key: key.to_vec(), ptr, size,
-            shm_dir: self.shm_dir.clone(), shm_name, shm_ptr,
+            shm_dir: self.shm_dir.clone(),
+            shm_name: format!("rdma-{}-{:x}", std::process::id(), ptr as usize),
+            shm_ptr: self.registered.lock().unwrap().get(&(ptr as usize)).unwrap().shm_ptr,
             debug: self.debug,
             cleaned: std::sync::atomic::AtomicBool::new(false),
+            owned_shm: true,
+            layout: Some(layout),
         }))
     }
 
-    fn register_memory(&self, ptr: *mut u8, size: usize) -> Result<(), RdmaError> {
-        self.dbg(&format!("register_memory ptr={ptr:p} size={size}"));
-
-        if !(ptr as usize).is_multiple_of(RDMA_REQUIRED_ALIGNMENT) {
-            return Err(RdmaError::MemoryNotSuitable {
-                ptr: ptr as usize,
-                size,
-            });
-        }
-
-        let name = format!("rdma-{}-{:x}", std::process::id(), ptr as usize);
-        let path = format!("{}/{name}", self.shm_dir);
-
-        let file = OpenOptions::new()
-            .read(true).write(true).create(true).truncate(true)
-            .open(&path)
-            .map_err(|e| RdmaError::MemoryRegistrationFailed {
-                ptr: ptr as usize, size,
-                reason: format!("create {path}: {e}"),
-            })?;
-        file.set_len(size as u64)
-            .map_err(|e| RdmaError::MemoryRegistrationFailed {
-                ptr: ptr as usize, size,
-                reason: format!("resize {path}: {e}"),
-            })?;
-
-        let shm_ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(), size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED, file.as_raw_fd(), 0,
-            )
-        };
-        if shm_ptr == libc::MAP_FAILED {
-            let _ = std::fs::remove_file(&path);
-            return Err(RdmaError::MemoryRegistrationFailed {
-                ptr: ptr as usize, size,
-                reason: format!("mmap {path}: {}", std::io::Error::last_os_error()),
-            });
-        }
-        drop(file);
-
-        self.registered.lock().unwrap().insert(
-            ptr as usize,
-            ShmEntry { name, path, shm_ptr, buf_ptr: ptr, size },
-        );
-        Ok(())
-    }
-
-    fn deregister_memory(&self, ptr: *mut u8) -> Result<(), RdmaError> {
-        self.dbg(&format!("deregister_memory ptr={ptr:p}"));
-        if let Some(entry) = self.registered.lock().unwrap().remove(&(ptr as usize)) {
-            unsafe { entry.cleanup(); }
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    fn prepare_put_token(
-        &self,
-        s3_key: &[u8],
-        buffer: *const u8,
-        size: usize,
-        offset: usize,
-    ) -> Result<Vec<u8>, RdmaError> {
-        let key = String::from_utf8_lossy(s3_key);
-        let shm_name = {
-            let registered = self.registered.lock().unwrap();
-            let entry = registered.get(&(buffer as usize)).ok_or_else(|| {
-                RdmaError::TokenGenerationFailed {
-                    key: key.to_string(),
-                    reason: format!("buffer {buffer:p} not registered"),
-                }
-            })?;
-
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    buffer.add(offset),
-                    entry.shm_ptr as *mut u8,
-                    size,
-                );
-                if libc::msync(entry.shm_ptr, size, libc::MS_SYNC) != 0 {
-                    let e = std::io::Error::last_os_error();
-                    return Err(RdmaError::TokenGenerationFailed {
-                        key: key.to_string(),
-                        reason: format!("msync shm={} failed: {e}", entry.name),
-                    });
-                }
-            }
-            entry.name.clone()
-        }; // lock released; string allocation below is outside the critical section
-
-        let token = format!("RDMA_PUT_{shm_name}_{size}_{offset}_key_{key}")
-            .into_bytes();
-        self.dbg(&format!("prepare_put_token key={key} shm={shm_name}"));
-        Ok(token)
-    }
-
-    fn prepare_get_token(
-        &self,
-        s3_key: &[u8],
-        buffer: *mut u8,
-        size: usize,
-        offset: usize,
-    ) -> Result<Vec<u8>, RdmaError> {
-        let key = String::from_utf8_lossy(s3_key);
-        let shm_name = {
-            let registered = self.registered.lock().unwrap();
-            let entry = registered.get(&(buffer as usize)).ok_or_else(|| {
-                RdmaError::TokenGenerationFailed {
-                    key: key.to_string(),
-                    reason: format!("buffer {buffer:p} not registered"),
-                }
-            })?;
-            entry.name.clone()
-        }; // lock released; string allocation below is outside the critical section
-
-        let token = format!("RDMA_GET_{shm_name}_{size}_{offset}_key_{key}")
-            .into_bytes();
-        self.dbg(&format!("prepare_get_token key={key} shm={shm_name}"));
-        Ok(token)
-    }
-
-    fn process_rdma_reply(
-        &self,
-        rdma_status: u16,
-        request_token: &[u8],
-        transferred: usize,
-        callback: RdmaCompletionCallback,
-    ) -> Result<(), RdmaError> {
-        self.dbg(&format!("process_rdma_reply status={rdma_status} transferred={transferred}"));
-
-        let error_code = rdma_status_to_error_code(rdma_status);
-        if error_code != 0 {
-            callback(RdmaCompletionResult { error_code, reply_token: vec![] });
-            return Ok(());
-        }
-
-        let (op, shm_name, _size, token_offset) = match Self::parse_token(request_token) {
-            Ok(t) => t,
-            Err(e) => {
-                callback(RdmaCompletionResult { error_code: -1, reply_token: vec![] });
-                return Err(e);
-            }
-        };
-
-        let entry_to_drop: Option<ShmEntry> = {
-            let mut registered = self.registered.lock().unwrap();
-            let found_ptr = registered.iter()
-                .find(|(_, e)| e.name == shm_name)
-                .map(|(&k, _)| k);
-
-            found_ptr.and_then(|ptr| {
-                let entry = registered.remove(&ptr)?;
-                if op == "GET" && transferred > 0 {
-                    let available = entry.size.saturating_sub(token_offset);
-                    let copy_len = transferred.min(available);
-                    if copy_len > 0 {
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                (entry.shm_ptr as *const u8).add(token_offset),
-                                entry.buf_ptr,
-                                copy_len,
-                            );
-                        }
-                    }
-                }
-                Some(entry)
-            })
-        };
-
-        if let Some(entry) = entry_to_drop {
-            unsafe { entry.cleanup(); }
-        }
-
-        callback(RdmaCompletionResult { error_code: 0, reply_token: vec![] });
-        Ok(())
+    fn bind_registered(&self, key: &[u8]) -> Result<Box<dyn RdmaClientChannel>, RdmaError> {
+        self.dbg(&format!("bind_registered key={}", String::from_utf8_lossy(key)));
+        // Use the first available registered buffer from the pool.
+        // If none are registered, return error.
+        let reg = self.registered.lock().unwrap();
+        let (&ptr_key, entry) = reg.iter().next().ok_or_else(|| {
+            RdmaError::OperationNotSupported("no registered buffers available".into())
+        })?;
+        Ok(Box::new(MockClientChannel {
+            key: key.to_vec(),
+            ptr: ptr_key as *mut u8,
+            size: entry.size,
+            shm_dir: self.shm_dir.clone(),
+            shm_name: entry.name.clone(),
+            shm_ptr:  entry.shm_ptr,
+            debug: self.debug,
+            cleaned: std::sync::atomic::AtomicBool::new(false),
+            owned_shm: false,
+            layout: None,
+        }))
     }
 
     // ── Telemetry (delegated to TelemState) ──────────────────────────────────
@@ -604,4 +485,156 @@ impl RdmaServerProvider for MockRdmaProvider {
 impl RdmaProvider for MockRdmaProvider {
     fn supports_client(&self) -> bool { true }
     fn supports_server(&self) -> bool { true }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{RdmaClientProvider, RdmaServerProvider};
+
+    #[test]
+    fn put_then_get_roundtrip() {
+        let client = MockRdmaProvider::new(false, "/dev/shm", 4096);
+        let ch = client.bind(4096, b"key").unwrap();
+        let server = MockRdmaProvider::new(false, "/dev/shm", 4096);
+
+        // PUT "hello"
+        let n = ch.put(0, 4096,
+            Box::new(|buf: &mut [u8]| {
+                buf[..5].copy_from_slice(b"hello");
+                5
+            }),
+            Box::new(|token: &[u8]| {
+                let srv = server.open_channel(b"key", token).unwrap();
+                let mut out: Vec<u8> = Vec::with_capacity(4096);
+                let n = unsafe {
+                    extern "C" fn write_cb(d: *mut std::ffi::c_void, b: *const std::ffi::c_void, n: usize) -> isize {
+                        unsafe {
+                            let out = &mut *(d as *mut Vec<u8>);
+                            let src = std::slice::from_raw_parts(b as *const u8, n);
+                            out.extend_from_slice(src);
+                            n as isize
+                        }
+                    }
+                    srv.handle_put(0, 4096, write_cb, &mut out as *mut Vec<u8> as *mut std::ffi::c_void)
+                }.unwrap();
+                assert_eq!(&out[..5], b"hello");
+                Ok((200, n))
+            }),
+        ).unwrap();
+        assert_eq!(n, 4096);
+
+        // GET "world"
+        let mut received = Vec::new();
+        let n = ch.get(0, 4096,
+            Box::new(|token: &[u8]| {
+                let srv = server.open_channel(b"key", token).unwrap();
+                let payload: &[u8] = b"world";
+                let n = unsafe {
+                    extern "C" fn read_cb(d: *mut std::ffi::c_void, b: *mut std::ffi::c_void, cap: usize) -> isize {
+                        unsafe {
+                            let src = &*(d as *const &[u8]);
+                            let dst = std::slice::from_raw_parts_mut(b as *mut u8, cap);
+                            let n = src.len().min(cap);
+                            dst[..n].copy_from_slice(&src[..n]);
+                            n as isize
+                        }
+                    }
+                    srv.handle_get(0, read_cb, &payload as *const &[u8] as *mut std::ffi::c_void)
+                }.unwrap();
+                Ok((200, n))
+            }),
+            Box::new(|data: &[u8]| received.extend_from_slice(data)),
+        ).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(received, b"world");
+    }
+
+    #[test]
+    fn put_empty_write() {
+        let client = MockRdmaProvider::new(false, "/dev/shm", 4096);
+        let ch = client.bind(4096, b"key").unwrap();
+        let server = MockRdmaProvider::new(false, "/dev/shm", 4096);
+
+        let n = ch.put(0, 4096,
+            Box::new(|_buf: &mut [u8]| 0),
+            Box::new(|token: &[u8]| {
+                let srv = server.open_channel(b"key", token).unwrap();
+                let mut out: Vec<u8> = Vec::with_capacity(4096);
+                let n = unsafe {
+                    extern "C" fn write_cb(d: *mut std::ffi::c_void, b: *const std::ffi::c_void, n: usize) -> isize {
+                        unsafe {
+                            let out = &mut *(d as *mut Vec<u8>);
+                            let src = std::slice::from_raw_parts(b as *const u8, n);
+                            out.extend_from_slice(src);
+                            n as isize
+                        }
+                    }
+                    srv.handle_put(0, 4096, write_cb, &mut out as *mut Vec<u8> as *mut std::ffi::c_void)
+                }.unwrap();
+                Ok((200, n))
+            }),
+        ).unwrap();
+        assert_eq!(n, 4096);
+    }
+
+    #[test]
+    fn put_then_get_offset() {
+        let client = MockRdmaProvider::new(false, "/dev/shm", 4096);
+        let ch = client.bind(4096, b"key").unwrap();
+        let server = MockRdmaProvider::new(false, "/dev/shm", 4096);
+
+        // PUT 3 bytes at offset 100
+        let n = ch.put(100, 4096,
+            Box::new(|buf: &mut [u8]| {
+                buf[..3].copy_from_slice(b"foo");
+                3
+            }),
+            Box::new(|token: &[u8]| {
+                let srv = server.open_channel(b"key", token).unwrap();
+                let mut out: Vec<u8> = Vec::with_capacity(4096);
+                let n = unsafe {
+                    extern "C" fn write_cb(d: *mut std::ffi::c_void, b: *const std::ffi::c_void, n: usize) -> isize {
+                        unsafe {
+                            let out = &mut *(d as *mut Vec<u8>);
+                            let src = std::slice::from_raw_parts(b as *const u8, n);
+                            out.extend_from_slice(src);
+                            n as isize
+                        }
+                    }
+                    srv.handle_put(0, 4096, write_cb, &mut out as *mut Vec<u8> as *mut std::ffi::c_void)
+                }.unwrap();
+                assert_eq!(&out[..3], b"foo");
+                Ok((200, n))
+            }),
+        ).unwrap();
+        assert_eq!(n, 4096);
+
+        // GET 3 bytes at offset 100
+        let mut received = Vec::new();
+        let n = ch.get(100, 3,
+            Box::new(|token: &[u8]| {
+                let srv = server.open_channel(b"key", token).unwrap();
+                let payload: &[u8] = b"bar";
+                let n = unsafe {
+                    extern "C" fn read_cb(d: *mut std::ffi::c_void, b: *mut std::ffi::c_void, cap: usize) -> isize {
+                        unsafe {
+                            let src = &*(d as *const &[u8]);
+                            let dst = std::slice::from_raw_parts_mut(b as *mut u8, cap);
+                            let n = src.len().min(cap);
+                            dst[..n].copy_from_slice(&src[..n]);
+                            n as isize
+                        }
+                    }
+                    srv.handle_get(0, read_cb, &payload as *const &[u8] as *mut std::ffi::c_void)
+                }.unwrap();
+                Ok((200, n))
+            }),
+            Box::new(|data: &[u8]| received.extend_from_slice(data)),
+        ).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(received, b"bar");
+    }
 }

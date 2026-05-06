@@ -181,6 +181,57 @@ pub enum RdmaRole {
     Both,
 }
 
+// ── RdmaPutHandle / RdmaGetHandle ─────────────────────────────────────────────
+
+/// Handle for an in-flight PUT (upload) RDMA operation.
+///
+/// Created by [`RdmaClientChannel::prepare_put`].  The handle bundles the
+/// opaque RDMA descriptor token with the operation's offset and size metadata.
+/// Consumed by [`RdmaClientChannel::complete_put`].
+///
+/// The token bytes are exposed via [`token()`](Self::token) for serialization
+/// into the `x-amz-rdma-token` HTTP header.
+#[derive(Debug)]
+pub struct RdmaPutHandle {
+    pub(crate) token:  Vec<u8>,
+    pub(crate) offset: usize,
+    pub(crate) size:   usize,
+}
+
+/// Handle for an in-flight GET (download) RDMA operation.
+///
+/// Created by [`RdmaClientChannel::prepare_get`].  The handle bundles the
+/// opaque RDMA descriptor token with the operation's offset and size metadata.
+/// Consumed by [`RdmaClientChannel::complete_get`].
+#[derive(Debug)]
+pub struct RdmaGetHandle {
+    pub(crate) token:  Vec<u8>,
+    pub(crate) offset: usize,
+    pub(crate) size:   usize,
+}
+
+impl RdmaPutHandle {
+    /// Opaque token bytes for the `x-amz-rdma-token` HTTP header.
+    pub fn token(&self) -> &[u8] { &self.token }
+
+    /// Byte offset within the registered buffer for this transfer.
+    pub fn offset(&self) -> usize { self.offset }
+
+    /// Number of bytes this transfer covers.
+    pub fn size(&self) -> usize { self.size }
+}
+
+impl RdmaGetHandle {
+    /// Opaque token bytes for the `x-amz-rdma-token` HTTP header.
+    pub fn token(&self) -> &[u8] { &self.token }
+
+    /// Byte offset within the registered buffer for this transfer.
+    pub fn offset(&self) -> usize { self.offset }
+
+    /// Number of bytes this transfer covers.
+    pub fn size(&self) -> usize { self.size }
+}
+
 // ── RdmaClientChannel trait ────────────────────────────────────────────────────
 
 /// An open client-side RDMA session bound to a registered buffer and S3 key.
@@ -191,20 +242,84 @@ pub enum RdmaRole {
 ///
 /// Dropping the channel deregisters the buffer.
 pub trait RdmaClientChannel: Send + Sync {
-    /// Generate an RDMA descriptor token for a PUT (upload).
-    fn prepare_put_token(&self, offset: usize, size: usize) -> Result<Vec<u8>, crate::error::RdmaError>;
+    /// Prepare a PUT (upload) operation, returning a typed handle.
+    ///
+    /// The token points directly to the registered buffer for zero-copy
+    /// RDMA-read by the server — no intermediate buffer copy is needed.
+    fn prepare_put(&self, offset: usize, size: usize) -> Result<RdmaPutHandle, crate::error::RdmaError>;
 
-    /// Generate an RDMA descriptor token for a GET (download).
-    fn prepare_get_token(&self, offset: usize, size: usize) -> Result<Vec<u8>, crate::error::RdmaError>;
+    /// Prepare a GET (download) operation, returning a typed handle.
+    ///
+    /// The token points directly to the registered buffer for zero-copy
+    /// RDMA-write by the server.
+    fn prepare_get(&self, offset: usize, size: usize) -> Result<RdmaGetHandle, crate::error::RdmaError>;
 
-    /// Process the server reply and clean up.
-    fn process_rdma_reply(
+    /// Complete a PUT operation.  Consumes the handle.
+    ///
+    /// `rdma_status` is the `x-amz-rdma-reply` HTTP status code
+    /// (200/204/206 = success, 501 = fallback, 0 = absent).
+    /// `transferred` is the value of `x-amz-rdma-bytes` (0 if absent).
+    fn complete_put(
         &self,
+        handle: RdmaPutHandle,
         rdma_status: u16,
-        request_token: &[u8],
         transferred: usize,
-        callback: RdmaCompletionCallback,
     ) -> Result<(), crate::error::RdmaError>;
+
+    /// Complete a GET operation.  Consumes the handle.
+    fn complete_get(
+        &self,
+        handle: RdmaGetHandle,
+        rdma_status: u16,
+        transferred: usize,
+    ) -> Result<(), crate::error::RdmaError>;
+
+    /// Execute a full PUT: call `write` to fill the buffer directly,
+    /// prepare the token for the written range, call `send` with the token,
+    /// then complete.  Zero-copy — `write` fills the registered buffer
+    /// (e.g. via `pread`), then the NIC RDMA-reads from it.
+    ///
+    /// `write` receives `&mut buf[offset..offset+size]` and must return the
+    /// number of bytes actually written.  `send` receives the token bytes
+    /// and must return `(rdma_status, transferred_bytes)`.
+    fn put(
+        &self,
+        offset: usize,
+        size:   usize,
+        write:  Box<dyn FnOnce(&mut [u8]) -> usize + Send + '_>,
+        send:   Box<dyn FnOnce(&[u8]) -> Result<(u16, usize), crate::error::RdmaError> + Send + '_>,
+    ) -> Result<usize, crate::error::RdmaError> {
+        let buf = unsafe { std::slice::from_raw_parts_mut(self.ptr() as *mut u8, self.size()) };
+        let cap = buf.len().saturating_sub(offset);
+        let n = write(&mut buf[offset..offset.saturating_add(size.min(cap))]);
+        let handle = self.prepare_put(offset, n)?;
+        let (status, transferred) = send(handle.token())?;
+        self.complete_put(handle, status, transferred)?;
+        Ok(transferred)
+    }
+
+    /// Execute a full GET: prepare token, `send` the token to the server,
+    /// complete, then pass the downloaded data to `read`.  The buffer is
+    /// accessed only within `get` — no dangling reference can outlive the call.
+    ///
+    /// `send` receives the token bytes and must return `(rdma_status, transferred)`.
+    /// `read` receives the valid slice of the buffer containing the downloaded
+    /// data.  Capture the data in the closure (e.g. extend a Vec, copy to a
+    /// file descriptor).  Returns the number of bytes transferred.
+    fn get(
+        &self,
+        offset: usize,
+        size:   usize,
+        send:   Box<dyn FnOnce(&[u8]) -> Result<(u16, usize), crate::error::RdmaError> + Send + '_>,
+        read:   Box<dyn FnOnce(&[u8]) + Send + '_>,
+    ) -> Result<usize, crate::error::RdmaError> {
+        let handle = self.prepare_get(offset, size)?;
+        let (status, transferred) = send(handle.token())?;
+        self.complete_get(handle, status, transferred)?;
+        let buf = unsafe { std::slice::from_raw_parts(self.ptr() as *const u8, self.size()) };
+        read(&buf[..transferred.min(buf.len())]);
+        Ok(transferred)
+    }
 
     /// The S3 object key this channel is bound to.
     fn key(&self) -> &[u8];
@@ -221,39 +336,26 @@ pub trait RdmaClientChannel: Send + Sync {
 
 // ── RdmaClientProvider trait ──────────────────────────────────────────────────
 
-/// Client-side RDMA operations: memory registration and token generation.
+/// Client-side RDMA operations: allocate, register, and bind buffers.
 ///
-/// Implemented by any provider that acts as an S3 client — the node that
-/// initiates transfers by registering buffers and attaching tokens to HTTP
-/// requests.
+/// Implemented by any provider that acts as an S3 client.  The provider
+/// allocates and manages buffers internally — callers access the buffer
+/// through the returned [`RdmaClientChannel`].
 ///
 /// All methods have default implementations that return
 /// [`RdmaError::OperationNotSupported`](crate::error::RdmaError::OperationNotSupported)
 /// so implementors only override what they actually support.
 pub trait RdmaClientProvider: Send + Sync {
-    /// Returns `true` if the memory at `ptr..ptr+size` is eligible for RDMA.
+    /// Allocate, register, and bind a buffer to an S3 key.
     ///
-    /// Implementors should check that `ptr` is non-null, aligned to
-    /// [`RDMA_REQUIRED_ALIGNMENT`], and backed by pinnable memory (not
-    /// garbage-collected or JIT-compiled pages).
-    fn is_memory_suitable(&self, _ptr: *const u8, _size: usize) -> bool {
-        false
-    }
-
-    /// Bind a buffer to an S3 key, returning an [`RdmaClientChannel`].
-    ///
-    /// This is the **primary** client-side method.  The returned channel
-    /// registers the buffer, owns the key, and provides token generation
-    /// and reply processing.  Dropping the channel deregisters the buffer.
-    ///
-    /// The existing [`register_memory`](Self::register_memory) /
-    /// [`deregister_memory`](Self::deregister_memory) /
-    /// [`prepare_put_token`](Self::prepare_put_token) /
-    /// [`prepare_get_token`](Self::prepare_get_token) methods are
-    /// retained for compatibility but new code should prefer `bind`.
+    /// This is the **primary** client-side method.  The provider allocates
+    /// a buffer of `size` bytes, registers it, and returns an
+    /// [`RdmaClientChannel`].  The buffer is accessible via
+    /// [`ch.ptr()`](RdmaClientChannel::ptr) /
+    /// [`ch.size()`](RdmaClientChannel::size).
+    /// Dropping the channel deregisters and frees the buffer.
     fn bind(
         &self,
-        _ptr: *mut u8,
         _size: usize,
         _key: &[u8],
     ) -> Result<Box<dyn RdmaClientChannel>, crate::error::RdmaError> {
@@ -262,110 +364,35 @@ pub trait RdmaClientProvider: Send + Sync {
         ))
     }
 
-    /// Register a memory region so the RDMA subsystem can access it.
+    /// Bind a pre-registered buffer from the provider's internal pool.
     ///
-    /// The registered buffer is **pinned** — the OS must not swap, migrate, or
-    /// move the physical pages for the duration of registration.  The provider
-    /// locks the pages (e.g. via `mlock` or IOMMU pinning) so the RDMA NIC can
-    /// perform DMA to/from them without page faults.
-    ///
-    /// **Alignment:** `ptr` must be aligned to [`RDMA_REQUIRED_ALIGNMENT`]
-    /// (4 KiB).  Implementors should return [`RdmaError::MemoryNotSuitable`]
-    /// for unaligned pointers.
-    ///
-    /// # Safety
-    /// `ptr` must remain valid until [`deregister_memory`](Self::deregister_memory).
-    fn register_memory(&self, _ptr: *mut u8, _size: usize) -> Result<(), crate::error::RdmaError> {
-        Err(crate::error::RdmaError::OperationNotSupported(
-            "register_memory: not supported by this provider".into(),
-        ))
-    }
-
-    /// Deregister a previously registered memory region.
-    fn deregister_memory(&self, _ptr: *mut u8) -> Result<(), crate::error::RdmaError> {
-        Err(crate::error::RdmaError::OperationNotSupported(
-            "deregister_memory: not supported by this provider".into(),
-        ))
-    }
-
-    /// Maximum single-transfer size for the given buffer.
-    /// Default: `usize::MAX` (no provider-imposed limit).
-    fn get_max_transfer_size(&self, _ptr: *const u8) -> usize {
-        usize::MAX
-    }
-
-    /// Generate an RDMA descriptor token for a PUT (upload) sub-request.
-    ///
-    /// Returns bytes used as the value of the `x-amz-rdma-token` request header.
-    fn prepare_put_token(
+    /// Like [`bind`](Self::bind), but uses a buffer that was previously
+    /// allocated and registered (e.g. at pool construction time).  Dropping
+    /// the channel does **not** free the buffer — it returns to the pool.
+    fn bind_registered(
         &self,
-        _s3_key: &[u8],
-        _buffer: *const u8,
-        _size: usize,
-        _offset: usize,
-    ) -> Result<Vec<u8>, crate::error::RdmaError> {
+        _key: &[u8],
+    ) -> Result<Box<dyn RdmaClientChannel>, crate::error::RdmaError> {
         Err(crate::error::RdmaError::OperationNotSupported(
-            "prepare_put_token: not supported by this provider".into(),
+            "bind_registered: not supported by this provider".into(),
         ))
     }
 
-    /// Generate an RDMA descriptor token for a GET (download) sub-request.
-    fn prepare_get_token(
-        &self,
-        _s3_key: &[u8],
-        _buffer: *mut u8,
-        _size: usize,
-        _offset: usize,
-    ) -> Result<Vec<u8>, crate::error::RdmaError> {
-        Err(crate::error::RdmaError::OperationNotSupported(
-            "prepare_get_token: not supported by this provider".into(),
-        ))
-    }
+    /// Default buffer size in bytes.  Matches [`RdmaServerProvider::buf_size`].
+    fn buf_size(&self) -> usize { 0 }
 
-    /// Process the `x-amz-rdma-reply` numeric status returned by the S3 server.
-    ///
-    /// The default implementation fires `callback` immediately based on whether
-    /// `rdma_status` is a 2xx success or not.  Provider overrides (e.g. mock)
-    /// use this to copy SHM data into the buffer before calling back.
-    fn process_rdma_reply(
-        &self,
-        rdma_status: u16,
-        _request_token: &[u8],
-        _transferred: usize,
-        callback: RdmaCompletionCallback,
-    ) -> Result<(), crate::error::RdmaError> {
-        callback(RdmaCompletionResult {
-            error_code: rdma_status_to_error_code(rdma_status),
-            reply_token: vec![],
-        });
-        Ok(())
-    }
-
-    /// Human-readable name of this provider implementation (e.g. `"MockRdmaProvider"`).
-    ///
-    /// Default: `"unknown"`.  Providers should override this for logging and debugging.
+    /// Human-readable provider name.
     fn name(&self) -> &str { "unknown" }
 
     /// Transport protocol identifier (e.g. `"mock"`, `"cuobj"`).
-    ///
-    /// Default: `"unknown"`.
     fn protocol(&self) -> &str { "unknown" }
 
     // ── Telemetry ────────────────────────────────────────────────────────────
-    //
-    // Lifecycle: call `supports_telemetry()` → `setup_telemetry()` →
-    // optionally `set_telem_level()` → `shutdown_telemetry()` before drop.
-    // For the cuobj backend these methods forward to the C++ SDK's static
-    // `cuObjClient::setupTelemetry` / `cuObjServer::setupTelemetry`;
-    // the mock backend stores the config in-process.
 
     /// Returns `true` if this provider supports telemetry configuration.
     fn supports_telemetry(&self) -> bool { false }
 
     /// Configure the telemetry output destination and verbosity level.
-    ///
-    /// May be called multiple times to change the destination; the previous
-    /// configuration is replaced.
     fn setup_telemetry(
         &self,
         _config: &TelemetryConfig,
@@ -407,46 +434,43 @@ pub trait RdmaClientProvider: Send + Sync {
 /// - **Per-transfer resources** — the channel can hold a cuObj channel ID,
 ///   pre-allocated buffer, or other resources for the lifetime of the transfer.
 pub trait RdmaServerChannel: Send + Sync {
-    /// Perform an RDMA PUT: read from the client buffer into `buf`.
+    /// Zero-copy RDMA PUT: RDMA-read from the client buffer, then flush to
+    /// storage via `write_fn`.
     ///
     /// `offset` is the byte offset into the client's registered buffer.
-    fn handle_put(&self, buf: &mut [u8], offset: usize, size: usize) -> Result<usize, crate::error::RdmaError>;
-
-    /// Perform an RDMA GET: write `data` into the client's registered buffer.
+    /// `size` is the number of bytes to transfer.
     ///
-    /// `offset` is the byte offset into the client's registered buffer.
-    fn handle_get(&self, data: &[u8], offset: usize) -> Result<usize, crate::error::RdmaError>;
-
-    /// Zero-copy RDMA PUT.
+    /// The plugin calls `write_fn(write_fn_data, ptr, n)` to write `n` bytes
+    /// from its RDMA-registered buffer directly to the storage layer, avoiding
+    /// an intermediate copy into a caller-provided slice.
     ///
     /// # Safety
     /// `write_fn_data` must remain valid for the duration of the call.
-    unsafe fn handle_put_zc(
+    unsafe fn handle_put(
         &self,
-        _offset: usize,
-        _size: usize,
-        _write_fn: crate::ffi::RdmaIoWriteFn,
-        _write_fn_data: *mut std::ffi::c_void,
-    ) -> Result<usize, crate::error::RdmaError> {
-        Err(crate::error::RdmaError::OperationNotSupported(
-            "handle_put_zc: not supported by this provider".into(),
-        ))
-    }
+        offset: usize,
+        size: usize,
+        write_fn: crate::ffi::RdmaIoWriteFn,
+        write_fn_data: *mut std::ffi::c_void,
+    ) -> Result<usize, crate::error::RdmaError>;
 
-    /// Zero-copy RDMA GET.
+    /// Zero-copy RDMA GET: fill from storage via `read_fn`, then RDMA-write
+    /// to the client buffer.
+    ///
+    /// `offset` is the byte offset into the client's registered buffer.
+    ///
+    /// The plugin calls `read_fn(read_fn_data, ptr, capacity)` to fill its
+    /// RDMA-registered buffer directly from the storage layer, then
+    /// RDMA-writes that buffer to the client.
     ///
     /// # Safety
     /// `read_fn_data` must remain valid for the duration of the call.
-    unsafe fn handle_get_zc(
+    unsafe fn handle_get(
         &self,
-        _offset: usize,
-        _read_fn: crate::ffi::RdmaIoReadFn,
-        _read_fn_data: *mut std::ffi::c_void,
-    ) -> Result<usize, crate::error::RdmaError> {
-        Err(crate::error::RdmaError::OperationNotSupported(
-            "handle_get_zc: not supported by this provider".into(),
-        ))
-    }
+        offset: usize,
+        read_fn: crate::ffi::RdmaIoReadFn,
+        read_fn_data: *mut std::ffi::c_void,
+    ) -> Result<usize, crate::error::RdmaError>;
 
     /// The S3 object key this channel is bound to.
     fn key(&self) -> &[u8];

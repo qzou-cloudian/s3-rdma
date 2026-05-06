@@ -16,7 +16,7 @@
 //!
 //! | Side   | Provider method | Returns | Channel methods |
 //! |--------|----------------|---------|-----------------|
-//! | Client | `bind(ptr, size, key)` | `RdmaClientChannel` | `prepare_put_token`, `prepare_get_token`, `process_rdma_reply` |
+//! | Client | `bind(ptr, size, key)` | `RdmaClientChannel` | `prepare_put`, `prepare_get`, `complete_put`, `complete_get` |
 //! | Server | `open_channel(key, token)` | `RdmaServerChannel` | `handle_put`, `handle_get` (+ ZC variants) |
 //!
 //! The channel owns the binding (key, token, buffer registration) so callers
@@ -42,12 +42,12 @@
 //!   Client                                    Server
 //!   ──────                                    ──────
 //!   ch = provider.bind(ptr, size, key)
-//!   token = ch.prepare_put_token(offset, size)
-//!     │  PUT /bucket/key  +  x-amz-rdma-token: <token>
-//!     │                          ↓             ch = provider.open_channel(key, token)
+//!   put = ch.prepare_put(offset, size)
+//!     │  PUT /bucket/key  +  x-amz-rdma-token: <put.token()>
+//!     │                          ↓             ch = provider.open_channel(key, put.token())
 //!     │                          ↓             n = ch.handle_put(buf, offset, size)
 //!     │  ← x-amz-rdma-reply: <reply>
-//!   ch.process_rdma_reply(200, token, n, cb)
+//!   ch.complete_put(put, 200, n)?
 //!   drop(ch)  →  deregister memory
 //! ```
 //!
@@ -76,7 +76,7 @@ mod python;
 // ── Primary public API ────────────────────────────────────────────────────────
 
 pub use provider::{RdmaRole, RdmaProvider, RdmaProviderConfig};
-pub use provider::{RdmaServerChannel, RdmaClientChannel, RdmaClientProvider, RdmaServerProvider};
+pub use provider::{RdmaServerChannel, RdmaClientChannel, RdmaClientProvider, RdmaServerProvider, RdmaPutHandle, RdmaGetHandle};
 pub use provider::{TelemetryConfig, TelemLevel, TelemState};
 pub use provider::{DEFAULT_RDMA_BUF_SIZE, RDMA_REQUIRED_ALIGNMENT};
 pub use mock::MockRdmaProvider;
@@ -246,7 +246,7 @@ pub fn create_worker_pool(
     cfg: &RdmaServerConfig,
     workers: usize,
 ) -> Result<Box<dyn RdmaServerProvider>, RdmaError> {
-    let inner: Arc<dyn RdmaServerProvider> = match provider {
+    let inner: Arc<dyn RdmaProvider> = match provider {
         "mock" => {
             if debug { info!("[rdma] MockRdmaProvider in pool ({workers} workers)"); }
             Arc::new(MockRdmaProvider::new(debug, &cfg.shm_path, cfg.buf_size))
@@ -256,7 +256,7 @@ pub fn create_worker_pool(
             {
                 let plugin = RdmaPlugin::new_server(cfg)?;
                 if debug { info!("[rdma] RdmaPlugin in pool ({workers} workers)"); }
-                Arc::new(plugin) as Arc<dyn RdmaServerProvider>
+                Arc::new(plugin) as Arc<dyn RdmaProvider>
             }
             #[cfg(not(feature = "rdma-server"))]
             {
@@ -278,5 +278,8 @@ pub fn create_worker_pool(
             reason: "unknown provider (valid: mock, cuobj, auto)".to_owned(),
         }),
     };
-    Ok(Box::new(worker_pool::RdmaWorkerPool::new(inner, workers)))
+    Ok(Box::new(worker_pool::RdmaWorkerPool::builder()
+        .server_workers(workers)
+        .provider(inner)
+        .build()?))
 }

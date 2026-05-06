@@ -21,6 +21,7 @@
 
 #[cfg(feature = "rdma-server")]
 fn run_server() {
+    use std::ffi::c_void;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use s3_rdma::provider::{RdmaServerConfig, RdmaServerProvider};
@@ -50,10 +51,18 @@ fn run_server() {
     line.clear();
     println!("[server] PUT token received");
 
-    let mut put_buf = vec![0u8; 4096];
+    let mut put_buf: Vec<u8> = Vec::with_capacity(4096);
     {
         let ch = plugin.open_channel(key, &put_token).expect("open PUT");
-        let n = ch.handle_put(&mut put_buf, 0, 4096).expect("handle_put");
+        unsafe extern "C" fn put_write(user_data: *mut c_void, buf: *const c_void, n: usize) -> isize {
+            let out = &mut *(user_data as *mut Vec<u8>);
+            let src = std::slice::from_raw_parts(buf as *const u8, n);
+            out.extend_from_slice(src);
+            n as isize
+        }
+        let n = unsafe {
+            ch.handle_put(0, 4096, put_write, &mut put_buf as *mut Vec<u8> as *mut c_void)
+        }.expect("handle_put");
         println!("[server] RDMA_READ {} bytes: {:?}", n, &put_buf[..4]);
     }
 
@@ -65,7 +74,17 @@ fn run_server() {
 
     {
         let ch = plugin.open_channel(key, &get_token).expect("open GET");
-        let n = ch.handle_get(b"pong", 0).expect("handle_get");
+        unsafe extern "C" fn get_read(user_data: *mut c_void, buf: *mut c_void, capacity: usize) -> isize {
+            let src = &*(user_data as *const &[u8]);
+            let dst = std::slice::from_raw_parts_mut(buf as *mut u8, capacity);
+            let n = src.len().min(capacity);
+            dst[..n].copy_from_slice(&src[..n]);
+            n as isize
+        }
+        let pong: &[u8] = b"pong";
+        let n = unsafe {
+            ch.handle_get(0, get_read, &pong as *const &[u8] as *mut c_void)
+        }.expect("handle_get");
         println!("[server] RDMA_WRITE {} bytes", n);
     }
 

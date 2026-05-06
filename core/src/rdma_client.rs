@@ -12,7 +12,7 @@
 //! 3. `/lib64/`, `/usr/lib64/` (common CUDA/cuObject install locations).
 
 #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
-use crate::provider::{TelemetryConfig, TelemLevel};
+use crate::provider::{TelemetryConfig, TelemLevel, DEFAULT_RDMA_BUF_SIZE};
 
 #[cfg(feature = "rdma-client")]
 mod real {
@@ -23,10 +23,7 @@ mod real {
 
     use crate::error::RdmaError;
     use crate::ffi::{ByteCursor, CTelemetryConfig, GetNamedClientVtableFn, RdmaProviderVtable};
-    use crate::provider::{
-        RdmaCompletionCallback, RdmaCompletionResult,
-        rdma_status_to_error_code, TelemetryConfig, TelemLevel,
-    };
+    use crate::provider::{RdmaClientChannel, TelemetryConfig, TelemLevel};
 
     // ── Library search ────────────────────────────────────────────────────────
 
@@ -143,203 +140,29 @@ mod real {
         pub fn name(&self)    -> &str { "RdmaPluginClient" }
         pub fn version(&self) -> u32  { unsafe { (*self.vtable).provider_version } }
 
-        pub fn is_memory_suitable(&self, ptr: *const u8, size: usize) -> bool {
-            if let Some(f) = self.vtable().is_memory_suitable {
-                unsafe { f(self.ctx, ptr as *const std::ffi::c_void, size) }
-            } else {
-                true
-            }
-        }
-
-        pub fn register_memory(&self, ptr: *mut u8, size: usize) -> Result<(), RdmaError> {
-            if let Some(f) = self.vtable().register_memory {
-                let rc = unsafe { f(self.ctx, ptr as *mut std::ffi::c_void, size) };
-                if rc != 0 {
-                    return Err(RdmaError::MemoryRegistrationFailed {
-                        ptr: ptr as usize, size,
-                        reason: format!("vtable register_memory returned {rc}"),
-                    });
-                }
-            }
-            Ok(())
-        }
-
-        pub fn deregister_memory(&self, ptr: *mut u8) -> Result<(), RdmaError> {
-            if let Some(f) = self.vtable().deregister_memory {
-                let rc = unsafe { f(self.ctx, ptr as *mut std::ffi::c_void) };
-                if rc != 0 {
-                    return Err(RdmaError::MemoryDeregistrationFailed {
-                        ptr: ptr as usize,
-                        reason: format!("vtable deregister_memory returned {rc}"),
-                    });
-                }
-            }
-            Ok(())
-        }
-
-        pub fn get_max_transfer_size(&self, ptr: *const u8) -> usize {
-            if let Some(f) = self.vtable().get_max_transfer_size {
-                unsafe { f(self.ctx, ptr as *const std::ffi::c_void) }
-            } else {
-                usize::MAX
-            }
-        }
-
-        pub fn prepare_put_token(
-            &self,
-            s3_key: &[u8],
-            buffer: *const u8,
-            size:   usize,
-            offset: usize,
-        ) -> Result<Vec<u8>, RdmaError> {
-            let f = self.vtable().prepare_put_token.ok_or_else(|| {
-                RdmaError::TokenGenerationFailed {
-                    key: String::from_utf8_lossy(s3_key).into_owned(),
-                    reason: "prepare_put_token not implemented in rdma plugin".into(),
-                }
+        /// Allocate, register, and bind a buffer.  The plugin allocates memory
+        /// internally; access it via `ch.ptr()` / `ch.size()`.
+        pub fn bind(
+            &self, size: usize, key: &[u8],
+        ) -> Result<Box<dyn RdmaClientChannel>, RdmaError> {
+            let f = self.vtable().bind_channel.ok_or_else(|| {
+                RdmaError::OperationNotSupported(
+                    "bind_channel not implemented".into(),
+                )
             })?;
-            let key_cursor = ByteCursor::from_slice(s3_key);
-            let mut out = ByteCursor::null();
-            let rc = unsafe {
-                f(self.ctx, &key_cursor,
-                  buffer as *const std::ffi::c_void, size, offset,
-                  &mut out)
-            };
-            if rc != 0 {
-                return Err(RdmaError::TokenGenerationFailed {
-                    key: String::from_utf8_lossy(s3_key).into_owned(),
-                    reason: format!("prepare_put_token returned {rc}"),
+            let key_cursor = ByteCursor::from_slice(key);
+            let mut out: *mut std::ffi::c_void = std::ptr::null_mut();
+            let rc = unsafe { f(self.ctx, size, &key_cursor, &mut out) };
+            if rc != 0 || out.is_null() {
+                return Err(RdmaError::MemoryRegistrationFailed {
+                    ptr: 0, size,
+                    reason: format!("bind_channel returned {rc}"),
                 });
             }
-            let token = unsafe {
-                let slice = std::slice::from_raw_parts(out.ptr, out.len);
-                let v = slice.to_vec();
-                drop(Box::from_raw(
-                    std::ptr::slice_from_raw_parts_mut(out.ptr as *mut u8, out.len)
-                ));
-                v
-            };
-            Ok(token)
+            let boxed: Box<Box<dyn RdmaClientChannel>> =
+                unsafe { Box::from_raw(out as *mut Box<dyn RdmaClientChannel>) };
+            Ok(*boxed)
         }
-
-        pub fn prepare_get_token(
-            &self,
-            s3_key: &[u8],
-            buffer: *mut u8,
-            size:   usize,
-            offset: usize,
-        ) -> Result<Vec<u8>, RdmaError> {
-            let f = self.vtable().prepare_get_token.ok_or_else(|| {
-                RdmaError::TokenGenerationFailed {
-                    key: String::from_utf8_lossy(s3_key).into_owned(),
-                    reason: "prepare_get_token not implemented in rdma plugin".into(),
-                }
-            })?;
-            let key_cursor = ByteCursor::from_slice(s3_key);
-            let mut out = ByteCursor::null();
-            let rc = unsafe {
-                f(self.ctx, &key_cursor,
-                  buffer as *mut std::ffi::c_void, size, offset,
-                  &mut out)
-            };
-            if rc != 0 {
-                return Err(RdmaError::TokenGenerationFailed {
-                    key: String::from_utf8_lossy(s3_key).into_owned(),
-                    reason: format!("prepare_get_token returned {rc}"),
-                });
-            }
-            let token = unsafe {
-                let slice = std::slice::from_raw_parts(out.ptr, out.len);
-                let v = slice.to_vec();
-                drop(Box::from_raw(
-                    std::ptr::slice_from_raw_parts_mut(out.ptr as *mut u8, out.len)
-                ));
-                v
-            };
-            Ok(token)
-        }
-
-        /// Process the `x-amz-rdma-reply` status code returned by the S3 server.
-        ///
-        /// Always deregisters the MR via `process_reply_token(request_token)`
-        /// regardless of RDMA status, so the plugin's pending map entry is
-        /// cleaned up when the server replies.
-        pub fn process_rdma_reply(
-            &self,
-            rdma_status: u16,
-            request_token: &[u8],
-            _transferred: usize,
-            callback: RdmaCompletionCallback,
-        ) -> Result<(), RdmaError> {
-            // Always deregister the MR, whether the server reports success or error.
-            if let Some(f) = self.vtable().process_reply_token {
-                let cursor = ByteCursor::from_slice(request_token);
-                // Pass null user_data and no callback — we only need the cleanup.
-                let rc = unsafe { f(self.ctx, &cursor, std::ptr::null_mut(), None) };
-                if rc != 0 {
-                    error!("[RdmaPluginClient] process_reply_token returned {rc}");
-                }
-            }
-            callback(RdmaCompletionResult {
-                error_code: rdma_status_to_error_code(rdma_status),
-                reply_token: vec![],
-            });
-            Ok(())
-        }
-
-        // ── Telemetry ────────────────────────────────────────────────────────
-
-        pub fn supports_telemetry(&self) -> bool {
-            self.vtable().supports_telemetry.is_some()
-        }
-
-        pub fn setup_telemetry(&self, config: &TelemetryConfig) -> Result<(), RdmaError> {
-            let Some(f) = self.vtable().setup_telemetry else {
-                return Err(RdmaError::OperationNotSupported(
-                    "telemetry not supported by rdma plugin".into(),
-                ));
-            };
-            let log_file = config.log_file.as_ref()
-                .and_then(|s| std::ffi::CString::new(s.as_str()).ok());
-            let c_cfg = CTelemetryConfig {
-                use_otel: config.use_otel as i32,
-                log_file: log_file.as_ref().map(|cs| cs.as_ptr()).unwrap_or(std::ptr::null()),
-                level: config.level as u32,
-            };
-            let rc = unsafe { f(self.ctx, &c_cfg) };
-            if rc != 0 {
-                return Err(RdmaError::TelemetryError(format!("setup_telemetry returned {rc}")));
-            }
-            Ok(())
-        }
-
-        pub fn shutdown_telemetry(&self) -> Result<(), RdmaError> {
-            let Some(f) = self.vtable().shutdown_telemetry else {
-                return Err(RdmaError::OperationNotSupported(
-                    "telemetry not supported by rdma plugin".into(),
-                ));
-            };
-            let rc = unsafe { f(self.ctx) };
-            if rc != 0 {
-                return Err(RdmaError::TelemetryError(format!("shutdown_telemetry returned {rc}")));
-            }
-            Ok(())
-        }
-
-        pub fn set_telem_level(&self, level: TelemLevel) -> Result<(), RdmaError> {
-            let Some(f) = self.vtable().set_telem_level else {
-                return Err(RdmaError::OperationNotSupported(
-                    "telemetry not supported by rdma plugin".into(),
-                ));
-            };
-            let rc = unsafe { f(self.ctx, level as u32) };
-            if rc != 0 {
-                return Err(RdmaError::TelemetryError(format!("set_telem_level returned {rc}")));
-            }
-            Ok(())
-        }
-
-    }
 
     // ── Availability probe ────────────────────────────────────────────────────
 
@@ -353,6 +176,8 @@ mod real {
         find_library().is_some()
     }
 }
+
+} // mod real
 
 #[cfg(feature = "rdma-client")]
 pub use real::RdmaPluginClient;
@@ -459,85 +284,23 @@ impl RdmaPlugin {
 impl crate::provider::RdmaClientProvider for RdmaPlugin {
     fn name(&self) -> &str { "RdmaPlugin" }
     fn protocol(&self) -> &str { "cuobj" }
+    fn buf_size(&self) -> usize { self.buf_size }
 
-    fn is_memory_suitable(&self, ptr: *const u8, size: usize) -> bool {
+    fn bind(&self, size: usize, key: &[u8]) -> Result<Box<dyn crate::provider::RdmaClientChannel>, crate::RdmaError> {
         #[cfg(feature = "rdma-client")]
         if let Some(c) = &self.client {
-            return c.is_memory_suitable(ptr, size);
+            return c.bind(size, key);
         }
-        let _ = (ptr, size);
-        false
-    }
-
-    fn register_memory(&self, ptr: *mut u8, size: usize) -> Result<(), crate::RdmaError> {
-        #[cfg(feature = "rdma-client")]
-        if let Some(c) = &self.client {
-            return c.register_memory(ptr, size);
-        }
-        let _ = (ptr, size);
+        let _ = (size, key);
         Err(crate::RdmaError::OperationNotSupported("rdma client not loaded".into()))
     }
 
-    fn deregister_memory(&self, ptr: *mut u8) -> Result<(), crate::RdmaError> {
+    fn bind_registered(&self, key: &[u8]) -> Result<Box<dyn crate::provider::RdmaClientChannel>, crate::RdmaError> {
         #[cfg(feature = "rdma-client")]
         if let Some(c) = &self.client {
-            return c.deregister_memory(ptr);
+            return c.bind(DEFAULT_RDMA_BUF_SIZE, key);
         }
-        let _ = ptr;
-        Err(crate::RdmaError::OperationNotSupported("rdma client not loaded".into()))
-    }
-
-    fn get_max_transfer_size(&self, ptr: *const u8) -> usize {
-        #[cfg(feature = "rdma-client")]
-        if let Some(c) = &self.client {
-            return c.get_max_transfer_size(ptr);
-        }
-        let _ = ptr;
-        0
-    }
-
-    fn prepare_put_token(
-        &self,
-        s3_key: &[u8],
-        buffer: *const u8,
-        size:   usize,
-        offset: usize,
-    ) -> Result<Vec<u8>, crate::RdmaError> {
-        #[cfg(feature = "rdma-client")]
-        if let Some(c) = &self.client {
-            return c.prepare_put_token(s3_key, buffer, size, offset);
-        }
-        let _ = (s3_key, buffer, size, offset);
-        Err(crate::RdmaError::OperationNotSupported("rdma client not loaded".into()))
-    }
-
-    fn prepare_get_token(
-        &self,
-        s3_key: &[u8],
-        buffer: *mut u8,
-        size:   usize,
-        offset: usize,
-    ) -> Result<Vec<u8>, crate::RdmaError> {
-        #[cfg(feature = "rdma-client")]
-        if let Some(c) = &self.client {
-            return c.prepare_get_token(s3_key, buffer, size, offset);
-        }
-        let _ = (s3_key, buffer, size, offset);
-        Err(crate::RdmaError::OperationNotSupported("rdma client not loaded".into()))
-    }
-
-    fn process_rdma_reply(
-        &self,
-        rdma_status: u16,
-        request_token: &[u8],
-        transferred: usize,
-        callback: crate::provider::RdmaCompletionCallback,
-    ) -> Result<(), crate::RdmaError> {
-        #[cfg(feature = "rdma-client")]
-        if let Some(c) = &self.client {
-            return c.process_rdma_reply(rdma_status, request_token, transferred, callback);
-        }
-        let _ = (rdma_status, request_token, transferred, callback);
+        let _ = key;
         Err(crate::RdmaError::OperationNotSupported("rdma client not loaded".into()))
     }
 

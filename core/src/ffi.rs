@@ -101,44 +101,19 @@ pub struct RdmaProviderVtable {
     /// Destroy the provider.
     pub cleanup: Option<unsafe extern "C" fn(*mut c_void)>,
 
-    /// Returns `true` if `ptr[0..size]` is eligible for RDMA.
-    pub is_memory_suitable:    Option<unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> bool>,
-    /// Register a memory region for RDMA access.
-    pub register_memory:       Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> i32>,
-    /// Deregister a previously registered memory region.
-    pub deregister_memory:     Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32>,
-    /// Maximum single-transfer size (`usize::MAX` = no limit).
-    pub get_max_transfer_size: Option<unsafe extern "C" fn(*mut c_void, *const c_void) -> usize>,
-
-    /// Generate an RDMA token for a PUT (upload) operation.
+    /// Allocate, register, and bind a buffer to an S3 key.
     ///
-    /// On success (`return 0`), `*out` receives an owning `ByteCursor` whose
-    /// `ptr` was allocated by the plugin (`Box::into_raw` / `malloc`).  The
-    /// **caller must free** the pointer via the matching deallocator
-    /// (`Box::from_raw` on the Rust side).
+    /// The plugin allocates `size` bytes of RDMA-suitable memory, registers
+    /// it, and returns a double-boxed channel.  The returned `*mut c_void`
+    /// is a `Box<Box<dyn RdmaClientChannel>>` — the caller must unbox it
+    /// with `Box::from_raw` twice.
     ///
-    /// On error (`return != 0`), `*out` **must** be left as
-    /// `ByteCursor::null()` (the value the caller initialised it to).  The
-    /// caller skips deallocation for error returns.
-    pub prepare_put_token: Option<unsafe extern "C" fn(
-        *mut c_void, *const ByteCursor,
-        *const c_void, usize, usize,
-        *mut ByteCursor,
-    ) -> i32>,
-
-    /// Generate an RDMA token for a GET (download) operation.
-    ///
-    /// Ownership convention: same as [`prepare_put_token`](#structfield.prepare_put_token).
-    pub prepare_get_token: Option<unsafe extern "C" fn(
-        *mut c_void, *const ByteCursor,
-        *mut c_void, usize, usize,
-        *mut ByteCursor,
-    ) -> i32>,
-
-    /// Process the RDMA reply token returned by the S3 server.
-    pub process_reply_token: Option<unsafe extern "C" fn(
-        *mut c_void, *const ByteCursor,
-        *mut c_void, Option<RdmaCompletionFn>,
+    /// Returns null on error.
+    pub bind_channel: Option<unsafe extern "C" fn(
+        *mut c_void,            // ctx
+        usize,                  // size
+        *const ByteCursor,      // key
+        *mut *mut c_void,       // out_channel (Box<Box<dyn RdmaClientChannel>>)
     ) -> i32>,
 
     // ── Telemetry ────────────────────────────────────────────────────────────
@@ -147,16 +122,12 @@ pub struct RdmaProviderVtable {
     pub supports_telemetry: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
 
     /// Set up telemetry output for this provider.
-    /// `cfg` points to a [`CTelemetryConfig`]; valid for the duration of the call.
-    /// Returns 0 on success, non-zero on failure.
     pub setup_telemetry: Option<unsafe extern "C" fn(*mut c_void, *const CTelemetryConfig) -> i32>,
 
     /// Shut down telemetry (reset to default output stream).
-    /// Returns 0 on success, non-zero on failure.
     pub shutdown_telemetry: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
 
     /// Set telemetry log-path flags.
-    /// Returns 0 on success, non-zero on failure.
     pub set_telem_level: Option<unsafe extern "C" fn(*mut c_void, level: u32) -> i32>,
 }
 
@@ -215,6 +186,19 @@ pub struct RdmaServerInitParams {
     pub buf_size:    usize,
 }
 
+/// Callback for the HTTP round-trip in [`RdmaClientChannel::put`]/[`get`].
+///
+/// Receives the serialised token bytes and opaque `user_data`.  Must write
+/// the server's `(rdma_status, transferred_bytes)` to `out_status` /
+/// `out_transferred`.  Called synchronously between prepare and complete.
+pub type RdmaSendFn = unsafe extern "C" fn(
+    token:           *const u8,
+    token_len:       usize,
+    user_data:       *mut std::ffi::c_void,
+    out_status:      *mut u16,
+    out_transferred: *mut usize,
+);
+
 // SAFETY: only used during init() on the calling thread; `Sync` is not needed.
 unsafe impl Send for RdmaServerInitParams {}
 
@@ -248,53 +232,16 @@ pub struct RdmaServerVtable {
     /// On success copies the received bytes into the caller-provided buffer `buf`
     /// and writes the byte count into `*out_transferred`.
     ///
-    /// The plugin guarantees `*out_transferred <= plugin_pool_slot_size`.  The
-    /// caller must ensure `buf` is at least `plugin_pool_slot_size` bytes (i.e.
-    /// both pools are configured to the same `rdma_buffer_size`).
-    /// Returns 0 on success, non-zero on failure.
-    pub handle_put: Option<unsafe extern "C" fn(
-        ctx:             *mut c_void,
-        s3_key:          *const ByteCursor,
-        token:           *const ByteCursor,
-        buf:             *mut u8,
-        offset:          usize,
-        size:            usize,
-        out_transferred: *mut usize,
-    ) -> i32>,
-
-    /// Handle an RDMA GET: the server RDMA_WRITEs `data` into the client
-    /// buffer identified by `token`, starting at byte `offset` within that
-    /// buffer.
+    /// Handle an RDMA PUT.
     ///
-    /// `offset=0` writes from the start of the client buffer (original
-    /// single-shot behaviour).  When streaming, callers advance `offset` by
-    /// the `written` count returned from the previous call.
-    ///
-    /// On success writes the number of bytes transferred into `*out_written`.
-    /// Returns 0 on success, non-zero on failure.
-    pub handle_get: Option<unsafe extern "C" fn(
-        ctx:         *mut c_void,
-        s3_key:      *const ByteCursor,
-        data:        *const ByteCursor,
-        token:       *const ByteCursor,
-        offset:      usize,
-        out_written: *mut usize,
-    ) -> i32>,
-
-    // ── Zero-copy variants ────────────────────────────────────────────────────
-
-    /// Handle a zero-copy RDMA PUT.
-    ///
-    /// Same RDMA semantics as `handle_put`, but instead of copying the received
-    /// bytes into a caller-provided buffer, the plugin calls
-    /// `write_fn(write_fn_data, rdma_buf_ptr, transferred)` directly from its
-    /// internal RDMA-registered buffer.  The callback performs the I/O (e.g.,
-    /// `pwrite(fd, ...)`) without an intermediate copy.
+    /// The plugin RDMA-reads from the client buffer, then calls
+    /// `write_fn(write_fn_data, rdma_buf_ptr, transferred)` to flush the data
+    /// directly from its internal RDMA-registered buffer to the storage layer.
+    /// No intermediate copy into a caller-provided slice.
     ///
     /// `write_fn` must be thread-safe.  The plugin may call it from a worker
-    /// thread other than the one that invoked `handle_put_zc`.  Returns 0 on
-    /// success, non-zero on failure.
-    pub handle_put_zc: Option<unsafe extern "C" fn(
+    /// thread.  Returns 0 on success, non-zero on failure.
+    pub handle_put: Option<unsafe extern "C" fn(
         ctx:             *mut c_void,
         s3_key:          *const ByteCursor,
         token:           *const ByteCursor,
@@ -305,15 +252,14 @@ pub struct RdmaServerVtable {
         out_transferred: *mut usize,
     ) -> i32>,
 
-    /// Handle a zero-copy RDMA GET.
+    /// Handle an RDMA GET.
     ///
-    /// Instead of the caller copying data into the plugin's pool slot, the plugin
-    /// calls `read_fn(read_fn_data, rdma_buf_ptr, capacity)` to fill its
-    /// RDMA-registered buffer directly (e.g., `pread(fd, ...)`), then
-    /// RDMA_WRITEs that buffer to the client.
+    /// The plugin calls `read_fn(read_fn_data, rdma_buf_ptr, capacity)` to fill
+    /// its RDMA-registered buffer directly from the storage layer, then
+    /// RDMA_WRITEs that buffer to the client.  No intermediate copy.
     ///
     /// `read_fn` must be thread-safe.  Returns 0 on success, non-zero on failure.
-    pub handle_get_zc: Option<unsafe extern "C" fn(
+    pub handle_get: Option<unsafe extern "C" fn(
         ctx:          *mut c_void,
         s3_key:       *const ByteCursor,
         token:        *const ByteCursor,

@@ -261,27 +261,31 @@ impl PyRdmaProvider {
         let buf_cap = if size > 0 {
             size
         } else {
-            // buf_size() returns usize::MAX for the mock when unconfigured;
-            // cap to avoid allocating a giant buffer by default.
             raw_cap.clamp(4096, DEFAULT_RDMA_BUF_SIZE)
         };
-        let mut buf = vec![0u8; buf_cap];
+        let mut buf: Vec<u8> = Vec::with_capacity(buf_cap);
+
+        unsafe extern "C" fn write_cb(
+            user_data: *mut std::ffi::c_void, ptr: *const std::ffi::c_void, n: usize,
+        ) -> isize {
+            let out = &mut *(user_data as *mut Vec<u8>);
+            let src = std::slice::from_raw_parts(ptr as *const u8, n);
+            out.extend_from_slice(src);
+            n as isize
+        }
+
         let ch = self.inner.open_channel(s3_key, token)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let n = ch.handle_put(&mut buf, offset, size)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let n = unsafe {
+            ch.handle_put(offset, size, write_cb,
+                          &mut buf as *mut Vec<u8> as *mut std::ffi::c_void)
+        }.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         buf.truncate(n);
         Ok(PyBytes::new_bound(py, &buf))
     }
 
     /// Handle an RDMA GET from a client: writes ``data`` into the client's
     /// registered buffer and returns the number of bytes written.
-    ///
-    /// :param s3_key: the S3 object key.
-    /// :param data:   the object payload to send to the client.
-    /// :param token:  the RDMA descriptor token from ``x-amz-rdma-token``.
-    /// :param offset: byte offset into the client buffer (default 0).
-    /// :returns: number of bytes written to the client buffer.
     #[pyo3(signature = (s3_key, data, token, offset = 0))]
     fn handle_get(
         &self,
@@ -290,9 +294,20 @@ impl PyRdmaProvider {
         token:  &[u8],
         offset: usize,
     ) -> PyResult<usize> {
+        unsafe extern "C" fn read_cb(
+            user_data: *mut std::ffi::c_void, buf: *mut std::ffi::c_void, capacity: usize,
+        ) -> isize {
+            let src = &*(user_data as *const &[u8]);
+            let dst = std::slice::from_raw_parts_mut(buf as *mut u8, capacity);
+            let n = src.len().min(capacity);
+            dst[..n].copy_from_slice(&src[..n]);
+            n as isize
+        }
+
+        let data_ref: &[u8] = data;
         self.inner.open_channel(s3_key, token)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-            .handle_get(data, offset)
+            .handle_get(offset, read_cb, &data_ref as *const &[u8] as *mut std::ffi::c_void)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 

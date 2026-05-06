@@ -13,7 +13,7 @@ use s3_rdma::error::RdmaError;
 use s3_rdma::provider::DEFAULT_RDMA_BUF_SIZE;
 use s3_rdma::provider::RdmaServerChannel;
 
-static PROVIDER_NAME: &[u8] = b"s3-rdma-server\0";
+static PROVIDER_NAME: &[u8] = b"s3-rdma-server-cuobj\0";
 
 struct ServerProvider {
     server:   Arc<CuObjServer>,
@@ -92,26 +92,37 @@ impl RdmaServerChannel for SyncChannel {
     fn token(&self) -> &[u8] { &self.token }
     fn buf_size(&self) -> usize { self.buf_size }
 
-    fn handle_put(&self, buf: &mut [u8], offset: usize, size: usize) -> Result<usize, RdmaError> {
+    unsafe fn handle_put(
+        &self, offset: usize, size: usize,
+        write_fn: s3_rdma::ffi::RdmaIoWriteFn, write_fn_data: *mut std::ffi::c_void,
+    ) -> Result<usize, RdmaError> {
         let guard = self.get_buffer()?;
         let b = guard.as_ref().unwrap();
         let ks = std::str::from_utf8(&self.key).unwrap_or("");
         let ts = std::str::from_utf8(&self.token).unwrap_or("");
         let n = b.handle_put(ks, offset, size, ts, Some(self.channel_id))
             .map_err(|e| RdmaError::TransferFailed(format!("{e:?}")))?;
-        let cl = n.min(buf.len());
-        unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), buf.as_mut_ptr(), cl); }
-        Ok(cl)
+        let wr = write_fn(write_fn_data, b.as_ptr() as *const std::ffi::c_void, n);
+        if wr < 0 {
+            return Err(RdmaError::TransferFailed(format!("write_fn returned {wr}")));
+        }
+        Ok(wr as usize)
     }
 
-    fn handle_get(&self, data: &[u8], offset: usize) -> Result<usize, RdmaError> {
+    unsafe fn handle_get(
+        &self, offset: usize,
+        read_fn: s3_rdma::ffi::RdmaIoReadFn, read_fn_data: *mut std::ffi::c_void,
+    ) -> Result<usize, RdmaError> {
         let guard = self.get_buffer()?;
         let b = guard.as_ref().unwrap();
         let ks = std::str::from_utf8(&self.key).unwrap_or("");
         let ts = std::str::from_utf8(&self.token).unwrap_or("");
-        let cl = data.len().min(b.len());
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), b.as_ptr() as *mut u8, cl); }
-        b.handle_get(ks, offset, cl, ts, Some(self.channel_id))
+        let n = read_fn(read_fn_data, b.as_ptr() as *mut std::ffi::c_void, b.len());
+        if n < 0 {
+            return Err(RdmaError::TransferFailed(format!("read_fn returned {n}")));
+        }
+        let n = n as usize;
+        b.handle_get(ks, offset, n, ts, Some(self.channel_id))
             .map_err(|e| RdmaError::TransferFailed(format!("{e:?}")))
     }
 }
@@ -122,34 +133,6 @@ impl Drop for SyncChannel { fn drop(&mut self) { self.server.free_channel_by_id(
 
 unsafe extern "C" fn c_handle_put(
     _ctx: *mut c_void, s3_key: *const ByteCursor, token: *const ByteCursor,
-    buf: *mut u8, offset: usize, size: usize, out_transferred: *mut usize,
-) -> i32 {
-    if s3_key.is_null() || token.is_null() || buf.is_null() || out_transferred.is_null() { return -1; }
-    let Some(p) = get_provider() else { return -1 };
-    let k = unsafe { (*s3_key).as_slice() }; let t = unsafe { (*token).as_slice() };
-    let mut buf_slice = unsafe { std::slice::from_raw_parts_mut(buf, p.buf_size) };
-    match open_channel_sync(p, k, t).and_then(|ch| ch.handle_put(&mut buf_slice, offset, size)) {
-        Ok(n) => { unsafe { *out_transferred = n; } 0 }
-        Err(e) => { error!("[s3-rdma-server] handle_put: {e}"); -1 }
-    }
-}
-
-unsafe extern "C" fn c_handle_get(
-    _ctx: *mut c_void, s3_key: *const ByteCursor, data: *const ByteCursor,
-    token: *const ByteCursor, offset: usize, out_written: *mut usize,
-) -> i32 {
-    if s3_key.is_null() || data.is_null() || token.is_null() || out_written.is_null() { return -1; }
-    let Some(p) = get_provider() else { return -1 };
-    let k = unsafe { (*s3_key).as_slice() }; let d = unsafe { (*data).as_slice() };
-    let t = unsafe { (*token).as_slice() };
-    match open_channel_sync(p, k, t).and_then(|ch| ch.handle_get(d, offset)) {
-        Ok(n) => { unsafe { *out_written = n; } 0 }
-        Err(e) => { error!("[s3-rdma-server] handle_get: {e}"); -1 }
-    }
-}
-
-unsafe extern "C" fn c_handle_put_zc(
-    _ctx: *mut c_void, s3_key: *const ByteCursor, token: *const ByteCursor,
     offset: usize, size: usize, write_fn: s3_rdma::ffi::RdmaIoWriteFn,
     write_fn_data: *mut c_void, out_transferred: *mut usize,
 ) -> i32 {
@@ -157,14 +140,14 @@ unsafe extern "C" fn c_handle_put_zc(
     let Some(p) = get_provider() else { return -1 };
     let k = unsafe { (*s3_key).as_slice() }; let t = unsafe { (*token).as_slice() };
     match open_channel_sync(p, k, t)
-        .and_then(|ch| unsafe { ch.handle_put_zc(offset, size, write_fn, write_fn_data) })
+        .and_then(|ch| unsafe { ch.handle_put(offset, size, write_fn, write_fn_data) })
     {
         Ok(n) => { unsafe { *out_transferred = n; } 0 }
-        Err(e) => { error!("[s3-rdma-server] handle_put_zc: {e}"); -1 }
+        Err(e) => { error!("[s3-rdma-server] handle_put: {e}"); -1 }
     }
 }
 
-unsafe extern "C" fn c_handle_get_zc(
+unsafe extern "C" fn c_handle_get(
     _ctx: *mut c_void, s3_key: *const ByteCursor, token: *const ByteCursor,
     offset: usize, read_fn: s3_rdma::ffi::RdmaIoReadFn, read_fn_data: *mut c_void,
     out_written: *mut usize,
@@ -173,10 +156,10 @@ unsafe extern "C" fn c_handle_get_zc(
     let Some(p) = get_provider() else { return -1 };
     let k = unsafe { (*s3_key).as_slice() }; let t = unsafe { (*token).as_slice() };
     match open_channel_sync(p, k, t)
-        .and_then(|ch| unsafe { ch.handle_get_zc(offset, read_fn, read_fn_data) })
+        .and_then(|ch| unsafe { ch.handle_get(offset, read_fn, read_fn_data) })
     {
         Ok(n) => { unsafe { *out_written = n; } 0 }
-        Err(e) => { error!("[s3-rdma-server] handle_get_zc: {e}"); -1 }
+        Err(e) => { error!("[s3-rdma-server] handle_get: {e}"); -1 }
     }
 }
 
@@ -224,10 +207,8 @@ static VTABLE: RdmaServerVtable = RdmaServerVtable {
     provider_version:    6,
     init:                Some(c_init),
     cleanup:             Some(c_cleanup),
-    handle_put:          Some(c_handle_put),
-    handle_get:          Some(c_handle_get),
-    handle_put_zc:       Some(c_handle_put_zc),
-    handle_get_zc:       Some(c_handle_get_zc),
+    handle_put:  Some(c_handle_put),
+    handle_get:  Some(c_handle_get),
     supports_telemetry:  Some(c_supports_telemetry),
     setup_telemetry:     Some(c_setup_telemetry),
     shutdown_telemetry:  Some(c_shutdown_telemetry),
