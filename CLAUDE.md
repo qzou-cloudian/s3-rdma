@@ -5,12 +5,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & test commands
 
 ```sh
-# Build everything (core + providers + Java JNI)
+# Build root crate only (default)
+cargo build
+
+# Build everything (root + providers + Java JNI)
 cargo build --workspace
 
 # Build with specific feature flags
-cargo build -p s3-rdma --features rdma-client,rdma-server
-cargo build -p s3-rdma --features buffer-pool,engine
+cargo build --features rdma-client,rdma-server
+cargo build --features buffer-pool,engine
 
 # Client plugin (mock backend only, no CUDA SDK needed)
 cargo build -p s3-rdma-client
@@ -30,7 +33,7 @@ cargo test -p s3-rdma
 cargo test -p s3-rdma -- token::tests::parse_mock_put
 
 # Run the Rust example
-cargo run --example mock_provider --manifest-path core/Cargo.toml
+cargo run --example mock_provider
 
 # Python: build extension (separate maturin project, NOT a workspace member)
 cd bindings/python && python3 -m maturin develop
@@ -40,7 +43,7 @@ cd bindings/python && /home/qingshan/.venv/bin/python -m pytest tests/ -v
 cd bindings/python && python3 examples/example.py
 
 # Java: build JNI library + Java classes
-cargo build --manifest-path bindings/java/Cargo.toml
+cargo build -p s3-rdma-jni
 mvn compile -f bindings/java/pom.xml
 ```
 
@@ -52,18 +55,19 @@ the mock provider exercises the full API path over POSIX shared memory.
 ### Workspace layout
 
 ```
-s3-rdma/                          # workspace root (Cargo.toml)
-├── core/                         # s3-rdma crate — traits, mock provider, plugin loader
-├── providers/client/             # cdylib → libs3rdmaclient.so
-├── providers/server/             # cdylib → libs3rdmaserver.so
-└── bindings/java/                # cdylib → libs3rdmajni.so + Maven project
+s3-rdma/                          # workspace root + s3-rdma crate (Cargo.toml)
+├── src/                          # s3-rdma crate — traits, mock provider, plugin loader
+├── examples/
+├── providers/client/             # cdylib → libs3rdmaclient.so  (not in default-members)
+├── providers/server/             # cdylib → libs3rdmaserver.so  (not in default-members)
+└── bindings/java/                # cdylib → libs3rdmajni.so + Maven project  (not in default-members)
 ```
 
 `bindings/python/` is a **separate maturin project** (not a workspace member).  Its Rust source
-is `core/src/python.rs`, compiled with `--features pyo3`.  Build it with
+is `src/python.rs`, compiled with `--features pyo3`.  Build it with
 `cd bindings/python && maturin develop`, not `cargo build`.
 
-### Trait hierarchy (`core/src/provider.rs`)
+### Trait hierarchy (`src/provider.rs`)
 
 ```
 RdmaProvider: RdmaClientProvider + RdmaServerProvider

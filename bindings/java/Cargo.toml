@@ -16,5 +16,5 @@ rdma-client = ["s3-rdma/rdma-client"]
 rdma-server = ["s3-rdma/rdma-server"]
 
 [dependencies]
-s3-rdma = { path = "../../core" }
+s3-rdma = { path = "../.." }
 jni     = { version = "0.21" }
