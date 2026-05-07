@@ -6,39 +6,34 @@ use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{Receiver, SyncSender};
 
 use crate::error::RdmaError;
-use crate::ffi::{RdmaIoReadFn, RdmaIoWriteFn};
-use crate::provider::{RdmaClientChannel, RdmaClientProvider, RdmaPutHandle, RdmaGetHandle};
-use crate::provider::{RdmaServerChannel, RdmaServerProvider, RdmaProvider};
+use crate::provider::{RdmaClientProvider, RdmaServerChannel, RdmaServerProvider, RdmaProvider};
 
 // ── Client work items ───────────────────────────────────────────────────────
 
-type ClientPutResult = Result<(RdmaPutHandle, Box<dyn RdmaClientChannel>), String>;
-type ClientGetResult = Result<(RdmaGetHandle, Box<dyn RdmaClientChannel>), String>;
-
-pub(crate) enum ClientWorkItem {
-    /// Bind a buffer, fill it via write_fn, prepare PUT token.
-    /// Returns the token + the channel for later completion.
+pub enum ClientOp {
+    /// Bind, write, prepare, send, complete — full PUT via `ch.put()`.
     Put {
-        key:           Vec<u8>,
-        size:          usize,
-        offset:        usize,
-        write_fn:      usize,       // RdmaIoWriteFn cast to usize for Send
-        write_fn_data: usize,
-        result_tx:     SyncSender<ClientPutResult>,
+        key:       Vec<u8>,
+        size:      usize,
+        offset:    usize,
+        write:     usize,  // Box<Box<dyn FnOnce(&mut [u8]) -> usize + Send>> as *mut _ as usize
+        send:      usize,  // Box<Box<dyn FnOnce(&[u8]) -> Result<(u16, usize), RdmaError> + Send>>
+        result_tx: SyncSender<Result<usize, String>>,
     },
-    /// Bind a buffer, prepare GET token.
-    /// Returns the token + the channel.
+    /// Bind, prepare, send, complete, read — full GET via `ch.get()`.
     Get {
-        key:           Vec<u8>,
-        size:          usize,
-        offset:        usize,
-        result_tx:     SyncSender<ClientGetResult>,
+        key:       Vec<u8>,
+        size:      usize,
+        offset:    usize,
+        send:      usize,  // Box<Box<dyn FnOnce(&[u8]) -> Result<(u16, usize), RdmaError> + Send>>
+        read:      usize,  // Box<Box<dyn FnOnce(&[u8]) + Send>>
+        result_tx: SyncSender<Result<usize, String>>,
     },
 }
 
 // ── Server work items ──────────────────────────────────────────────────────
 
-enum ServerWorkItem {
+enum ServerOp {
     Put {
         key:       Vec<u8>,
         token:     Vec<u8>,
@@ -61,7 +56,7 @@ enum ServerWorkItem {
 
 fn client_worker_main(
     provider: Arc<dyn RdmaProvider>,
-    rx:       Arc<Mutex<Receiver<ClientWorkItem>>>,
+    rx:       Arc<Mutex<Receiver<ClientOp>>>,
 ) {
     loop {
         let work = match rx.lock().unwrap().recv() {
@@ -69,25 +64,21 @@ fn client_worker_main(
             Err(_) => break,
         };
         match work {
-            ClientWorkItem::Put { key, size, offset, write_fn, write_fn_data, result_tx } => {
+            ClientOp::Put { key, size, offset, write, send, result_tx } => {
+                let write = *unsafe { Box::from_raw(write as *mut Box<dyn FnOnce(&mut [u8]) -> usize + Send>) };
+                let send  = *unsafe { Box::from_raw(send  as *mut Box<dyn FnOnce(&[u8]) -> Result<(u16, usize), RdmaError> + Send>) };
                 let r = (|| {
                     let ch = RdmaClientProvider::bind(provider.as_ref(), size, &key)?;
-                    let write_fn: RdmaIoWriteFn = unsafe { std::mem::transmute(write_fn) };
-                    let write_fn_data = write_fn_data as *mut std::ffi::c_void;
-                    let wr = unsafe { write_fn(write_fn_data, ch.ptr() as *const std::ffi::c_void, size) };
-                    if wr < 0 {
-                        return Err(RdmaError::TransferFailed(format!("write_fn returned {wr}")));
-                    }
-                    let handle = ch.prepare_put(offset, size)?;
-                    Ok((handle, ch))
+                    ch.put(offset, size, write, send)
                 })().map_err(|e: RdmaError| e.to_string());
                 let _ = result_tx.send(r);
             }
-            ClientWorkItem::Get { key, size, offset, result_tx } => {
+            ClientOp::Get { key, size, offset, send, read, result_tx } => {
+                let send = *unsafe { Box::from_raw(send as *mut Box<dyn FnOnce(&[u8]) -> Result<(u16, usize), RdmaError> + Send>) };
+                let read = *unsafe { Box::from_raw(read as *mut Box<dyn FnOnce(&[u8]) + Send>) };
                 let r = (|| {
                     let ch = RdmaClientProvider::bind(provider.as_ref(), size, &key)?;
-                    let handle = ch.prepare_get(offset, size)?;
-                    Ok((handle, ch))
+                    ch.get(offset, size, send, read)
                 })().map_err(|e: RdmaError| e.to_string());
                 let _ = result_tx.send(r);
             }
@@ -99,7 +90,7 @@ fn client_worker_main(
 
 fn server_worker_main(
     provider: Arc<dyn RdmaProvider>,
-    rx:       Arc<Mutex<Receiver<ServerWorkItem>>>,
+    rx:       Arc<Mutex<Receiver<ServerOp>>>,
 ) {
     loop {
         let work = match rx.lock().unwrap().recv() {
@@ -107,7 +98,7 @@ fn server_worker_main(
             Err(_) => break,
         };
         match work {
-            ServerWorkItem::Put { key, token, offset, size, write, result_tx } => {
+            ServerOp::Put { key, token, offset, size, write, result_tx } => {
                 let write = *unsafe { Box::from_raw(write as *mut Box<dyn FnOnce(&[u8]) -> Result<usize, RdmaError> + Send>) };
                 let r = (|| -> Result<usize, RdmaError> {
                     let ch = RdmaServerProvider::open_channel(provider.as_ref(), &key, &token)?;
@@ -115,7 +106,7 @@ fn server_worker_main(
                 })().map_err(|e| e.to_string());
                 let _ = result_tx.send(r);
             }
-            ServerWorkItem::Get { key, token, offset, size, read, result_tx } => {
+            ServerOp::Get { key, token, offset, size, read, result_tx } => {
                 let read = *unsafe { Box::from_raw(read as *mut Box<dyn FnOnce(&mut [u8]) -> usize + Send>) };
                 let r = (|| -> Result<usize, RdmaError> {
                     let ch = RdmaServerProvider::open_channel(provider.as_ref(), &key, &token)?;
@@ -131,8 +122,8 @@ fn server_worker_main(
 
 /// Bounded-concurrency pool with separate client and server thread pools.
 pub struct RdmaWorkerPool {
-    pub(crate) client_sender: Option<std::sync::mpsc::Sender<ClientWorkItem>>,
-    server_sender:    Option<std::sync::mpsc::Sender<ServerWorkItem>>,
+    pub client_sender: Option<std::sync::mpsc::Sender<ClientOp>>,
+    server_sender:    Option<std::sync::mpsc::Sender<ServerOp>>,
     _provider:        Arc<dyn RdmaProvider>,
     client_workers:   Vec<std::thread::JoinHandle<()>>,
     server_workers:   Vec<std::thread::JoinHandle<()>>,
@@ -180,7 +171,7 @@ impl RdmaServerProvider for RdmaWorkerPool {
 struct PoolServerChannel {
     key:    Vec<u8>,
     token:  Vec<u8>,
-    sender: std::sync::mpsc::Sender<ServerWorkItem>,
+    sender: std::sync::mpsc::Sender<ServerOp>,
 }
 
 impl RdmaServerChannel for PoolServerChannel {
@@ -193,7 +184,7 @@ impl RdmaServerChannel for PoolServerChannel {
         write: Box<dyn FnOnce(&[u8]) -> Result<usize, RdmaError> + Send + '_>,
     ) -> Result<usize, RdmaError> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.sender.send(ServerWorkItem::Put {
+        self.sender.send(ServerOp::Put {
             key: self.key.clone(), token: self.token.clone(),
             offset, size,
             write: Box::into_raw(Box::new(write)) as usize,
@@ -208,7 +199,7 @@ impl RdmaServerChannel for PoolServerChannel {
         read: Box<dyn FnOnce(&mut [u8]) -> usize + Send + '_>,
     ) -> Result<usize, RdmaError> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.sender.send(ServerWorkItem::Get {
+        self.sender.send(ServerOp::Get {
             key: self.key.clone(), token: self.token.clone(),
             offset, size,
             read: Box::into_raw(Box::new(read)) as usize,
@@ -247,7 +238,7 @@ impl RdmaWorkerPoolBuilder {
             .ok_or_else(|| RdmaError::OperationNotSupported("provider required".into()))?;
 
         // Client workers
-        let (client_tx, client_rx) = std::sync::mpsc::channel::<ClientWorkItem>();
+        let (client_tx, client_rx) = std::sync::mpsc::channel::<ClientOp>();
         let client_rx = Arc::new(Mutex::new(client_rx));
         let client_workers: Vec<_> = (0..self.client_workers.max(1))
             .map(|i| {
@@ -261,7 +252,7 @@ impl RdmaWorkerPoolBuilder {
             .collect();
 
         // Server workers
-        let (server_tx, server_rx) = std::sync::mpsc::channel::<ServerWorkItem>();
+        let (server_tx, server_rx) = std::sync::mpsc::channel::<ServerOp>();
         let server_rx = Arc::new(Mutex::new(server_rx));
         let server_workers: Vec<_> = (0..self.server_workers.max(1))
             .map(|i| {
@@ -305,71 +296,62 @@ mod tests {
         let size = 4096;
         let sender = pool.client_sender.as_ref().unwrap().clone();
 
-        // Client PUT through pool.
+        // Client PUT through pool — write + send via `ch.put()`
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let payload = b"ping".to_vec();
-        unsafe extern "C" fn put_write(user_data: *mut std::ffi::c_void, buf: *const std::ffi::c_void, n: usize) -> isize {
-            let src_data = &*(user_data as *const Vec<u8>);
-            let dst = std::slice::from_raw_parts_mut(buf as *mut u8, n);
-            let len = src_data.len().min(n);
-            dst[..len].copy_from_slice(&src_data[..len]);
-            len as isize
-        }
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        sender.send(ClientWorkItem::Put {
+        let write: Box<dyn FnOnce(&mut [u8]) -> usize + Send> =
+            Box::new(move |buf: &mut [u8]| {
+                buf[..4].copy_from_slice(&payload);
+                4
+            });
+        let send: Box<dyn FnOnce(&[u8]) -> Result<(u16, usize), RdmaError> + Send> =
+            Box::new(|token: &[u8]| {
+                let srv = MockRdmaProvider::new(false, "/dev/shm", 4096);
+                let srv_ch = srv.open_channel(key, token).unwrap();
+                let mut out: Vec<u8> = Vec::with_capacity(size);
+                let n = srv_ch.handle_put(0, size, Box::new(|data: &[u8]| {
+                    out.extend_from_slice(data);
+                    Ok(data.len())
+                })).unwrap();
+                assert_eq!(&out[..4], b"ping");
+                Ok((200, n))
+            });
+        sender.send(ClientOp::Put {
             key: key.to_vec(), size, offset: 0,
-            write_fn: put_write as usize,
-            write_fn_data: &payload as *const Vec<u8> as usize,
+            write: Box::into_raw(Box::new(write)) as usize,
+            send: Box::into_raw(Box::new(send)) as usize,
             result_tx: tx,
         }).unwrap();
-        let (put_handle, client_ch) = rx.recv().unwrap().unwrap();
+        let n = rx.recv().unwrap().unwrap();
+        assert_eq!(n, 4096);
 
-        // Server PUT through pool.
-        let mut put_buf: Vec<u8> = Vec::with_capacity(size);
-        unsafe extern "C" fn srv_put_write(user_data: *mut std::ffi::c_void, buf: *const std::ffi::c_void, n: usize) -> isize {
-            let out = &mut *(user_data as *mut Vec<u8>);
-            let src = std::slice::from_raw_parts(buf as *const u8, n);
-            out.extend_from_slice(src);
-            n as isize
-        }
-        {
-            let srv_ch = pool.open_channel(key, put_handle.token()).unwrap();
-            let n = unsafe { srv_ch.handle_put(0, size, srv_put_write, &mut put_buf as *mut Vec<u8> as *mut std::ffi::c_void) }.unwrap();
-            assert_eq!(n, 4096);
-            assert_eq!(&put_buf[..4], b"ping");
-        }
-
-        // Complete PUT.
-        client_ch.complete_put(put_handle, 200, 4096).unwrap();
-        drop(client_ch);
-
-        // Client GET through pool.
+        // Client GET through pool — send + read via `ch.get()`
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        sender.send(ClientWorkItem::Get {
+        let result = Arc::new(Mutex::new(Vec::new()));
+        let r2 = Arc::clone(&result);
+        let send: Box<dyn FnOnce(&[u8]) -> Result<(u16, usize), RdmaError> + Send> =
+            Box::new(|token: &[u8]| {
+                let srv = MockRdmaProvider::new(false, "/dev/shm", 4096);
+                let srv_ch = srv.open_channel(key, token).unwrap();
+                let payload: Vec<u8> = b"hello pool".to_vec();
+                let n = srv_ch.handle_get(0, 0, Box::new(|buf: &mut [u8]| {
+                    let n = payload.len().min(buf.len());
+                    buf[..n].copy_from_slice(&payload[..n]);
+                    n
+                })).unwrap();
+                Ok((200, n))
+            });
+        let read: Box<dyn FnOnce(&[u8]) + Send> =
+            Box::new(move |data: &[u8]| r2.lock().unwrap().extend_from_slice(data));
+        sender.send(ClientOp::Get {
             key: key.to_vec(), size, offset: 0,
+            send: Box::into_raw(Box::new(send)) as usize,
+            read: Box::into_raw(Box::new(read)) as usize,
             result_tx: tx,
         }).unwrap();
-        let (get_handle, client_ch) = rx.recv().unwrap().unwrap();
-
-        // Server GET through pool.
-        let get_data = b"hello pool".to_vec();
-        unsafe extern "C" fn srv_get_read(user_data: *mut std::ffi::c_void, buf: *mut std::ffi::c_void, capacity: usize) -> isize {
-            let src = &*(user_data as *const Vec<u8>);
-            let dst = std::slice::from_raw_parts_mut(buf as *mut u8, capacity);
-            let n = src.len().min(capacity);
-            dst[..n].copy_from_slice(&src[..n]);
-            n as isize
-        }
-        {
-            let srv_ch = pool.open_channel(key, get_handle.token()).unwrap();
-            let n = unsafe { srv_ch.handle_get(0, srv_get_read, &get_data as *const Vec<u8> as *mut std::ffi::c_void) }.unwrap();
-            assert_eq!(n, 10);
-        }
-
-        // Complete GET — data lands in the channel buffer.
-        client_ch.complete_get(get_handle, 200, 10).unwrap();
-        let data = unsafe { std::slice::from_raw_parts(client_ch.ptr() as *const u8, 10) };
-        assert_eq!(data, b"hello pool");
-        drop(client_ch);
+        let n = rx.recv().unwrap().unwrap();
+        assert_eq!(n, 10);
+        assert_eq!(&*result.lock().unwrap(), b"hello pool");
     }
 
     #[test]

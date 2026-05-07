@@ -18,34 +18,6 @@
 //! `Arc<dyn RdmaProvider>` is used when both roles are needed (e.g. same-node
 //! mock testing, Python/Java/C-ABI bindings).
 
-/// Convert the `x-amz-rdma-reply` numeric status to a callback `error_code`.
-///
-/// - `0`         → `-1` (absent header — treated as error)
-/// - `200..300`  → `0`  (RDMA success)
-/// - other       → status cast to `i32` (e.g. `501` for RDMA fallback)
-pub(crate) fn rdma_status_to_error_code(rdma_status: u16) -> i32 {
-    if rdma_status != 0 && (200..300).contains(&rdma_status) {
-        0
-    } else if rdma_status == 0 {
-        -1
-    } else {
-        rdma_status as i32
-    }
-}
-
-/// Result delivered when an RDMA operation completes.
-#[derive(Debug)]
-pub struct RdmaCompletionResult {
-    /// 0 on success; non-zero error code on failure.
-    pub error_code: i32,
-    /// Reply token echoed back from the server (may be empty).
-    /// Used by JNI and C-ABI bindings; otherwise typically empty.
-    pub reply_token: Vec<u8>,
-}
-
-/// Callback invoked when an async RDMA operation finishes.
-pub type RdmaCompletionCallback = Box<dyn FnOnce(RdmaCompletionResult) + Send + 'static>;
-
 // ── Default header names ─────────────────────────────────────────────────────
 
 pub const RDMA_TOKEN_HEADER: &str = "x-amz-rdma-token";

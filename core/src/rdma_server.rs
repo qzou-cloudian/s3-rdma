@@ -151,13 +151,6 @@ mod real {
             Ok(*boxed)
         }
 
-        fn _old_open_channel_stub() {}
-
-        /// Zero-copy RDMA PUT: delegates to the plugin's `handle_put` entry.
-        ///
-        /// The plugin RDMA_READs from the client buffer into its internal
-        /// RDMA-registered slot, then invokes `write_fn(write_fn_data, ptr, n)`
-        /// to flush the data to storage without an intermediate copy.
         ///
         /// # Safety
         /// `write_fn_data` must remain valid for the duration of the call.

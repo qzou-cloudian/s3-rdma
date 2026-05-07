@@ -42,37 +42,21 @@ use crate::provider::{RdmaServerChannel, RdmaClientChannel, RdmaPutHandle, RdmaG
 const SHM_DIR: &str = "/dev/shm";
 
 struct ShmEntry {
-    /// Basename, e.g. `rdma-12345-7fab12340000`.
-    name: String,
-    /// Full path `/dev/shm/rdma-…`.
-    path: String,
-    /// `mmap`-ed pointer into the shared-memory region.
+    name:    String,
+    path:    String,
     shm_ptr: *mut libc::c_void,
-    /// Original client buffer pointer (destination for GET copies).
-    buf_ptr: *mut u8,
-    size: usize,
+    size:    usize,
 }
 
 // SAFETY: raw pointers are only accessed under the `registered` Mutex.
 unsafe impl Send for ShmEntry {}
 unsafe impl Sync for ShmEntry {}
 
-impl ShmEntry {
-    /// Unmap and delete the shared-memory file.
-    ///
-    /// # Safety
-    /// Must be called at most once per entry.
-    unsafe fn cleanup(&self) {
-        libc::munmap(self.shm_ptr, self.size);
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// MockChannel
+// MockServerChannel
 // ─────────────────────────────────────────────────────────────────────────────
 
-struct MockChannel {
+struct MockServerChannel {
     key:       Vec<u8>,
     token:     Vec<u8>,
     shm_dir:   String,
@@ -84,16 +68,16 @@ struct MockChannel {
     debug:     bool,
 }
 
-unsafe impl Send for MockChannel {}
-unsafe impl Sync for MockChannel {}
+unsafe impl Send for MockServerChannel {}
+unsafe impl Sync for MockServerChannel {}
 
-impl MockChannel {
+impl MockServerChannel {
     fn dbg(&self, msg: &str) {
-        if self.debug { tracing::debug!("[MockChannel] {msg}"); }
+        if self.debug { tracing::debug!("[MockServerChannel] {msg}"); }
     }
 }
 
-impl RdmaServerChannel for MockChannel {
+impl RdmaServerChannel for MockServerChannel {
     fn key(&self)   -> &[u8] { &self.key }
     fn token(&self) -> &[u8] { &self.token }
     fn buf_size(&self) -> usize { self.buf_size }
@@ -344,7 +328,7 @@ impl MockRdmaProvider {
         }
         self.registered.lock().unwrap().insert(
             ptr as usize,
-            ShmEntry { name, path, shm_ptr, buf_ptr: ptr, size },
+            ShmEntry { name, path, shm_ptr, size },
         );
         Ok(())
     }
@@ -448,7 +432,7 @@ impl RdmaServerProvider for MockRdmaProvider {
     fn open_channel(&self, key: &[u8], token: &[u8]) -> Result<Box<dyn RdmaServerChannel>, RdmaError> {
         let (op, shm_name, token_size, token_offset) = Self::parse_token(token)?;
         self.dbg(&format!("open_channel key={} shm={shm_name}", String::from_utf8_lossy(key)));
-        Ok(Box::new(MockChannel {
+        Ok(Box::new(MockServerChannel {
             key:       key.to_vec(),
             token:     token.to_vec(),
             shm_dir:   self.shm_dir.clone(),
@@ -484,7 +468,6 @@ impl RdmaProvider for MockRdmaProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{RdmaClientProvider, RdmaServerProvider};
 
     #[test]
     fn put_then_get_roundtrip() {
@@ -500,6 +483,7 @@ mod tests {
             }),
             Box::new(|token: &[u8]| {
                 let srv = server.open_channel(b"key", token).unwrap();
+                let mut out: Vec<u8> = Vec::with_capacity(4096);
                 let mut out: Vec<u8> = Vec::with_capacity(4096);
                 let n = srv.handle_put(0, 4096, Box::new(|data: &[u8]| {
                     out.extend_from_slice(data);
@@ -541,6 +525,7 @@ mod tests {
             Box::new(|token: &[u8]| {
                 let srv = server.open_channel(b"key", token).unwrap();
                 let mut out: Vec<u8> = Vec::with_capacity(4096);
+                let mut out: Vec<u8> = Vec::with_capacity(4096);
                 let n = srv.handle_put(0, 4096, Box::new(|data: &[u8]| {
                     out.extend_from_slice(data);
                     Ok(data.len())
@@ -565,6 +550,7 @@ mod tests {
             }),
             Box::new(|token: &[u8]| {
                 let srv = server.open_channel(b"key", token).unwrap();
+                let mut out: Vec<u8> = Vec::with_capacity(4096);
                 let mut out: Vec<u8> = Vec::with_capacity(4096);
                 let n = srv.handle_put(0, 4096, Box::new(|data: &[u8]| {
                     out.extend_from_slice(data);

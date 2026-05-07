@@ -12,7 +12,7 @@ use jni::JNIEnv;
 
 use s3_rdma::TelemLevel;
 use s3_rdma::provider::{RdmaRole, RdmaProvider, RdmaClientProvider};
-use s3_rdma::provider::{RdmaCompletionCallback, RdmaCompletionResult, RdmaServerConfig, DEFAULT_RDMA_BUF_SIZE};
+use s3_rdma::provider::{RdmaServerConfig, DEFAULT_RDMA_BUF_SIZE};
 use s3_rdma::provider::TelemetryConfig;
 
 fn throw(env: &mut JNIEnv<'_>, msg: &str) {
