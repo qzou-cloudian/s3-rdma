@@ -12,13 +12,13 @@ cargo build --workspace
 cargo build -p s3-rdma --features rdma-client,rdma-server
 cargo build -p s3-rdma --features buffer-pool,engine
 
-# Client plugin (mock backend)
-cargo build -p s3-rdma-client --features mock
+# Client plugin (mock backend only, no CUDA SDK needed)
+cargo build -p s3-rdma-client
 # Client plugin with cuObj hardware backend
 cargo build -p s3-rdma-client --features cuobj
 
-# Server plugin (mock backend)
-cargo build -p s3-rdma-server --features mock
+# Server plugin
+cargo build -p s3-rdma-server
 # Server plugin with cuObj hardware backend
 cargo build -p s3-rdma-server --features cuobj
 
@@ -32,82 +32,166 @@ cargo test -p s3-rdma -- token::tests::parse_mock_put
 # Run the Rust example
 cargo run --example mock_provider --manifest-path core/Cargo.toml
 
-# Python: build extension (requires venv with maturin)
+# Python: build extension (separate maturin project, NOT a workspace member)
 cd bindings/python && python3 -m maturin develop
+# Python: run tests (requires venv with pytest)
+cd bindings/python && /home/qingshan/.venv/bin/python -m pytest tests/ -v
 # Python: run example
 cd bindings/python && python3 examples/example.py
 
-# Java: build JNI library + classes
+# Java: build JNI library + Java classes
 cargo build --manifest-path bindings/java/Cargo.toml
 mvn compile -f bindings/java/pom.xml
 ```
 
 ## Architecture
 
-This is a GPU-Direct RDMA provider for S3 object storage with multi-language SDK (Rust, Python, Java). No NVIDIA hardware is needed for development — the mock provider exercises the full API path.
+GPU-Direct RDMA provider for S3 object storage.  No NVIDIA hardware needed for development —
+the mock provider exercises the full API path over POSIX shared memory.
 
-### Workspace layout (`Cargo.toml`)
+### Workspace layout
 
 ```
-s3-rdma/                          # workspace root
+s3-rdma/                          # workspace root (Cargo.toml)
 ├── core/                         # s3-rdma crate — traits, mock provider, plugin loader
 ├── providers/client/             # cdylib → libs3rdmaclient.so
 ├── providers/server/             # cdylib → libs3rdmaserver.so
 └── bindings/java/                # cdylib → libs3rdmajni.so + Maven project
 ```
 
-`bindings/python/` is a separate maturin project (not a workspace member) that depends on `core` with the `pyo3` feature.
+`bindings/python/` is a **separate maturin project** (not a workspace member).  Its Rust source
+is `core/src/python.rs`, compiled with `--features pyo3`.  Build it with
+`cd bindings/python && maturin develop`, not `cargo build`.
 
-### Trait hierarchy (core/src/provider.rs)
+### Trait hierarchy (`core/src/provider.rs`)
 
 ```
 RdmaProvider: RdmaClientProvider + RdmaServerProvider
-  ├── RdmaClientProvider  — register memory, generate PUT/GET tokens, process replies
-  └── RdmaServerProvider  — handle_put, handle_get, and zero-copy (_zc) variants
+  │
+  ├── RdmaClientProvider       — bind(size, key) → Box<dyn RdmaClientChannel>
+  │   └── RdmaClientChannel    — prepare_put / prepare_get / complete_put / complete_get / put / get
+  │
+  └── RdmaServerProvider       — open_channel(key, token) → Box<dyn RdmaServerChannel>
+      └── RdmaServerChannel    — handle_put / handle_get (closure-based)
 ```
 
-Consumer code should use the narrowest trait: `Arc<dyn RdmaClientProvider>` for client nodes, `Arc<dyn RdmaServerProvider>` for server/gateway nodes, `Arc<dyn RdmaProvider>` only when both roles are needed. All trait methods have default implementations returning `OperationNotSupported` — implementors only override what they support.
+Use the **narrowest** trait:
+- `Arc<dyn RdmaClientProvider>` — client nodes (bind memory, generate tokens)
+- `Arc<dyn RdmaServerProvider>` — gateway/server nodes (handle PUT/GET)
+- `Arc<dyn RdmaProvider>` — both roles (bindings, testing, mock)
+
+All trait methods have default implementations returning `OperationNotSupported`.
+
+### Channel-based API (the current API)
+
+**Client side:**
+```rust
+let ch = provider.bind(size, key)?;          // allocate + register buffer
+let put = ch.prepare_put(offset, size)?;     // token at put.token()
+// ... send PUT request with x-amz-rdma-token header ...
+ch.complete_put(put, rdma_status, n)?;       // confirm; drops deregisters buffer
+```
+
+Convenience combinators on `RdmaClientChannel`:
+- `ch.put(offset, size, write_fn, send_fn)` — fill buffer, prepare, send, complete in one call
+- `ch.get(offset, size, send_fn, read_fn)` — prepare, send, complete, read data
+
+**Server side:**
+```rust
+let srv = provider.open_channel(key, token)?;
+let n = srv.handle_put(offset, size, Box::new(|data: &[u8]| {
+    // store data; return Ok(bytes_written)
+    Ok(data.len())
+}))?;
+```
 
 ### Concrete providers
 
 | Provider | Location | Description |
 |----------|----------|-------------|
-| `MockRdmaProvider` | `core/src/mock.rs` | POSIX shared-memory (`/dev/shm`), both client+server roles |
-| `RdmaPlugin` | `core/src/rdma_client.rs` + `core/src/rdma_server.rs` | Runtime `.so` loader, supports client/server/both |
-| `RdmaEngine` (feature `engine`) | `core/src/engine.rs` | Fixed-size worker pool wrapping any `RdmaProvider`; dispatches server ops to N threads |
+| `MockRdmaProvider` | `core/src/mock.rs` | `/dev/shm` SHM files; both client+server roles; no hardware |
+| `RdmaPlugin` | `core/src/rdma_client.rs` + `core/src/rdma_server.rs` | Runtime `.so` loader via `libloading` |
+| `RdmaWorkerPool` | `core/src/worker_pool.rs` | Bounded-concurrency server pool wrapping any provider |
 
 ### Plugin / vtable system
 
-The `rdma-client` and `rdma-server` features enable runtime loading of `.so` plugins via `libloading`. Providers are built as `cdylib` crates that export C-ABI vtables:
+The `rdma-client` and `rdma-server` features enable runtime loading of `.so` plugins:
 
-- **`providers/client/`** → `libs3rdmaclient.so` exports `s3_rdma_get_client_vtable(name)` → returns `*const RdmaProviderVtable`
-- **`providers/server/`** → `libs3rdmaserver.so` exports `s3_rdma_get_server_vtable(name)` → returns `*const RdmaServerVtable`
+- **`providers/client/`** → `libs3rdmaclient.so` exports `s3_rdma_get_client_vtable(name)`
+- **`providers/server/`** → `libs3rdmaserver.so` exports `s3_rdma_get_server_vtable(name)`
 
-Each plugin accepts a backend name string (`"mock"` or `"cuobj"`) and routes to the corresponding implementation. The `"mock"` backend in `providers/client/src/mock.rs` delegates to `MockRdmaProvider`; the `"cuobj"` backend in `providers/client/src/rdma.rs` uses the `cuobj` crate for real NVIDIA hardware.
+Each plugin takes a backend name (`"mock"` or `"cuobj"`).  Plugin search order:
+`LD_LIBRARY_PATH` → executable dir → `/lib64/` → `/usr/lib64/`.
+The main binary has **no compile-time dependency** on any RDMA SDK.
 
-Plugin search order: `LD_LIBRARY_PATH` → executable dir → `/lib64/` → `/usr/lib64/`. This means the main binary has **no compile-time dependency** on any RDMA SDK.
-
-### Feature flags (core/Cargo.toml)
+### Feature flags (`core/Cargo.toml`)
 
 | Feature | Deps | Effect |
 |---------|------|--------|
 | `rdma-client` | `libloading` | `RdmaPluginClient`, `rdma_available()`, unified `RdmaPlugin` |
 | `rdma-server` | `libloading` | `RdmaPluginServer`, unified `RdmaPlugin` |
 | `buffer-pool` | `crossbeam-queue`, `tokio` | `BufferPool` / `OwnedBufferGuard` |
-| `engine` | (none) | `RdmaEngine` worker pool |
 | `pyo3` | `pyo3` | Python bindings (`core/src/python.rs`) |
+| (none) | — | Only `MockRdmaProvider` available |
 
-### Provider factory functions (core/src/lib.rs)
+### Provider factory functions (`core/src/lib.rs`)
 
-`create_provider(name, debug, role, cfg)` returns `Arc<dyn RdmaProvider>`. Name can be `"mock"`, `"cuobj"`, or `"auto"` (tries cuobj first, falls back to mock). There are also `create_client_provider` and `create_server_provider` convenience wrappers.
+| Function | Returns | Notes |
+|----------|---------|-------|
+| `create_provider(name, debug, role, cfg)` | `Arc<dyn RdmaProvider>` | name: `"mock"`, `"cuobj"`, `"auto"` |
+| `create_client_provider(name, debug, cfg)` | `Arc<dyn RdmaClientProvider>` | wrapper with `RdmaRole::Client` |
+| `create_server_provider(name, debug, cfg)` | `Arc<dyn RdmaServerProvider>` | wrapper with `RdmaRole::Server` |
+| `create_worker_pool(name, debug, cfg, workers)` | `Box<dyn RdmaServerProvider>` | bounded concurrency server |
+
+`"auto"` tries `"cuobj"` first, falls back to `"mock"`.
 
 ### Key supporting types
 
-- **`RdmaToken`** (`core/src/token.rs`): Wraps raw token bytes with parsed metadata (provider, size, offset). Handles mock (`RDMA_PUT_shm_size_offset_key_k`) and cuObj (`vaddr:size:rkey:...`) formats, plus an extended cuObj format with trailing `:decimal_size:decimal_offset`. The `raw()` method always returns only the base descriptor suitable for the cuObj C SDK.
-- **`RdmaError`** (`core/src/error.rs`): Error enum with `is_fallback_eligible()` — returns true for errors where falling back to plain HTTP is safe (memory not suitable, token gen failed, plugin unavailable, buffer too small, provider unavailable).
-- **`ByteCursor`** (`core/src/ffi.rs`): C-ABI-compatible `{ptr, len}` struct for crossing plugin boundaries.
-- **`BufferPool`** (feature `buffer-pool`, `core/src/pool.rs`): Thread-safe pool of 4 KiB-aligned pre-registered buffers with `try_acquire_owned`, `acquire_owned` (async), and `acquire_owned_blocking`.
+- **`RdmaToken`** (`core/src/token.rs`): Wraps raw token bytes with parsed metadata (provider,
+  size, offset).  Handles mock (`RDMA_{PUT|GET}_name_size_offset_key_k`) and cuObj
+  (`vaddr:size:rkey:…`) formats.  `raw()` returns only the base descriptor for the cuObj SDK.
+- **`RdmaError`** (`core/src/error.rs`): Error enum.  `is_fallback_eligible()` returns `true`
+  for errors where downgrading to plain HTTP is safe (plugin unavailable, buffer too small, etc.).
+- **`ByteCursor`** (`core/src/ffi.rs`): C-ABI `{ptr, len}` struct for crossing plugin boundaries.
+- **`BufferPool`** (feature `buffer-pool`, `core/src/pool.rs`): Thread-safe pool of 4 KiB-aligned
+  pre-registered buffers.  Methods: `try_acquire_owned`, `acquire_owned` (async),
+  `acquire_owned_blocking`.
+- **`RdmaServerConfig`** (`core/src/provider.rs`): Unified config for server providers.
+  Fields: `shm_path` (mock), `listen_addr`/`listen_port`/`buf_size` (cuObj).
 
-### HTTP protocol constants (core/src/provider.rs)
+### HTTP protocol constants (`core/src/provider.rs`)
 
-`RDMA_TOKEN_HEADER` (`x-amz-rdma-token`), `RDMA_REPLY_HEADER` (`x-amz-rdma-reply`), `RDMA_BYTES_HEADER` (`x-amz-rdma-bytes`), `RDMA_STREAM_HEADER` (`x-amz-rdma-stream`), `RDMA_TOKEN_SEPARATOR` (`|`). Providers can override header names via the trait methods.
+```
+RDMA_TOKEN_HEADER  = "x-amz-rdma-token"
+RDMA_REPLY_HEADER  = "x-amz-rdma-reply"
+RDMA_BYTES_HEADER  = "x-amz-rdma-bytes"
+RDMA_STREAM_HEADER = "x-amz-rdma-stream"
+RDMA_TOKEN_SEPARATOR = '|'
+```
+
+### Language bindings
+
+**Python (`core/src/python.rs`, built via `bindings/python/`):**
+- `PyRdmaProvider` holds `Arc<dyn RdmaProvider>` + `Mutex<HashMap<Vec<u8>, PendingTransfer>>`
+- `prepare_put_token` / `prepare_get_token` call `bind()` and store the channel in the pending map
+- `process_rdma_reply` looks up the pending transfer, calls `complete_put/get`, invokes callback
+- `register_memory` / `deregister_memory` are no-ops (kept for backward compatibility)
+- `handle_put` / `handle_get` call `open_channel` + closure-based transfer
+
+**Java (`bindings/java/src/lib.rs`):**
+- `ProviderState` holds `Arc<dyn RdmaProvider>` + `Mutex<HashMap<Vec<u8>, PendingTransfer>>`
+- Same pattern as Python: `nativePreparePutToken` → bind + store; `nativeProcessRdmaReply` → complete
+- `nativeRegisterMemory` / `nativeDeregisterMemory` are no-ops
+- `nativeHandlePut` / `nativeHandleGet` call `open_channel` + collect/supply data via closures
+- Supertrait ambiguity: when calling methods on `Arc<dyn RdmaProvider>` that exist on both
+  `RdmaClientProvider` and `RdmaServerProvider`, use UFCS:
+  `RdmaServerProvider::buf_size(&*state.provider)`
+
+### Mock token format
+
+```
+RDMA_{PUT|GET}_{shm_name}_{size}_{offset}[_key_{s3_key}]
+```
+
+- `shm_name` — filename only, no `/dev/shm/` prefix; **must not contain underscores**
+- Parsed with `splitn(7, '_')`; hyphens in names are fine
