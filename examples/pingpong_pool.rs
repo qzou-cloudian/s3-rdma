@@ -1,6 +1,6 @@
 //! Multi-threaded ping-pong with RdmaWorkerPool.
 //!
-//!   cargo run --example pingpong_pool --manifest-path core/Cargo.toml
+//!   cargo run --example pingpong_pool --features pool
 
 use std::sync::{Arc, Mutex};
 

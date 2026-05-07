@@ -56,7 +56,7 @@
 //! |-----------------|---------------------------------------------------------------------|
 //! | `rdma-client` | Enable [`RdmaPluginClient`] / [`RdmaPlugin`] client role   |
 //! | `rdma-server` | Enable [`RdmaPluginServer`] / [`RdmaPlugin`] server role   |
-//! | `buffer-pool`   | Enable [`BufferPool`] for pre-registered RDMA buffers               |
+//! | `pool`          | Enable [`BufferPool`] and [`RdmaWorkerPool`]                        |
 //! | (none)          | Only [`MockRdmaProvider`] available                                 |
 
 pub(crate) mod rdma_client;
@@ -64,10 +64,11 @@ pub(crate) mod rdma_server;
 pub mod error;
 pub mod ffi;
 pub mod mock;
-#[cfg(feature = "buffer-pool")]
-pub mod pool;
+#[cfg(feature = "pool")]
+pub mod buffer_pool;
 pub mod provider;
 pub mod token;
+#[cfg(feature = "pool")]
 pub mod worker_pool;
 #[cfg(feature = "pyo3")]
 mod python;
@@ -87,10 +88,11 @@ pub use rdma_client::RdmaPlugin;
 pub use provider::RdmaServerConfig;
 pub use token::RdmaToken;
 
+#[cfg(feature = "pool")]
 pub use worker_pool::RdmaWorkerPool;
 
-#[cfg(feature = "buffer-pool")]
-pub use pool::{BufferPool, BufferPoolBuilder, BufferPoolError, BufferRegistrar, OwnedBufferGuard};
+#[cfg(feature = "pool")]
+pub use buffer_pool::{BufferPool, BufferPoolBuilder, BufferPoolError, BufferRegistrar, OwnedBufferGuard};
 
 
 #[cfg(feature = "rdma-client")]
@@ -234,11 +236,12 @@ pub fn create_server_provider(
 /// RDMA transfers to `workers`.
 ///
 /// `provider` must be one of:
-/// - `"mock"`   → pool around [`MockRdmaProvider`] (requires `engine` feature)
-/// - `"cuobj"`  → pool around [`RdmaPlugin`] (requires `rdma-server` feature)
+/// - `"mock"`   → pool around [`MockRdmaProvider`] (requires `pool` feature)
+/// - `"cuobj"`  → pool around [`RdmaPlugin`] (requires `pool` + `rdma-server` features)
 /// - `"auto"`  → tries `"cuobj"` first, falls back to `"mock"`
 ///
 /// Returned as `Box<dyn RdmaServerProvider>` — use the trait for all operations.
+#[cfg(feature = "pool")]
 pub fn create_worker_pool(
     provider: &str,
     debug: bool,

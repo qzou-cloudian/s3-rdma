@@ -25,7 +25,7 @@
 //!
 //! ```no_run
 //! # use std::sync::Arc;
-//! # use s3_rdma::pool::BufferPool;
+//! # use s3_rdma::buffer_pool::BufferPool;
 //! // Plain-bytes pool (no RDMA provider):
 //! let pool = Arc::new(BufferPool::builder().count(8).size(4 * 1024 * 1024).build().unwrap());
 //! let guard = pool.try_acquire_owned().unwrap();

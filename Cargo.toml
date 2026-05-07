@@ -22,8 +22,9 @@ rdma-server = ["dep:libloading"]
 # Python bindings via PyO3 (build with maturin from the python/ directory)
 pyo3     = ["dep:pyo3", "pyo3/extension-module"]
 # Generic pre-registered RDMA buffer pool (works with any RdmaProvider:
-# bytes/mock/cuobj).  Adds crossbeam-queue and tokio::sync deps.
-buffer-pool = ["dep:crossbeam-queue", "dep:tokio"]
+# bytes/mock/cuobj).  Also gates worker_pool.  Adds crossbeam-queue and
+# tokio::sync deps.
+pool = ["dep:crossbeam-queue", "dep:tokio"]
 
 [dependencies]
 tracing       = "0.1"

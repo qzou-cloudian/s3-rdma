@@ -13,7 +13,7 @@ cargo build --workspace
 
 # Build with specific feature flags
 cargo build --features rdma-client,rdma-server
-cargo build --features buffer-pool,engine
+cargo build --features pool
 
 # Client plugin (mock backend only, no CUDA SDK needed)
 cargo build -p s3-rdma-client
@@ -113,9 +113,9 @@ let n = srv.handle_put(offset, size, Box::new(|data: &[u8]| {
 
 | Provider | Location | Description |
 |----------|----------|-------------|
-| `MockRdmaProvider` | `core/src/mock.rs` | `/dev/shm` SHM files; both client+server roles; no hardware |
-| `RdmaPlugin` | `core/src/rdma_client.rs` + `core/src/rdma_server.rs` | Runtime `.so` loader via `libloading` |
-| `RdmaWorkerPool` | `core/src/worker_pool.rs` | Bounded-concurrency server pool wrapping any provider |
+| `MockRdmaProvider` | `src/mock.rs` | `/dev/shm` SHM files; both client+server roles; no hardware |
+| `RdmaPlugin` | `src/rdma_client.rs` + `src/rdma_server.rs` | Runtime `.so` loader via `libloading` |
+| `RdmaWorkerPool` | `src/worker_pool.rs` | Bounded-concurrency server pool wrapping any provider (feature `pool`) |
 
 ### Plugin / vtable system
 
@@ -128,39 +128,39 @@ Each plugin takes a backend name (`"mock"` or `"cuobj"`).  Plugin search order:
 `LD_LIBRARY_PATH` → executable dir → `/lib64/` → `/usr/lib64/`.
 The main binary has **no compile-time dependency** on any RDMA SDK.
 
-### Feature flags (`core/Cargo.toml`)
+### Feature flags (`Cargo.toml`)
 
 | Feature | Deps | Effect |
 |---------|------|--------|
 | `rdma-client` | `libloading` | `RdmaPluginClient`, `rdma_available()`, unified `RdmaPlugin` |
 | `rdma-server` | `libloading` | `RdmaPluginServer`, unified `RdmaPlugin` |
-| `buffer-pool` | `crossbeam-queue`, `tokio` | `BufferPool` / `OwnedBufferGuard` |
-| `pyo3` | `pyo3` | Python bindings (`core/src/python.rs`) |
+| `pool` | `crossbeam-queue`, `tokio` | `BufferPool` / `OwnedBufferGuard` + `RdmaWorkerPool` |
+| `pyo3` | `pyo3` | Python bindings (`src/python.rs`) |
 | (none) | — | Only `MockRdmaProvider` available |
 
-### Provider factory functions (`core/src/lib.rs`)
+### Provider factory functions (`src/lib.rs`)
 
 | Function | Returns | Notes |
 |----------|---------|-------|
 | `create_provider(name, debug, role, cfg)` | `Arc<dyn RdmaProvider>` | name: `"mock"`, `"cuobj"`, `"auto"` |
 | `create_client_provider(name, debug, cfg)` | `Arc<dyn RdmaClientProvider>` | wrapper with `RdmaRole::Client` |
 | `create_server_provider(name, debug, cfg)` | `Arc<dyn RdmaServerProvider>` | wrapper with `RdmaRole::Server` |
-| `create_worker_pool(name, debug, cfg, workers)` | `Box<dyn RdmaServerProvider>` | bounded concurrency server |
+| `create_worker_pool(name, debug, cfg, workers)` | `Box<dyn RdmaServerProvider>` | bounded concurrency server (feature `pool`) |
 
 `"auto"` tries `"cuobj"` first, falls back to `"mock"`.
 
 ### Key supporting types
 
-- **`RdmaToken`** (`core/src/token.rs`): Wraps raw token bytes with parsed metadata (provider,
+- **`RdmaToken`** (`src/token.rs`): Wraps raw token bytes with parsed metadata (provider,
   size, offset).  Handles mock (`RDMA_{PUT|GET}_name_size_offset_key_k`) and cuObj
   (`vaddr:size:rkey:…`) formats.  `raw()` returns only the base descriptor for the cuObj SDK.
-- **`RdmaError`** (`core/src/error.rs`): Error enum.  `is_fallback_eligible()` returns `true`
+- **`RdmaError`** (`src/error.rs`): Error enum.  `is_fallback_eligible()` returns `true`
   for errors where downgrading to plain HTTP is safe (plugin unavailable, buffer too small, etc.).
-- **`ByteCursor`** (`core/src/ffi.rs`): C-ABI `{ptr, len}` struct for crossing plugin boundaries.
-- **`BufferPool`** (feature `buffer-pool`, `core/src/pool.rs`): Thread-safe pool of 4 KiB-aligned
+- **`ByteCursor`** (`src/ffi.rs`): C-ABI `{ptr, len}` struct for crossing plugin boundaries.
+- **`BufferPool`** (feature `pool`, `src/buffer_pool.rs`): Thread-safe pool of 4 KiB-aligned
   pre-registered buffers.  Methods: `try_acquire_owned`, `acquire_owned` (async),
   `acquire_owned_blocking`.
-- **`RdmaServerConfig`** (`core/src/provider.rs`): Unified config for server providers.
+- **`RdmaServerConfig`** (`src/provider.rs`): Unified config for server providers.
   Fields: `shm_path` (mock), `listen_addr`/`listen_port`/`buf_size` (cuObj).
 
 ### HTTP protocol constants (`core/src/provider.rs`)
