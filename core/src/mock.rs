@@ -43,7 +43,6 @@ const SHM_DIR: &str = "/dev/shm";
 
 struct ShmEntry {
     name:    String,
-    path:    String,
     shm_ptr: *mut libc::c_void,
     size:    usize,
 }
@@ -328,7 +327,7 @@ impl MockRdmaProvider {
         }
         self.registered.lock().unwrap().insert(
             ptr as usize,
-            ShmEntry { name, path, shm_ptr, size },
+            ShmEntry { name, shm_ptr, size },
         );
         Ok(())
     }
@@ -484,7 +483,6 @@ mod tests {
             Box::new(|token: &[u8]| {
                 let srv = server.open_channel(b"key", token).unwrap();
                 let mut out: Vec<u8> = Vec::with_capacity(4096);
-                let mut out: Vec<u8> = Vec::with_capacity(4096);
                 let n = srv.handle_put(0, 4096, Box::new(|data: &[u8]| {
                     out.extend_from_slice(data);
                     Ok(data.len())
@@ -525,7 +523,6 @@ mod tests {
             Box::new(|token: &[u8]| {
                 let srv = server.open_channel(b"key", token).unwrap();
                 let mut out: Vec<u8> = Vec::with_capacity(4096);
-                let mut out: Vec<u8> = Vec::with_capacity(4096);
                 let n = srv.handle_put(0, 4096, Box::new(|data: &[u8]| {
                     out.extend_from_slice(data);
                     Ok(data.len())
@@ -550,7 +547,6 @@ mod tests {
             }),
             Box::new(|token: &[u8]| {
                 let srv = server.open_channel(b"key", token).unwrap();
-                let mut out: Vec<u8> = Vec::with_capacity(4096);
                 let mut out: Vec<u8> = Vec::with_capacity(4096);
                 let n = srv.handle_put(0, 4096, Box::new(|data: &[u8]| {
                     out.extend_from_slice(data);

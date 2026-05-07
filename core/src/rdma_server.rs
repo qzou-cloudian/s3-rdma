@@ -128,6 +128,7 @@ mod real {
             Ok(*boxed)
         }
 
+        /// Handle an RDMA PUT from a client.
         ///
         /// # Safety
         /// `write_fn_data` must remain valid for the duration of the call.

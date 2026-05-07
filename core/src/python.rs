@@ -7,7 +7,8 @@
 //! cd bindings/python && python3 -m maturin develop
 //! ```
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyRuntimeError;
@@ -15,11 +16,11 @@ use pyo3::prelude::*;
 use pyo3::PyClassInitializer;
 use pyo3::types::PyBytes;
 
-use crate::provider::RdmaProvider;
-use crate::provider::RdmaClientProvider;
-use crate::provider::RdmaRole;
-use crate::provider::{RdmaServerConfig, RdmaCompletionCallback, DEFAULT_RDMA_BUF_SIZE};
-use crate::provider::TelemetryConfig;
+use crate::provider::{
+    RdmaClientChannel, RdmaClientProvider, RdmaGetHandle, RdmaPutHandle,
+    RdmaRole, RdmaServerConfig, RdmaServerProvider, TelemetryConfig,
+    DEFAULT_RDMA_BUF_SIZE,
+};
 use crate::TelemLevel;
 
 fn parse_role(role: &str) -> PyResult<RdmaRole> {
@@ -33,6 +34,30 @@ fn parse_role(role: &str) -> PyResult<RdmaRole> {
     }
 }
 
+// ── Pending-transfer registry ─────────────────────────────────────────────────
+
+/// Tracks whether an in-flight transfer is a PUT or GET.
+enum PendingOp {
+    Put { handle: RdmaPutHandle },
+    Get {
+        handle:  RdmaGetHandle,
+        /// Raw pointer into the caller's Python buffer (e.g. a `bytearray`).
+        /// The caller must keep the buffer alive until `process_rdma_reply` is
+        /// called.
+        dst_ptr: *mut u8,
+        dst_len: usize,
+    },
+}
+
+struct PendingTransfer {
+    channel: Box<dyn RdmaClientChannel>,
+    op:      PendingOp,
+}
+
+// Safety: `dst_ptr` is a raw pointer into a Python-managed buffer that the
+// caller promises to keep alive until `process_rdma_reply` consumes the entry.
+unsafe impl Send for PendingTransfer {}
+
 // ── RdmaProvider Python class ─────────────────────────────────────────────────
 
 /// Unified RDMA provider supporting client, server, or both roles.
@@ -45,10 +70,8 @@ fn parse_role(role: &str) -> PyResult<RdmaRole> {
 ///
 ///     import s3_rdma
 ///     ep = s3_rdma.RdmaProvider(provider="mock", role="client")
-///     ep.register_memory(data)
 ///     token = ep.prepare_put_token(data, 0, len(data), b"bucket/key")
 ///     ep.process_rdma_reply(200, token, len(data), lambda code, reply: None)
-///     ep.deregister_memory(data)
 ///
 /// Example (server role)::
 ///
@@ -57,7 +80,9 @@ fn parse_role(role: &str) -> PyResult<RdmaRole> {
 ///     written  = ep.handle_get(b"bucket/key", received, token)
 #[pyclass(name = "RdmaProvider", subclass)]
 pub struct PyRdmaProvider {
-    inner: Arc<dyn RdmaProvider>,
+    inner:   Arc<dyn crate::provider::RdmaProvider>,
+    /// Per-provider registry of in-flight RDMA transfers, keyed by token bytes.
+    pending: Mutex<HashMap<Vec<u8>, PendingTransfer>>,
 }
 
 #[pymethods]
@@ -100,7 +125,7 @@ impl PyRdmaProvider {
             buf_size,
         };
         crate::create_provider(provider, debug, provider_role, &cfg)
-            .map(|inner| Self { inner })
+            .map(|inner| Self { inner, pending: Mutex::new(HashMap::new()) })
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -119,46 +144,33 @@ impl PyRdmaProvider {
     fn supports_server(&self) -> bool { self.inner.supports_server() }
 
     /// Capacity in bytes of the server's per-slot transfer buffer.
-    fn buf_size(&self) -> usize { self.inner.buf_size() }
+    fn buf_size(&self) -> usize {
+        RdmaServerProvider::buf_size(self.inner.as_ref())
+    }
 
     // ── Client methods ────────────────────────────────────────────────────────
 
-    /// Returns ``True`` if the buffer at ``ptr`` of ``size`` bytes is RDMA-eligible.
-    ///
-    /// :param ptr: raw integer address of the buffer.
-    /// :param size: buffer size in bytes.
-    fn is_memory_suitable(&self, ptr: u64, size: usize) -> bool {
-        self.inner.is_memory_suitable(ptr as *const u8, size)
-    }
+    /// Returns ``True`` — the channel API validates suitability at bind time.
+    fn is_memory_suitable(&self, _ptr: u64, _size: usize) -> bool { true }
 
-    /// Register a memory region for RDMA.
+    /// No-op — memory registration is handled internally by
+    /// :meth:`prepare_put_token` and :meth:`prepare_get_token` when they
+    /// allocate and bind a channel buffer.
     ///
-    /// Accepts any buffer-protocol object: ``bytes``, ``bytearray``,
-    /// ``memoryview``, NumPy arrays, etc.
-    ///
-    /// The buffer's underlying memory pointer is recorded by the provider and
-    /// must remain valid (keep the Python object alive) until
-    /// :meth:`deregister_memory` is called.
-    ///
-    /// :param data: the buffer to register.
-    fn register_memory(&self, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        let buf = PyBuffer::<u8>::get_bound(data)?;
-        self.inner
-            .register_memory(buf.buf_ptr() as *mut u8, buf.len_bytes())
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
+    /// :param data: ignored (accepted for backward compatibility).
+    fn register_memory(&self, _data: &Bound<'_, PyAny>) -> PyResult<()> { Ok(()) }
 
-    /// Deregister a previously registered memory region.
+    /// No-op — channel resources are released automatically when
+    /// :meth:`process_rdma_reply` consumes the pending transfer.
     ///
-    /// :param data: the same buffer object passed to :meth:`register_memory`.
-    fn deregister_memory(&self, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        let buf = PyBuffer::<u8>::get_bound(data)?;
-        self.inner
-            .deregister_memory(buf.buf_ptr() as *mut u8)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
+    /// :param data: ignored (accepted for backward compatibility).
+    fn deregister_memory(&self, _data: &Bound<'_, PyAny>) -> PyResult<()> { Ok(()) }
 
     /// Generate an RDMA token for an S3 PUT (upload).
+    ///
+    /// Allocates an internal RDMA-registered buffer, copies ``data`` into it,
+    /// and returns the opaque token.  The pending transfer is stored internally
+    /// and consumed when :meth:`process_rdma_reply` is called.
     ///
     /// Accepts any buffer-protocol object for ``data``.
     ///
@@ -176,20 +188,41 @@ impl PyRdmaProvider {
         s3_key: &[u8],
     ) -> PyResult<Bound<'py, PyBytes>> {
         let buf = PyBuffer::<u8>::get_bound(data)?;
-        let b_ptr = buf.buf_ptr() as *const u8;
-        let b_len = buf.len_bytes();
-        let token = self.inner
-            .prepare_put_token(s3_key, b_ptr, size.min(b_len), offset)
+        let data_ptr = buf.buf_ptr() as *const u8;
+        let data_len = buf.len_bytes();
+
+        let ch = RdmaClientProvider::bind(self.inner.as_ref(), data_len, s3_key)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        // Copy the caller's data into the channel's registered buffer.
+        let copy_len = data_len.min(ch.size());
+        if copy_len > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(data_ptr, ch.ptr() as *mut u8, copy_len);
+            }
+        }
+
+        let put_size = size.min(copy_len.saturating_sub(offset));
+        let put_handle = ch.prepare_put(offset, put_size)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        let token = put_handle.token().to_vec();
+        self.pending.lock().unwrap().insert(
+            token.clone(),
+            PendingTransfer { channel: ch, op: PendingOp::Put { handle: put_handle } },
+        );
+
         Ok(PyBytes::new_bound(py, &token))
     }
 
     /// Generate an RDMA token for an S3 GET (download).
     ///
-    /// Accepts any buffer-protocol object for ``data``.  For a GET, the
-    /// server will write data back into this buffer via
-    /// :meth:`process_rdma_reply`, so pass a writable buffer (``bytearray``
-    /// or similar) rather than ``bytes``.
+    /// Allocates an internal RDMA-registered buffer and returns the opaque
+    /// token.  After the server fills the buffer via ``handle_get``, call
+    /// :meth:`process_rdma_reply` to copy the received data back into ``data``.
+    ///
+    /// Pass a writable buffer (``bytearray`` or similar) so that
+    /// :meth:`process_rdma_reply` can write the received data back into it.
     ///
     /// :param data:   buffer that will receive the downloaded data.
     /// :param offset: byte offset within the buffer for this sub-request.
@@ -205,17 +238,34 @@ impl PyRdmaProvider {
         s3_key: &[u8],
     ) -> PyResult<Bound<'py, PyBytes>> {
         let buf = PyBuffer::<u8>::get_bound(data)?;
-        let b_ptr = buf.buf_ptr() as *mut u8;
-        let b_len = buf.len_bytes();
-        let token = self.inner
-            .prepare_get_token(s3_key, b_ptr, size.min(b_len), offset)
+        let dst_ptr = buf.buf_ptr() as *mut u8;
+        let dst_len = buf.len_bytes();
+
+        let ch = RdmaClientProvider::bind(self.inner.as_ref(), dst_len, s3_key)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        let get_size = size.min(dst_len.saturating_sub(offset));
+        let get_handle = ch.prepare_get(offset, get_size)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        let token = get_handle.token().to_vec();
+        self.pending.lock().unwrap().insert(
+            token.clone(),
+            PendingTransfer {
+                channel: ch,
+                op: PendingOp::Get { handle: get_handle, dst_ptr, dst_len },
+            },
+        );
+
         Ok(PyBytes::new_bound(py, &token))
     }
 
     /// Process the ``x-amz-rdma-reply`` status returned by the S3 server.
     ///
-    /// Calls ``callback(error_code: int, reply_token: bytes)`` synchronously.
+    /// Completes the pending RDMA transfer associated with ``request_token``.
+    /// For GET operations, copies the received data back into the buffer
+    /// originally passed to :meth:`prepare_get_token`.
+    /// Calls ``callback(error_code, reply_token)`` synchronously.
     ///
     /// :param rdma_status:    numeric status (200/204/206 = success, 501 = fallback, 0 = absent).
     /// :param request_token:  the token originally sent in the PUT/GET request.
@@ -228,14 +278,36 @@ impl PyRdmaProvider {
         transferred:   usize,
         callback:      PyObject,
     ) -> PyResult<()> {
-        let cb: RdmaCompletionCallback = Box::new(move |result| {
-            Python::with_gil(|py| {
-                let _ = callback.call1(py, (result.error_code, result.reply_token.as_slice()));
-            });
+        let pending = self.pending.lock().unwrap().remove(request_token)
+            .ok_or_else(|| PyRuntimeError::new_err(
+                "no pending transfer for the given token; \
+                 call prepare_put_token or prepare_get_token first"
+            ))?;
+
+        let PendingTransfer { channel, op } = pending;
+        match op {
+            PendingOp::Put { handle } => {
+                channel.complete_put(handle, rdma_status, transferred)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            }
+            PendingOp::Get { handle, dst_ptr, dst_len } => {
+                channel.complete_get(handle, rdma_status, transferred)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                // Copy the received bytes from the channel buffer back into the
+                // caller's Python buffer (e.g. a bytearray).
+                let n = transferred.min(dst_len).min(channel.size());
+                if n > 0 {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(channel.ptr(), dst_ptr, n);
+                    }
+                }
+            }
+        }
+
+        Python::with_gil(|py| {
+            let _ = callback.call1(py, (0i32, PyBytes::new_bound(py, b"").as_ref()));
         });
-        self.inner
-            .process_rdma_reply(rdma_status, request_token, transferred, cb)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        Ok(())
     }
 
     // ── Server methods ────────────────────────────────────────────────────────
@@ -257,35 +329,30 @@ impl PyRdmaProvider {
         size:   usize,
         offset: usize,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let raw_cap = self.inner.buf_size();
-        let buf_cap = if size > 0 {
-            size
-        } else {
-            raw_cap.clamp(4096, DEFAULT_RDMA_BUF_SIZE)
+        let buf_cap = if size > 0 { size } else {
+            RdmaServerProvider::buf_size(self.inner.as_ref()).clamp(4096, DEFAULT_RDMA_BUF_SIZE)
         };
-        let mut buf: Vec<u8> = Vec::with_capacity(buf_cap);
+        let mut received: Vec<u8> = Vec::with_capacity(buf_cap);
 
-        unsafe extern "C" fn write_cb(
-            user_data: *mut std::ffi::c_void, ptr: *const std::ffi::c_void, n: usize,
-        ) -> isize {
-            let out = &mut *(user_data as *mut Vec<u8>);
-            let src = std::slice::from_raw_parts(ptr as *const u8, n);
-            out.extend_from_slice(src);
-            n as isize
-        }
-
-        let ch = self.inner.open_channel(s3_key, token)
+        let ch = RdmaServerProvider::open_channel(self.inner.as_ref(), s3_key, token)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let n = unsafe {
-            ch.handle_put(offset, size, write_cb,
-                          &mut buf as *mut Vec<u8> as *mut std::ffi::c_void)
-        }.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        buf.truncate(n);
-        Ok(PyBytes::new_bound(py, &buf))
+
+        ch.handle_put(offset, buf_cap, Box::new(|data: &[u8]| {
+            received.extend_from_slice(data);
+            Ok(data.len())
+        })).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        Ok(PyBytes::new_bound(py, &received))
     }
 
     /// Handle an RDMA GET from a client: writes ``data`` into the client's
     /// registered buffer and returns the number of bytes written.
+    ///
+    /// :param s3_key: the S3 object key.
+    /// :param data:   the object payload to send to the client.
+    /// :param token:  the RDMA descriptor token from ``x-amz-rdma-token``.
+    /// :param offset: byte offset into the client buffer (default 0).
+    /// :returns: number of bytes written to the client buffer.
     #[pyo3(signature = (s3_key, data, token, offset = 0))]
     fn handle_get(
         &self,
@@ -294,21 +361,17 @@ impl PyRdmaProvider {
         token:  &[u8],
         offset: usize,
     ) -> PyResult<usize> {
-        unsafe extern "C" fn read_cb(
-            user_data: *mut std::ffi::c_void, buf: *mut std::ffi::c_void, capacity: usize,
-        ) -> isize {
-            let src = &*(user_data as *const &[u8]);
-            let dst = std::slice::from_raw_parts_mut(buf as *mut u8, capacity);
-            let n = src.len().min(capacity);
-            dst[..n].copy_from_slice(&src[..n]);
-            n as isize
-        }
+        let data_owned = data.to_vec();
+        let data_len = data_owned.len();
 
-        let data_ref: &[u8] = data;
-        self.inner.open_channel(s3_key, token)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-            .handle_get(offset, read_cb, &data_ref as *const &[u8] as *mut std::ffi::c_void)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        let ch = RdmaServerProvider::open_channel(self.inner.as_ref(), s3_key, token)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        ch.handle_get(offset, data_len, Box::new(move |buf: &mut [u8]| {
+            let n = data_len.min(buf.len());
+            buf[..n].copy_from_slice(&data_owned[..n]);
+            Ok(n)
+        })).map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     fn __repr__(&self) -> String {
@@ -387,7 +450,6 @@ impl PyRdmaProvider {
 ///
 ///     import s3_rdma
 ///     ep = s3_rdma.MockRdmaProvider(debug=True)
-///     ep.register_memory(data)
 ///     token = ep.prepare_put_token(data, 0, len(data), b"bucket/key")
 ///     received = ep.handle_put(b"bucket/key", token, size=len(data))
 #[pyclass(name = "MockRdmaProvider", extends = PyRdmaProvider)]
@@ -419,10 +481,8 @@ impl PyMockRdmaProvider {
 ///
 ///     import s3_rdma
 ///     ep = s3_rdma.CuObjProvider(role="client")
-///     ep.register_memory(data)
 ///     token = ep.prepare_put_token(data, 0, len(data), b"bucket/key")
 ///     ep.process_rdma_reply(200, token, len(data), lambda code, reply: None)
-///     ep.deregister_memory(data)
 ///
 /// Example (server role)::
 ///

@@ -25,7 +25,6 @@
 //! Concrete implementations:
 //!
 //! - [`MockRdmaProvider`] — SHM-based simulation, no hardware required; both roles
-//! - [`RdmaPlugin`] — generic RDMA plugin (loads `.so` at runtime); both roles
 //! - [`RdmaPlugin`] — loads `.so` at runtime via the plugin system
 //!
 //! ## Choosing the right trait

@@ -225,15 +225,12 @@ pub struct RdmaServerVtable {
 
     /// Handle an RDMA PUT: the server RDMA_READs `size` bytes from the
     /// client buffer identified by `token`, starting at `offset` bytes into
-    /// the client's buffer.
-    ///
-    /// `offset=0, size=0` means "read the full buffer as described by the token".
+    /// Zero-copy RDMA PUT: RDMA-reads from the client's buffer.
     ///
     /// On success copies the received bytes into the caller-provided buffer `buf`
     /// and writes the byte count into `*out_transferred`.
     ///
-    /// Handle an RDMA PUT.
-    ///
+    /// `offset=0, size=0` means "read the full buffer as described by the token".
     /// The plugin RDMA-reads from the client buffer, then calls
     /// `write_fn(write_fn_data, rdma_buf_ptr, transferred)` to flush the data
     /// directly from its internal RDMA-registered buffer to the storage layer.

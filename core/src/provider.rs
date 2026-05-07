@@ -520,22 +520,26 @@ pub trait RdmaServerProvider: Send + Sync {
 
     // ── Telemetry (see same methods on [`RdmaClientProvider`]) ───────────────
 
+    /// Returns `true` if this provider supports telemetry configuration.
     fn supports_telemetry(&self) -> bool {
         false
     }
 
+    /// Configure the telemetry output destination and verbosity level.
     fn setup_telemetry(&self, _config: &TelemetryConfig) -> Result<(), crate::error::RdmaError> {
         Err(crate::error::RdmaError::OperationNotSupported(
             "telemetry not supported by this provider".into(),
         ))
     }
 
+    /// Shut down telemetry and reset to the default output stream.
     fn shutdown_telemetry(&self) -> Result<(), crate::error::RdmaError> {
         Err(crate::error::RdmaError::OperationNotSupported(
             "telemetry not supported by this provider".into(),
         ))
     }
 
+    /// Change the verbosity level without reconfiguring the output destination.
     fn set_telem_level(&self, _level: TelemLevel) -> Result<(), crate::error::RdmaError> {
         Err(crate::error::RdmaError::OperationNotSupported(
             "telemetry not supported by this provider".into(),

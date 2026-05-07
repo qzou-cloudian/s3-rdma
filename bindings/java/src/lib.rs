@@ -1,17 +1,22 @@
 //! JNI bindings for `s3-rdma`.
 //!
-//! Exposes the unified `RdmaProvider` Java class backed by
-//! `Box<Arc<dyn RdmaProvider>>`, supporting client, server, and both roles
-//! with any provider (`"mock"`, `"cuobj"`, `"auto"`).
+//! Exposes the unified `RdmaProvider` Java class backed by a `ProviderState`
+//! that wraps an `Arc<dyn RdmaProvider>` and a per-provider registry of
+//! in-flight RDMA transfers.  Supports client, server, and both roles with
+//! any provider (`"mock"`, `"cuobj"`, `"auto"`).
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use jni::objects::{JByteArray, JByteBuffer, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyteArray, jlong, JNI_TRUE};
 use jni::JNIEnv;
 
 use s3_rdma::TelemLevel;
-use s3_rdma::provider::{RdmaRole, RdmaProvider, RdmaClientProvider};
+use s3_rdma::provider::{
+    RdmaClientChannel, RdmaClientProvider, RdmaGetHandle, RdmaPutHandle,
+    RdmaRole, RdmaServerProvider,
+};
 use s3_rdma::provider::{RdmaServerConfig, DEFAULT_RDMA_BUF_SIZE};
 use s3_rdma::provider::TelemetryConfig;
 
@@ -20,25 +25,52 @@ fn throw(env: &mut JNIEnv<'_>, msg: &str) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// RdmaProvider JNI  (unified client+server, backed by Arc<dyn RdmaProvider>)
+// Provider state  (unified client+server, backed by Arc<dyn RdmaProvider>)
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Handle type for the unified RdmaProvider class.
-// The jlong stores a raw pointer to a heap-allocated Arc<dyn RdmaProvider>.
-// We box the Arc so we get a single-word (thin) pointer suitable for a jlong.
-type ArcProvider = Arc<dyn RdmaProvider>;
+// ── Pending-transfer registry ─────────────────────────────────────────────────
+
+/// Tracks whether an in-flight transfer is a PUT or GET.
+enum PendingOp {
+    Put { handle: RdmaPutHandle },
+    Get {
+        handle:  RdmaGetHandle,
+        /// Raw pointer into the Java direct ByteBuffer.  The Java code keeps
+        /// the ByteBuffer alive until `nativeProcessRdmaReply` is called.
+        dst_ptr: *mut u8,
+        dst_cap: usize,
+    },
+}
+
+struct PendingTransfer {
+    channel: Box<dyn RdmaClientChannel>,
+    op:      PendingOp,
+}
+
+// Safety: `dst_ptr` is a raw pointer into a Java-managed direct ByteBuffer
+// that the caller promises to keep alive until `nativeProcessRdmaReply`
+// consumes the entry.
+unsafe impl Send for PendingTransfer {}
+
+// ── ProviderState ─────────────────────────────────────────────────────────────
+
+/// Per-provider state stored behind the `nativeHandle` jlong.
+struct ProviderState {
+    provider: Arc<dyn s3_rdma::provider::RdmaProvider>,
+    /// In-flight RDMA transfers, keyed by token bytes.
+    pending:  Mutex<HashMap<Vec<u8>, PendingTransfer>>,
+}
 
 /// # Safety
 /// `handle` must be a non-null `jlong` produced by
 /// `Java_io_s3rdma_RdmaProvider_nativeCreate` and not yet passed to
 /// `Java_io_s3rdma_RdmaProvider_nativeDestroy`.
-unsafe fn arc_provider_ref(handle: jlong) -> &'static dyn RdmaProvider {
+unsafe fn provider_state_ref(handle: jlong) -> &'static ProviderState {
     if handle == 0 {
         eprintln!("[s3-rdma-jni] FATAL: null handle — nativeCreate likely returned 0 (error)");
         std::process::abort();
     }
-    let arc = unsafe { &*(handle as *const ArcProvider) };
-    arc.as_ref()
+    &*(handle as *const ProviderState)
 }
 
 fn parse_role(role: &str) -> Option<RdmaRole> {
@@ -97,7 +129,13 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeCreate(
     };
 
     match s3_rdma::create_provider(&provider_str, debug == JNI_TRUE, provider_role, &cfg) {
-        Ok(arc) => Box::into_raw(Box::new(arc)) as jlong,
+        Ok(arc) => {
+            let state = Box::new(ProviderState {
+                provider: arc,
+                pending: Mutex::new(HashMap::new()),
+            });
+            Box::into_raw(state) as jlong
+        }
         Err(e)  => { throw(&mut env, &e.to_string()); 0 }
     }
 }
@@ -108,7 +146,7 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeDestroy(
     _env: JNIEnv<'_>, _obj: JObject<'_>, handle: jlong,
 ) {
     if handle != 0 {
-        let _ = unsafe { Box::from_raw(handle as *mut ArcProvider) };
+        let _ = unsafe { Box::from_raw(handle as *mut ProviderState) };
     }
 }
 
@@ -118,7 +156,7 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeDestroy(
 pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeName<'a>(
     env: JNIEnv<'a>, _obj: JObject<'a>, handle: jlong,
 ) -> JString<'a> {
-    let s = unsafe { arc_provider_ref(handle) }.name();
+    let s = unsafe { provider_state_ref(handle) }.provider.name();
     env.new_string(s).unwrap_or_else(|_| JString::default())
 }
 
@@ -126,7 +164,7 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeName<'a>(
 pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeProtocol<'a>(
     env: JNIEnv<'a>, _obj: JObject<'a>, handle: jlong,
 ) -> JString<'a> {
-    let s = unsafe { arc_provider_ref(handle) }.protocol();
+    let s = unsafe { provider_state_ref(handle) }.provider.protocol();
     env.new_string(s).unwrap_or_else(|_| JString::default())
 }
 
@@ -134,59 +172,51 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeProtocol<'a>(
 pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeSupportsClient(
     _env: JNIEnv<'_>, _obj: JObject<'_>, handle: jlong,
 ) -> jboolean {
-    unsafe { arc_provider_ref(handle) }.supports_client() as jboolean
+    unsafe { provider_state_ref(handle) }.provider.supports_client() as jboolean
 }
 
 #[no_mangle]
 pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeSupportsServer(
     _env: JNIEnv<'_>, _obj: JObject<'_>, handle: jlong,
 ) -> jboolean {
-    unsafe { arc_provider_ref(handle) }.supports_server() as jboolean
+    unsafe { provider_state_ref(handle) }.provider.supports_server() as jboolean
 }
 
 // ── Client methods ────────────────────────────────────────────────────────────
 
+/// Always returns `true` — suitability is validated at `bind` time.
 #[no_mangle]
 pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeIsMemorySuitable(
     _env: JNIEnv<'_>, _obj: JObject<'_>,
-    handle: jlong, ptr: jlong, size: jlong,
+    _handle: jlong, _ptr: jlong, _size: jlong,
 ) -> jboolean {
-    unsafe { arc_provider_ref(handle) }
-        .is_memory_suitable(ptr as *const u8, size as usize) as jboolean
+    JNI_TRUE
 }
 
+/// No-op — memory registration is handled internally by `nativePreparePutToken`
+/// and `nativePrepareGetToken` when they allocate and bind a channel buffer.
 #[no_mangle]
 pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeRegisterMemory(
-    mut env: JNIEnv<'_>, _obj: JObject<'_>,
-    handle: jlong, buf: JByteBuffer<'_>,
+    _env: JNIEnv<'_>, _obj: JObject<'_>,
+    _handle: jlong, _buf: JByteBuffer<'_>,
 ) {
-    let ptr = match env.get_direct_buffer_address(&buf) {
-        Ok(p) => p,
-        Err(e) => { throw(&mut env, &format!("buf must be a direct ByteBuffer: {e}")); return; }
-    };
-    let len = match env.get_direct_buffer_capacity(&buf) {
-        Ok(c) => c,
-        Err(e) => { throw(&mut env, &e.to_string()); return; }
-    };
-    if let Err(e) = unsafe { arc_provider_ref(handle) }.register_memory(ptr, len) {
-        throw(&mut env, &e.to_string());
-    }
+    // No-op: channel API handles registration at prepare time.
 }
 
+/// No-op — channel resources are released when `nativeProcessRdmaReply`
+/// consumes the pending transfer entry.
 #[no_mangle]
 pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeDeregisterMemory(
-    mut env: JNIEnv<'_>, _obj: JObject<'_>,
-    handle: jlong, buf: JByteBuffer<'_>,
+    _env: JNIEnv<'_>, _obj: JObject<'_>,
+    _handle: jlong, _buf: JByteBuffer<'_>,
 ) {
-    let ptr = match env.get_direct_buffer_address(&buf) {
-        Ok(p) => p,
-        Err(e) => { throw(&mut env, &format!("buf must be a direct ByteBuffer: {e}")); return; }
-    };
-    if let Err(e) = unsafe { arc_provider_ref(handle) }.deregister_memory(ptr) {
-        throw(&mut env, &e.to_string());
-    }
+    // No-op: the channel is dropped when the pending transfer is removed.
 }
 
+/// `RdmaProvider.nativePreparePutToken(handle, s3Key, buf, offset, size) -> byte[]`
+///
+/// Allocates an RDMA channel, copies the Java direct buffer into it, prepares a
+/// PUT token, and stores the pending transfer in the per-provider registry.
 #[no_mangle]
 pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativePreparePutToken(
     mut env: JNIEnv<'_>, _obj: JObject<'_>,
@@ -201,15 +231,47 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativePreparePutToken(
         Ok(p) => p as *const u8,
         Err(e) => { throw(&mut env, &format!("buf must be a direct ByteBuffer: {e}")); return std::ptr::null_mut(); }
     };
-    match unsafe { arc_provider_ref(handle) }
-        .prepare_put_token(&key_bytes, buf_ptr, size as usize, offset as usize)
-    {
-        Ok(tok) => env.byte_array_from_slice(&tok)
-            .map(|a| a.into_raw()).unwrap_or(std::ptr::null_mut()),
-        Err(e) => { throw(&mut env, &e.to_string()); std::ptr::null_mut() }
+    let buf_cap = match env.get_direct_buffer_capacity(&buf) {
+        Ok(c) => c as usize,
+        Err(e) => { throw(&mut env, &e.to_string()); return std::ptr::null_mut(); }
+    };
+
+    let state = unsafe { provider_state_ref(handle) };
+
+    let ch = match RdmaClientProvider::bind(&*state.provider, buf_cap, &key_bytes) {
+        Ok(ch) => ch,
+        Err(e) => { throw(&mut env, &e.to_string()); return std::ptr::null_mut(); }
+    };
+
+    // Copy the Java direct buffer into the channel's registered buffer.
+    let copy_len = buf_cap.min(ch.size());
+    if copy_len > 0 {
+        unsafe { std::ptr::copy_nonoverlapping(buf_ptr, ch.ptr() as *mut u8, copy_len); }
     }
+
+    let put_size = (size as usize).min(copy_len.saturating_sub(offset as usize));
+    let put_handle = match ch.prepare_put(offset as usize, put_size) {
+        Ok(h) => h,
+        Err(e) => { throw(&mut env, &e.to_string()); return std::ptr::null_mut(); }
+    };
+
+    let token = put_handle.token().to_vec();
+    state.pending.lock().unwrap().insert(
+        token.clone(),
+        PendingTransfer { channel: ch, op: PendingOp::Put { handle: put_handle } },
+    );
+
+    env.byte_array_from_slice(&token)
+        .map(|a| a.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
+/// `RdmaProvider.nativePrepareGetToken(handle, s3Key, buf, offset, size) -> byte[]`
+///
+/// Allocates an RDMA channel, prepares a GET token, and stores the pending
+/// transfer (including the destination buffer pointer) in the per-provider
+/// registry.  After the server fills the SHM buffer, `nativeProcessRdmaReply`
+/// copies the data back into the Java direct ByteBuffer.
 #[no_mangle]
 pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativePrepareGetToken(
     mut env: JNIEnv<'_>, _obj: JObject<'_>,
@@ -224,17 +286,44 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativePrepareGetToken(
         Ok(p) => p,
         Err(e) => { throw(&mut env, &format!("buf must be a direct ByteBuffer: {e}")); return std::ptr::null_mut(); }
     };
-    match unsafe { arc_provider_ref(handle) }
-        .prepare_get_token(&key_bytes, buf_ptr, size as usize, offset as usize)
-    {
-        Ok(tok) => env.byte_array_from_slice(&tok)
-            .map(|a| a.into_raw()).unwrap_or(std::ptr::null_mut()),
-        Err(e) => { throw(&mut env, &e.to_string()); std::ptr::null_mut() }
-    }
+    let buf_cap = match env.get_direct_buffer_capacity(&buf) {
+        Ok(c) => c as usize,
+        Err(e) => { throw(&mut env, &e.to_string()); return std::ptr::null_mut(); }
+    };
+
+    let state = unsafe { provider_state_ref(handle) };
+
+    let ch = match RdmaClientProvider::bind(&*state.provider, buf_cap, &key_bytes) {
+        Ok(ch) => ch,
+        Err(e) => { throw(&mut env, &e.to_string()); return std::ptr::null_mut(); }
+    };
+
+    let get_size = (size as usize).min(buf_cap.saturating_sub(offset as usize));
+    let get_handle = match ch.prepare_get(offset as usize, get_size) {
+        Ok(h) => h,
+        Err(e) => { throw(&mut env, &e.to_string()); return std::ptr::null_mut(); }
+    };
+
+    let token = get_handle.token().to_vec();
+    state.pending.lock().unwrap().insert(
+        token.clone(),
+        PendingTransfer {
+            channel: ch,
+            op: PendingOp::Get { handle: get_handle, dst_ptr: buf_ptr, dst_cap: buf_cap },
+        },
+    );
+
+    env.byte_array_from_slice(&token)
+        .map(|a| a.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// `RdmaProvider.nativeProcessRdmaReply(handle, rdmaStatus, requestToken,
 ///                                       transferred, callback)`
+///
+/// Looks up the pending transfer by token, completes it, and (for GET)
+/// copies the received data back into the Java direct ByteBuffer.
+/// Calls `callback.onComplete(errorCode, replyToken)` synchronously.
 #[no_mangle]
 pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeProcessRdmaReply(
     mut env:       JNIEnv<'_>,
@@ -249,28 +338,56 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeProcessRdmaReply(
         Ok(b) => b,
         Err(e) => { throw(&mut env, &e.to_string()); return; }
     };
-    let jvm = env.get_java_vm().expect("get_java_vm");
-    let cb_global = match env.new_global_ref(&callback) {
-        Ok(r) => r,
-        Err(e) => { throw(&mut env, &e.to_string()); return; }
+
+    let state = unsafe { provider_state_ref(handle) };
+
+    let pending = match state.pending.lock().unwrap().remove(&req_bytes) {
+        Some(p) => p,
+        None => {
+            throw(&mut env, "no pending transfer for the given token; \
+                  call preparePutToken or prepareGetToken first");
+            return;
+        }
     };
 
-    let cb: RdmaCompletionCallback = Box::new(move |result: RdmaCompletionResult| {
-        let mut env = jvm.attach_current_thread().expect("attach_current_thread");
-        let reply_arr = env
-            .byte_array_from_slice(&result.reply_token)
-            .expect("byte_array_from_slice");
-        let _ = env.call_method(
-            cb_global.as_obj(), "onComplete", "(I[B)V",
-            &[JValue::Int(result.error_code), JValue::Object(&reply_arr)],
-        );
-    });
+    let transferred_n = transferred as usize;
+    let status = rdma_status as u16;
+    let PendingTransfer { channel, op } = pending;
 
-    if let Err(e) = unsafe { arc_provider_ref(handle) }
-        .process_rdma_reply(rdma_status as u16, &req_bytes, transferred as usize, cb)
-    {
+    let result = match op {
+        PendingOp::Put { handle: put_handle } => {
+            channel.complete_put(put_handle, status, transferred_n)
+        }
+        PendingOp::Get { handle: get_handle, dst_ptr, dst_cap } => {
+            let r = channel.complete_get(get_handle, status, transferred_n);
+            if r.is_ok() {
+                // Copy the received bytes from the channel buffer back into the
+                // caller's Java direct ByteBuffer.
+                let n = transferred_n.min(dst_cap).min(channel.size());
+                if n > 0 {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(channel.ptr(), dst_ptr, n);
+                    }
+                }
+            }
+            r
+        }
+    };
+
+    if let Err(e) = result {
         throw(&mut env, &e.to_string());
+        return;
     }
+
+    // Invoke callback.onComplete(0, new byte[0])
+    let reply_arr = match env.byte_array_from_slice(b"") {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+    let _ = env.call_method(
+        &callback, "onComplete", "(I[B)V",
+        &[JValue::Int(0), JValue::Object(&reply_arr)],
+    );
 }
 
 // ── Server methods ────────────────────────────────────────────────────────────
@@ -279,7 +396,7 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeProcessRdmaReply(
 pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeBufSize(
     _env: JNIEnv<'_>, _obj: JObject<'_>, handle: jlong,
 ) -> jlong {
-    unsafe { arc_provider_ref(handle) }.buf_size() as jlong
+    RdmaServerProvider::buf_size(&*unsafe { provider_state_ref(handle) }.provider) as jlong
 }
 
 /// `RdmaProvider.nativeHandlePut(handle, s3Key, token, offset, size) -> byte[]`
@@ -295,23 +412,28 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeHandlePut(
     let tok_bytes = match env.convert_byte_array(&token) {
         Ok(b) => b, Err(e) => { throw(&mut env, &e.to_string()); return std::ptr::null_mut(); }
     };
-    let ep = unsafe { arc_provider_ref(handle) };
-    let raw_cap = ep.buf_size();
+
+    let state = unsafe { provider_state_ref(handle) };
     let buf_cap = if size > 0 {
         size as usize
     } else {
-        // buf_size() returns usize::MAX for mock when unconfigured; cap to avoid OOM.
-        raw_cap.clamp(4096, DEFAULT_RDMA_BUF_SIZE)
+        // buf_size() may be usize::MAX for mock; cap to avoid OOM.
+        RdmaServerProvider::buf_size(&*state.provider).clamp(4096, DEFAULT_RDMA_BUF_SIZE)
     };
-    let mut buf = vec![0u8; buf_cap];
-    match ep.open_channel(&key_bytes, &tok_bytes)
-        .and_then(|ch| ch.handle_put(&mut buf, offset as usize, size as usize))
-    {
-        Ok(n) => {
-            buf.truncate(n);
-            env.byte_array_from_slice(&buf)
-                .map(|a| a.into_raw()).unwrap_or(std::ptr::null_mut())
-        }
+    let mut received = Vec::<u8>::with_capacity(buf_cap);
+
+    let ch = match RdmaServerProvider::open_channel(&*state.provider, &key_bytes, &tok_bytes) {
+        Ok(ch) => ch,
+        Err(e) => { throw(&mut env, &e.to_string()); return std::ptr::null_mut(); }
+    };
+
+    match ch.handle_put(offset as usize, buf_cap, Box::new(|data: &[u8]| {
+        received.extend_from_slice(data);
+        Ok(data.len())
+    })) {
+        Ok(_) => env.byte_array_from_slice(&received)
+                    .map(|a| a.into_raw())
+                    .unwrap_or(std::ptr::null_mut()),
         Err(e) => { throw(&mut env, &e.to_string()); std::ptr::null_mut() }
     }
 }
@@ -332,10 +454,20 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeHandleGet(
     let tok_bytes = match env.convert_byte_array(&token) {
         Ok(b) => b, Err(e) => { throw(&mut env, &e.to_string()); return -1; }
     };
-    match unsafe { arc_provider_ref(handle) }
-        .open_channel(&key_bytes, &tok_bytes)
-        .and_then(|ch| ch.handle_get(&data_bytes, offset as usize))
-    {
+
+    let state = unsafe { provider_state_ref(handle) };
+    let data_len = data_bytes.len();
+
+    let ch = match RdmaServerProvider::open_channel(&*state.provider, &key_bytes, &tok_bytes) {
+        Ok(ch) => ch,
+        Err(e) => { throw(&mut env, &e.to_string()); return -1; }
+    };
+
+    match ch.handle_get(offset as usize, data_len, Box::new(move |buf: &mut [u8]| {
+        let n = data_len.min(buf.len());
+        buf[..n].copy_from_slice(&data_bytes[..n]);
+        Ok(n)
+    })) {
         Ok(n)  => n as jlong,
         Err(e) => { throw(&mut env, &e.to_string()); -1 }
     }
@@ -347,7 +479,9 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeHandleGet(
 pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeSupportsTelemetry(
     _env: JNIEnv<'_>, _obj: JObject<'_>, handle: jlong,
 ) -> jboolean {
-    RdmaClientProvider::supports_telemetry(unsafe { arc_provider_ref(handle) }) as jboolean
+    RdmaClientProvider::supports_telemetry(
+        &*unsafe { provider_state_ref(handle) }.provider,
+    ) as jboolean
 }
 
 #[no_mangle]
@@ -375,7 +509,7 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeSetupTelemetry(
         level: lvl,
     };
     if let Err(e) = RdmaClientProvider::setup_telemetry(
-        unsafe { arc_provider_ref(handle) }, &cfg,
+        &*unsafe { provider_state_ref(handle) }.provider, &cfg,
     ) {
         throw(&mut env, &e.to_string());
     }
@@ -385,7 +519,9 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeSetupTelemetry(
 pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeShutdownTelemetry(
     mut env: JNIEnv<'_>, _obj: JObject<'_>, handle: jlong,
 ) {
-    if let Err(e) = RdmaClientProvider::shutdown_telemetry(unsafe { arc_provider_ref(handle) }) {
+    if let Err(e) = RdmaClientProvider::shutdown_telemetry(
+        &*unsafe { provider_state_ref(handle) }.provider,
+    ) {
         throw(&mut env, &e.to_string());
     }
 }
@@ -401,8 +537,9 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeSetTelemLevel(
         _ => TelemLevel::Debug,
     };
     if let Err(e) = RdmaClientProvider::set_telem_level(
-        unsafe { arc_provider_ref(handle) }, lvl,
+        &*unsafe { provider_state_ref(handle) }.provider, lvl,
     ) {
         throw(&mut env, &e.to_string());
     }
 }
+

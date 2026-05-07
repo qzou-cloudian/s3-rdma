@@ -32,10 +32,8 @@ class RdmaProvider:
 
         import s3_rdma
         ep = s3_rdma.RdmaProvider(provider="mock", role="client")
-        ep.register_memory(data)
         token = ep.prepare_put_token(data, 0, len(data), b"bucket/key")
         ep.process_rdma_reply(200, token, len(data), lambda code, reply: None)
-        ep.deregister_memory(data)
 
     Example (server role)::
 
@@ -107,26 +105,24 @@ class RdmaProvider:
 
     def register_memory(self, data: ReadableBuffer) -> None:
         """
-        Register a memory region for RDMA.
+        No-op — memory registration is handled internally by
+        :meth:`prepare_put_token` and :meth:`prepare_get_token`.
 
-        Accepts any buffer-protocol object: ``bytes``, ``bytearray``,
-        ``memoryview``, NumPy arrays, etc.
+        Accepted for backward compatibility.  The channel-based API allocates
+        and registers RDMA-eligible buffers internally when preparing tokens.
 
-        The buffer's underlying memory pointer is recorded by the provider.
-        Keep the Python object alive until :meth:`deregister_memory` is called.
-
-        :param data: the buffer to register.
-        :raises RuntimeError: if registration fails.
-        :raises BufferError: if ``data`` does not support the buffer protocol.
+        :param data: ignored.
         """
         ...
 
     def deregister_memory(self, data: ReadableBuffer) -> None:
         """
-        Deregister a previously registered memory region.
+        No-op — channel resources are released when :meth:`process_rdma_reply`
+        consumes the pending transfer.
 
-        :param data: the same buffer object passed to :meth:`register_memory`.
-        :raises RuntimeError: if deregistration fails.
+        Accepted for backward compatibility.
+
+        :param data: ignored.
         """
         ...
 
@@ -248,7 +244,6 @@ class MockRdmaProvider(RdmaProvider):
 
         import s3_rdma
         ep = s3_rdma.MockRdmaProvider(debug=True)
-        ep.register_memory(data)
         token = ep.prepare_put_token(data, 0, len(data), b"bucket/key")
         received = ep.handle_put(b"bucket/key", token, size=len(data))
     """
@@ -275,10 +270,8 @@ class CuObjProvider(RdmaProvider):
 
         import s3_rdma
         ep = s3_rdma.CuObjProvider(role="client")
-        ep.register_memory(data)
         token = ep.prepare_put_token(data, 0, len(data), b"bucket/key")
         ep.process_rdma_reply(200, token, len(data), lambda code, reply: None)
-        ep.deregister_memory(data)
 
     Example (server role)::
 

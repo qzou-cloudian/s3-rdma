@@ -245,6 +245,7 @@ impl std::fmt::Debug for RdmaPlugin {
 
 #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
 impl RdmaPlugin {
+    /// Create a new [`RdmaPlugin`] in client-only mode.
     ///
     /// Returns `Err` if the `rdma-client` feature is not compiled in or the
     /// plugin cannot be loaded.
