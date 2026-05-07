@@ -56,7 +56,6 @@
 //! |-----------------|---------------------------------------------------------------------|
 //! | `rdma-client` | Enable [`RdmaPluginClient`] / [`RdmaPlugin`] client role   |
 //! | `rdma-server` | Enable [`RdmaPluginServer`] / [`RdmaPlugin`] server role   |
-//! | `pool`          | Enable [`BufferPool`] and [`RdmaWorkerPool`]                        |
 //! | (none)          | Only [`MockRdmaProvider`] available                                 |
 
 pub(crate) mod rdma_client;
@@ -64,12 +63,8 @@ pub(crate) mod rdma_server;
 pub mod error;
 pub mod ffi;
 pub mod mock;
-#[cfg(feature = "pool")]
-pub mod buffer_pool;
 pub mod provider;
 pub mod token;
-#[cfg(feature = "pool")]
-pub mod worker_pool;
 #[cfg(feature = "pyo3")]
 mod python;
 
@@ -88,13 +83,6 @@ pub use rdma_client::RdmaPlugin;
 pub use provider::RdmaServerConfig;
 pub use token::RdmaToken;
 
-#[cfg(feature = "pool")]
-pub use worker_pool::RdmaWorkerPool;
-
-#[cfg(feature = "pool")]
-pub use buffer_pool::{BufferPool, BufferPoolBuilder, BufferPoolError, BufferRegistrar, OwnedBufferGuard};
-
-
 #[cfg(feature = "rdma-client")]
 pub use rdma_client::RdmaPluginClient;
 #[cfg(feature = "rdma-client")]
@@ -104,7 +92,6 @@ pub use rdma_client::rdma_available;
 pub use rdma_server::RdmaPluginServer;
 
 use std::sync::Arc;
-
 use tracing::info;
 
 pub use error::RdmaError;
@@ -229,59 +216,5 @@ pub fn create_server_provider(
         .map(|p| p as Arc<dyn RdmaServerProvider>)
 }
 
-/// Build a [`RdmaWorkerPool`] wrapping the named provider.
-///
-/// Returns a bounded-concurrency worker pool.  Each of `workers` threads
-/// calls `open_channel` on the underlying provider, bounding concurrent
-/// RDMA transfers to `workers`.
-///
-/// `provider` must be one of:
-/// - `"mock"`   → pool around [`MockRdmaProvider`] (requires `pool` feature)
-/// - `"cuobj"`  → pool around [`RdmaPlugin`] (requires `pool` + `rdma-server` features)
-/// - `"auto"`  → tries `"cuobj"` first, falls back to `"mock"`
-///
-/// Returned as `Box<dyn RdmaServerProvider>` — use the trait for all operations.
-#[cfg(feature = "pool")]
-pub fn create_worker_pool(
-    provider: &str,
-    debug: bool,
-    cfg: &RdmaServerConfig,
-    workers: usize,
-) -> Result<Box<dyn RdmaServerProvider>, RdmaError> {
-    let inner: Arc<dyn RdmaProvider> = match provider {
-        "mock" => {
-            if debug { info!("[rdma] MockRdmaProvider in pool ({workers} workers)"); }
-            Arc::new(MockRdmaProvider::new(debug, &cfg.shm_path, cfg.buf_size))
-        }
-        "cuobj" => {
-            #[cfg(feature = "rdma-server")]
-            {
-                let plugin = RdmaPlugin::new_server(cfg)?;
-                if debug { info!("[rdma] RdmaPlugin in pool ({workers} workers)"); }
-                Arc::new(plugin) as Arc<dyn RdmaProvider>
-            }
-            #[cfg(not(feature = "rdma-server"))]
-            {
-                let _ = (debug, cfg, workers);
-                return Err(RdmaError::ProviderUnavailable {
-                    provider: provider.to_owned(),
-                    reason: "compiled without `rdma-server` feature".into(),
-                });
-            }
-        }
-        "auto" => {
-            match create_worker_pool("cuobj", debug, cfg, workers) {
-                Ok(p) => return Ok(p),
-                Err(_) => return create_worker_pool("mock", debug, cfg, workers),
-            }
-        }
-        other => return Err(RdmaError::ProviderUnavailable {
-            provider: other.to_owned(),
-            reason: "unknown provider (valid: mock, cuobj, auto)".to_owned(),
-        }),
-    };
-    Ok(Box::new(worker_pool::RdmaWorkerPool::builder()
-        .server_workers(workers)
-        .provider(inner)
-        .build()?))
-}
+
+

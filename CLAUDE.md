@@ -13,7 +13,6 @@ cargo build --workspace
 
 # Build with specific feature flags
 cargo build --features rdma-client,rdma-server
-cargo build --features pool
 
 # Client plugin (mock backend only, no CUDA SDK needed)
 cargo build -p s3-rdma-client
@@ -115,7 +114,6 @@ let n = srv.handle_put(offset, size, Box::new(|data: &[u8]| {
 |----------|----------|-------------|
 | `MockRdmaProvider` | `src/mock.rs` | `/dev/shm` SHM files; both client+server roles; no hardware |
 | `RdmaPlugin` | `src/rdma_client.rs` + `src/rdma_server.rs` | Runtime `.so` loader via `libloading` |
-| `RdmaWorkerPool` | `src/worker_pool.rs` | Bounded-concurrency server pool wrapping any provider (feature `pool`) |
 
 ### Plugin / vtable system
 
@@ -134,9 +132,11 @@ The main binary has **no compile-time dependency** on any RDMA SDK.
 |---------|------|--------|
 | `rdma-client` | `libloading` | `RdmaPluginClient`, `rdma_available()`, unified `RdmaPlugin` |
 | `rdma-server` | `libloading` | `RdmaPluginServer`, unified `RdmaPlugin` |
-| `pool` | `crossbeam-queue`, `tokio` | `BufferPool` / `OwnedBufferGuard` + `RdmaWorkerPool` |
 | `pyo3` | `pyo3` | Python bindings (`src/python.rs`) |
 | (none) | — | Only `MockRdmaProvider` available |
+
+> **Note:** `BufferPool`, `OwnedBufferGuard`, and `RdmaWorkerPool` have moved to the
+> `hsg-rdma` crate (hsg project) which owns pool management, observability, and async APIs.
 
 ### Provider factory functions (`src/lib.rs`)
 
@@ -145,7 +145,6 @@ The main binary has **no compile-time dependency** on any RDMA SDK.
 | `create_provider(name, debug, role, cfg)` | `Arc<dyn RdmaProvider>` | name: `"mock"`, `"cuobj"`, `"auto"` |
 | `create_client_provider(name, debug, cfg)` | `Arc<dyn RdmaClientProvider>` | wrapper with `RdmaRole::Client` |
 | `create_server_provider(name, debug, cfg)` | `Arc<dyn RdmaServerProvider>` | wrapper with `RdmaRole::Server` |
-| `create_worker_pool(name, debug, cfg, workers)` | `Box<dyn RdmaServerProvider>` | bounded concurrency server (feature `pool`) |
 
 `"auto"` tries `"cuobj"` first, falls back to `"mock"`.
 
@@ -157,13 +156,10 @@ The main binary has **no compile-time dependency** on any RDMA SDK.
 - **`RdmaError`** (`src/error.rs`): Error enum.  `is_fallback_eligible()` returns `true`
   for errors where downgrading to plain HTTP is safe (plugin unavailable, buffer too small, etc.).
 - **`ByteCursor`** (`src/ffi.rs`): C-ABI `{ptr, len}` struct for crossing plugin boundaries.
-- **`BufferPool`** (feature `pool`, `src/buffer_pool.rs`): Thread-safe pool of 4 KiB-aligned
-  pre-registered buffers.  Methods: `try_acquire_owned`, `acquire_owned` (async),
-  `acquire_owned_blocking`.
 - **`RdmaServerConfig`** (`src/provider.rs`): Unified config for server providers.
   Fields: `shm_path` (mock), `listen_addr`/`listen_port`/`buf_size` (cuObj).
 
-### HTTP protocol constants (`core/src/provider.rs`)
+### HTTP protocol constants (`src/provider.rs`)
 
 ```
 RDMA_TOKEN_HEADER  = "x-amz-rdma-token"
@@ -175,7 +171,7 @@ RDMA_TOKEN_SEPARATOR = '|'
 
 ### Language bindings
 
-**Python (`core/src/python.rs`, built via `bindings/python/`):**
+**Python (`src/python.rs`, built via `bindings/python/`):**
 - `PyRdmaProvider` holds `Arc<dyn RdmaProvider>` + `Mutex<HashMap<Vec<u8>, PendingTransfer>>`
 - `prepare_put_token` / `prepare_get_token` call `bind()` and store the channel in the pending map
 - `process_rdma_reply` looks up the pending transfer, calls `complete_put/get`, invokes callback
