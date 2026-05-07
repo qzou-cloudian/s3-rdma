@@ -24,37 +24,7 @@ mod real {
     use crate::ffi::{ByteCursor, CTelemetryConfig, GetNamedClientVtableFn, RdmaProviderVtable};
     use crate::provider::{RdmaClientChannel, TelemetryConfig, TelemLevel};
 
-    // ── Library search ────────────────────────────────────────────────────────
-
     const LIB_NAME: &str = "libs3rdmaclient.so";
-
-    fn try_load(path: impl AsRef<std::ffi::OsStr>) -> Option<Library> {
-        unsafe { Library::new(path) }.ok()
-    }
-
-    fn find_library() -> Option<Library> {
-        // Search order:
-        //   1. Standard linker paths (LD_LIBRARY_PATH, RPATH, ldconfig)
-        //   2. Directory alongside the running executable
-        //   3. Common RDMA SDK install locations
-        if let Some(lib) = try_load(LIB_NAME) {
-            return Some(lib);
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                if let Some(lib) = try_load(dir.join(LIB_NAME)) {
-                    return Some(lib);
-                }
-            }
-        }
-        for dir in &["/lib64", "/usr/lib64"] {
-            if let Some(lib) = try_load(format!("{dir}/{LIB_NAME}")) {
-                return Some(lib);
-            }
-        }
-        None
-    }
-
     // ── RdmaPluginClient ──────────────────────────────────────────────────
 
     /// RDMA client provider that loads `libs3rdmaclient.so` at runtime and
@@ -86,7 +56,7 @@ mod real {
         /// the underlying RDMA SDK `.so` is missing), or the vtable's
         /// `init` fails.
         pub fn new() -> Result<Self, RdmaError> {
-            let lib = find_library().ok_or_else(|| {
+            let lib = crate::ffi::find_library(LIB_NAME).ok_or_else(|| {
                 RdmaError::RdmaPluginLoadFailed(
                     format!("{LIB_NAME} not found \
                              (searched LD_LIBRARY_PATH, exe dir, /lib64)")
@@ -223,7 +193,7 @@ mod real {
     /// not initialise the hardware backend (which may still fail at
     /// construction time if no GPU is available).
     pub fn is_available() -> bool {
-        find_library().is_some()
+        crate::ffi::find_library(LIB_NAME).is_some()
     }
 }
 

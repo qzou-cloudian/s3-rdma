@@ -43,7 +43,7 @@ fn main() {
             let srv = server.open_channel(key, token).unwrap();
             let n = srv.handle_get(0, 0, Box::new(|buf: &mut [u8]| {
                 buf[..4].copy_from_slice(b"pong");
-                4
+                Ok(4)
             })).unwrap();
             println!("GET:  server wrote {} bytes", n);
             Ok((200, n))

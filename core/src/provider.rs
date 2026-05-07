@@ -467,7 +467,7 @@ pub trait RdmaServerChannel: Send + Sync {
     /// Zero-copy RDMA GET: call `read` to fill the buffer from storage, then
     /// RDMA-write it to the client.  The closure receives a `&mut [u8]` view
     /// of the RDMA-registered buffer to fill and returns the number of bytes
-    /// written into it.
+    /// written into it, or an error.
     ///
     /// `offset` is the byte offset into the client's registered buffer.
     /// `size` is the number of bytes to transfer (0 = use token capacity).
@@ -475,7 +475,7 @@ pub trait RdmaServerChannel: Send + Sync {
         &self,
         offset: usize,
         size:   usize,
-        read:   Box<dyn FnOnce(&mut [u8]) -> usize + Send + '_>,
+        read:   Box<dyn FnOnce(&mut [u8]) -> Result<usize, crate::error::RdmaError> + Send + '_>,
     ) -> Result<usize, crate::error::RdmaError>;
 
     /// The S3 object key this channel is bound to.

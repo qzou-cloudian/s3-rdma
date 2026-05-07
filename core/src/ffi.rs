@@ -314,3 +314,32 @@ unsafe impl Sync for RdmaServerVtable {}
 /// the provider name is not recognised.
 pub type GetNamedServerVtableFn =
     unsafe extern "C" fn(name: *const c_char) -> *const RdmaServerVtable;
+
+// ── Shared library loader ─────────────────────────────────────────────────
+
+/// Search for `lib_name` in standard locations and return the loaded library.
+///
+/// Requires `rdma-client` or `rdma-server` feature for `libloading`.
+/// Search order: LD_LIBRARY_PATH → executable directory → `/lib64/` → `/usr/lib64/`.
+#[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
+pub fn find_library(lib_name: &str) -> Option<libloading::Library> {
+    fn try_load(path: impl AsRef<std::ffi::OsStr>) -> Option<libloading::Library> {
+        unsafe { libloading::Library::new(path) }.ok()
+    }
+    if let Some(lib) = try_load(lib_name) {
+        return Some(lib);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if let Some(lib) = try_load(dir.join(lib_name)) {
+                return Some(lib);
+            }
+        }
+    }
+    for dir in &["/lib64", "/usr/lib64"] {
+        if let Some(lib) = try_load(format!("{dir}/{lib_name}")) {
+            return Some(lib);
+        }
+    }
+    None
+}

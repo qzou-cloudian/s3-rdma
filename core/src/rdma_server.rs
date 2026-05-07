@@ -20,29 +20,6 @@ mod real {
 
     const LIB_NAME: &str = "libs3rdmaserver.so";
 
-    fn try_load(path: impl AsRef<std::ffi::OsStr>) -> Option<Library> {
-        unsafe { Library::new(path) }.ok()
-    }
-
-    fn find_library() -> Option<Library> {
-        if let Some(lib) = try_load(LIB_NAME) {
-            return Some(lib);
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                if let Some(lib) = try_load(dir.join(LIB_NAME)) {
-                    return Some(lib);
-                }
-            }
-        }
-        for dir in &["/lib64", "/usr/lib64"] {
-            if let Some(lib) = try_load(format!("{dir}/{LIB_NAME}")) {
-                return Some(lib);
-            }
-        }
-        None
-    }
-
     // ── RdmaPluginServer ──────────────────────────────────────────────────
 
     /// RDMA server provider that loads `libs3rdmaserver.so` at runtime.
@@ -62,7 +39,7 @@ mod real {
     impl RdmaPluginServer {
         /// Load the plugin and initialise it with the given config.
         pub fn new(cfg: &RdmaServerConfig) -> Result<Self, RdmaError> {
-            let lib = find_library().ok_or_else(|| {
+            let lib = crate::ffi::find_library(LIB_NAME).ok_or_else(|| {
                 RdmaError::RdmaPluginLoadFailed(
                     format!("{LIB_NAME} not found \
                              (searched LD_LIBRARY_PATH, exe dir, /lib64, /usr/lib64)")

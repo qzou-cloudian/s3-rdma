@@ -108,14 +108,14 @@ impl RdmaServerChannel for SyncChannel {
 
     fn handle_get(
         &self, offset: usize, _size: usize,
-        read: Box<dyn FnOnce(&mut [u8]) -> usize + Send + '_>,
+        read: Box<dyn FnOnce(&mut [u8]) -> Result<usize, RdmaError> + Send + '_>,
     ) -> Result<usize, RdmaError> {
         let guard = self.get_buffer()?;
         let b = guard.as_ref().unwrap();
         let ks = std::str::from_utf8(&self.key).unwrap_or("");
         let ts = std::str::from_utf8(&self.token).unwrap_or("");
         let buf = unsafe { std::slice::from_raw_parts_mut(b.as_ptr() as *mut u8, b.len()) };
-        let n = read(buf);
+        let n = read(buf)?;
         b.handle_get(ks, offset, n, ts, Some(self.channel_id))
             .map_err(|e| RdmaError::TransferFailed(format!("{e:?}")))
     }

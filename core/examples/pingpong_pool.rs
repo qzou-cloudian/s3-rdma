@@ -61,7 +61,7 @@ fn main() {
             let n = ch.handle_get(0, 0, Box::new(move |buf: &mut [u8]| {
                 let n = pong.len().min(buf.len());
                 buf[..n].copy_from_slice(&pong[..n]);
-                n
+                Ok(n)
             })).unwrap();
             println!("GET:  written {} bytes", n);
             Ok::<(u16, usize), s3_rdma::RdmaError>((200, n))

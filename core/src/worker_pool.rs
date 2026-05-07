@@ -47,7 +47,7 @@ enum ServerOp {
         token:     Vec<u8>,
         offset:    usize,
         size:      usize,
-        read:      usize,  // Box<Box<dyn FnOnce(&mut [u8]) -> usize + Send>> as *mut _ as usize
+        read:      usize,  // Box<Box<dyn FnOnce(&mut [u8]) -> Result<usize, RdmaError> + Send>> as *mut _ as usize
         result_tx: SyncSender<Result<usize, String>>,
     },
 }
@@ -107,7 +107,7 @@ fn server_worker_main(
                 let _ = result_tx.send(r);
             }
             ServerOp::Get { key, token, offset, size, read, result_tx } => {
-                let read = *unsafe { Box::from_raw(read as *mut Box<dyn FnOnce(&mut [u8]) -> usize + Send>) };
+                let read = *unsafe { Box::from_raw(read as *mut Box<dyn FnOnce(&mut [u8]) -> Result<usize, RdmaError> + Send>) };
                 let r = (|| -> Result<usize, RdmaError> {
                     let ch = RdmaServerProvider::open_channel(provider.as_ref(), &key, &token)?;
                     ch.handle_get(offset, size, read)
@@ -196,7 +196,7 @@ impl RdmaServerChannel for PoolServerChannel {
 
     fn handle_get(
         &self, offset: usize, size: usize,
-        read: Box<dyn FnOnce(&mut [u8]) -> usize + Send + '_>,
+        read: Box<dyn FnOnce(&mut [u8]) -> Result<usize, RdmaError> + Send + '_>,
     ) -> Result<usize, RdmaError> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.sender.send(ServerOp::Get {
@@ -337,7 +337,7 @@ mod tests {
                 let n = srv_ch.handle_get(0, 0, Box::new(|buf: &mut [u8]| {
                     let n = payload.len().min(buf.len());
                     buf[..n].copy_from_slice(&payload[..n]);
-                    n
+                    Ok(n)
                 })).unwrap();
                 Ok((200, n))
             });

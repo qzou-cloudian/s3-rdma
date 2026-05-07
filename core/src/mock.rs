@@ -109,7 +109,7 @@ impl RdmaServerChannel for MockServerChannel {
 
     fn handle_get(
         &self, offset: usize, size: usize,
-        read: Box<dyn FnOnce(&mut [u8]) -> usize + Send + '_>,
+        read: Box<dyn FnOnce(&mut [u8]) -> Result<usize, RdmaError> + Send + '_>,
     ) -> Result<usize, RdmaError> {
         if self.op != "GET" {
             return Err(RdmaError::TransferFailed(format!("expected GET token, got {}", self.op)));
@@ -117,7 +117,7 @@ impl RdmaServerChannel for MockServerChannel {
         let cap = if size > 0 { size } else { self.token_size };
         let capacity = cap.saturating_sub(offset);
         let mut buf = vec![0u8; capacity];
-        let n = read(&mut buf);
+        let n = read(&mut buf)?;
         let write_start = self.token_offset + offset;
         let path = format!("{}/{}", self.shm_dir, self.shm_name);
         self.dbg(&format!("handle_get shm={} write={n}/{} write_start={write_start}", self.shm_name, capacity));
@@ -504,7 +504,7 @@ mod tests {
                 let n = srv.handle_get(0, 0, Box::new(|buf: &mut [u8]| {
                     let n = payload.len().min(buf.len());
                     buf[..n].copy_from_slice(&payload[..n]);
-                    n
+                    Ok(n)
                 })).unwrap();
                 Ok((200, n))
             }),
@@ -571,7 +571,7 @@ mod tests {
                 let n = srv.handle_get(0, 0, Box::new(|buf: &mut [u8]| {
                     let n = payload.len().min(buf.len());
                     buf[..n].copy_from_slice(&payload[..n]);
-                    n
+                    Ok(n)
                 })).unwrap();
                 Ok((200, n))
             }),
