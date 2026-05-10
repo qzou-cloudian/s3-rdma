@@ -27,7 +27,7 @@ fn run_server() {
     use s3_rdma::provider::{RdmaServerConfig, RdmaServerProvider};
     use s3_rdma::RdmaPlugin;
 
-    let rdma_ip   = std::env::var("RDMA_IP").unwrap_or_else(|_| "10.50.132.250".into());
+    let rdma_ip   = std::env::var("RDMA_IP").unwrap_or_else(|_| "127.0.0.1".into());
     let rdma_port = std::env::var("RDMA_PORT").unwrap_or_else(|_| "4421".into()).parse().unwrap();
     let ctrl_port: u16 = std::env::var("CTRL_PORT").unwrap_or_else(|_| "7072".into()).parse().unwrap();
 

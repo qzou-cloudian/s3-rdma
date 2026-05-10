@@ -13,6 +13,18 @@ use s3_rdma::error::RdmaError;
 use s3_rdma::provider::DEFAULT_RDMA_BUF_SIZE;
 use s3_rdma::provider::RdmaServerChannel;
 
+/// Wraps a `*mut c_void` user-data pointer so it can cross thread boundaries.
+///
+/// # Safety
+/// The C FFI contract (see `RdmaIoWriteFn`/`RdmaIoReadFn` docs) requires that
+/// the user-data pointer be thread-safe.  We assert `Send` here to satisfy the
+/// `Box<dyn FnOnce + Send>` bound on the trait methods.
+struct SendPtr(*mut c_void);
+unsafe impl Send for SendPtr {}
+impl SendPtr {
+    fn get(&self) -> *mut c_void { self.0 }
+}
+
 static PROVIDER_NAME: &[u8] = b"s3-rdma-server-cuobj\0";
 
 struct ServerProvider {
@@ -133,9 +145,16 @@ unsafe extern "C" fn c_handle_put(
     if s3_key.is_null() || token.is_null() || out_transferred.is_null() { return -1; }
     let Some(p) = get_provider() else { return -1 };
     let k = unsafe { (*s3_key).as_slice() }; let t = unsafe { (*token).as_slice() };
-    match open_channel_sync(p, k, t)
-        .and_then(|ch| unsafe { ch.handle_put(offset, size, write_fn, write_fn_data) })
-    {
+    let data = SendPtr(write_fn_data);
+    let write = Box::new(move |buf: &[u8]| {
+        let n = unsafe { write_fn(data.get(), buf.as_ptr() as *const c_void, buf.len()) };
+        if n < 0 {
+            Err(RdmaError::TransferFailed(format!("write_fn returned {n}")))
+        } else {
+            Ok(n as usize)
+        }
+    });
+    match open_channel_sync(p, k, t).and_then(|ch| ch.handle_put(offset, size, write)) {
         Ok(n) => { unsafe { *out_transferred = n; } 0 }
         Err(e) => { error!("[s3-rdma-server] handle_put: {e}"); -1 }
     }
@@ -149,9 +168,16 @@ unsafe extern "C" fn c_handle_get(
     if s3_key.is_null() || token.is_null() || out_written.is_null() { return -1; }
     let Some(p) = get_provider() else { return -1 };
     let k = unsafe { (*s3_key).as_slice() }; let t = unsafe { (*token).as_slice() };
-    match open_channel_sync(p, k, t)
-        .and_then(|ch| unsafe { ch.handle_get(offset, read_fn, read_fn_data) })
-    {
+    let data = SendPtr(read_fn_data);
+    let read = Box::new(move |buf: &mut [u8]| {
+        let n = unsafe { read_fn(data.get(), buf.as_mut_ptr() as *mut c_void, buf.len()) };
+        if n < 0 {
+            Err(RdmaError::TransferFailed(format!("read_fn returned {n}")))
+        } else {
+            Ok(n as usize)
+        }
+    });
+    match open_channel_sync(p, k, t).and_then(|ch| ch.handle_get(offset, 0, read)) {
         Ok(n) => { unsafe { *out_written = n; } 0 }
         Err(e) => { error!("[s3-rdma-server] handle_get: {e}"); -1 }
     }
@@ -218,9 +244,13 @@ pub fn vtable() -> *const RdmaServerVtable { &VTABLE }
 mod tests {
     use super::*;
 
+    fn rdma_ip() -> String {
+        std::env::var("RDMA_IP").unwrap_or_else(|_| "127.0.0.1".into())
+    }
+
     #[test]
     fn sync_channel_creation_and_drop() {
-        let srv = Arc::new(CuObjServer::new("10.50.132.250", 4430).expect("CuObjServer::new"));
+        let srv = Arc::new(CuObjServer::new(&rdma_ip(), 4430).expect("CuObjServer::new"));
         let p = ServerProvider { server: Arc::clone(&srv), buf_size: 4096 };
         let key = b"test/key";
         let token = b"deadbeef:1000:cafe"; // minimal cuobj token: vaddr:size:rkey
@@ -236,7 +266,7 @@ mod tests {
 
     #[test]
     fn sync_channel_rejects_invalid_token() {
-        let srv = Arc::new(CuObjServer::new("10.50.132.250", 4431).expect("CuObjServer::new"));
+        let srv = Arc::new(CuObjServer::new(&rdma_ip(), 4431).expect("CuObjServer::new"));
         let p = ServerProvider { server: Arc::clone(&srv), buf_size: 4096 };
         // Invalid token — no colon delimiter.
         let result = open_channel_sync(&p, b"key", b"invalid_token");
@@ -247,7 +277,7 @@ mod tests {
 
     #[test]
     fn provider_init_and_cleanup() {
-        let srv = Arc::new(CuObjServer::new("10.50.132.250", 4432).expect("CuObjServer::new"));
+        let srv = Arc::new(CuObjServer::new(&rdma_ip(), 4432).expect("CuObjServer::new"));
         assert!(srv.is_connected());
         let p = Box::new(ServerProvider { server: srv, buf_size: 4096 });
         drop(p);
@@ -256,7 +286,7 @@ mod tests {
 
     #[test]
     fn cuobj_connectivity() {
-        let srv = Arc::new(CuObjServer::new("10.50.132.250", 4433).expect("CuObjServer::new"));
+        let srv = Arc::new(CuObjServer::new(&rdma_ip(), 4433).expect("CuObjServer::new"));
         assert!(srv.is_connected(), "RDMA fabric not connected");
         let ch = srv.alloc_channel().expect("alloc_channel");
         let id = ch.id();
@@ -268,7 +298,7 @@ mod tests {
 
     #[test]
     fn server_multiple_channels() {
-        let srv = Arc::new(CuObjServer::new("10.50.132.250", 4434).expect("CuObjServer::new"));
+        let srv = Arc::new(CuObjServer::new(&rdma_ip(), 4434).expect("CuObjServer::new"));
         let mut ids = Vec::new();
         for _ in 0..4 {
             let ch = srv.alloc_channel().expect("alloc");
@@ -284,7 +314,7 @@ mod tests {
 
     #[test]
     fn server_persistent_buffer_lifecycle() {
-        let srv = Arc::new(CuObjServer::new("10.50.132.250", 4435).expect("CuObjServer::new"));
+        let srv = Arc::new(CuObjServer::new(&rdma_ip(), 4435).expect("CuObjServer::new"));
         let ch = srv.alloc_channel().expect("alloc");
         let cid = ch.id(); std::mem::forget(ch);
         let buf = PersistentBuffer::new(Arc::clone(&srv), 4096).expect("PersistentBuffer::new");
@@ -298,7 +328,7 @@ mod tests {
     #[test]
     fn server_register_existing_buffer() {
         use std::alloc::{Layout, alloc, dealloc};
-        let srv = Arc::new(CuObjServer::new("10.50.132.250", 4436).expect("CuObjServer::new"));
+        let srv = Arc::new(CuObjServer::new(&rdma_ip(), 4436).expect("CuObjServer::new"));
         let layout = Layout::from_size_align(4096, 4096).unwrap();
         let ptr = unsafe { alloc(layout) };
         let rbuf = srv.register_existing_buffer(ptr, 4096)
