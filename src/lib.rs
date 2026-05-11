@@ -70,7 +70,7 @@ mod python;
 
 // ── Primary public API ────────────────────────────────────────────────────────
 
-pub use provider::{RdmaRole, RdmaProvider, RdmaProviderConfig, RdmaProviderBase};
+pub use provider::{RdmaRole, RdmaProvider, RdmaProviderConfig, RdmaProviderConfigBuilder, RdmaProviderBase};
 pub use provider::{RdmaServerChannel, RdmaClientChannel, RdmaClientChannelExt, RdmaServerChannelExt, RdmaClientProvider, RdmaServerProvider, RdmaTransferHandle};
 pub use provider::{TelemetryConfig, TelemLevel, TelemState};
 pub use provider::{DEFAULT_RDMA_BUF_SIZE, RDMA_REQUIRED_ALIGNMENT};
@@ -136,6 +136,8 @@ pub fn rdma_provider_info() -> String {
 /// Returns [`RdmaError::ProviderUnavailable`] if the name is unrecognised,
 /// the required feature is not compiled in, or the underlying SDK fails to
 /// initialise.
+#[deprecated(since = "0.4.0", note = "use `RdmaProviderConfig::builder()` instead")]
+#[allow(deprecated)]
 pub fn create_provider(
     provider: &str,
     debug: bool,
@@ -210,6 +212,8 @@ pub fn create_provider(
 ///
 /// Convenience wrapper around [`create_provider`] with [`RdmaRole::Client`].
 /// No server configuration is needed — the provider is client-only.
+#[deprecated(since = "0.4.0", note = "use `RdmaProviderConfig::builder().build_client()` instead")]
+#[allow(deprecated)]
 pub fn create_client_provider(
     provider: &str,
     debug: bool,
@@ -222,6 +226,8 @@ pub fn create_client_provider(
 ///
 /// Convenience wrapper around [`create_provider`] with [`RdmaRole::Server`].
 /// The `cfg` provides listen address, port, and buffer size for the server.
+#[deprecated(since = "0.4.0", note = "use `RdmaProviderConfig::builder().build_server()` instead")]
+#[allow(deprecated)]
 pub fn create_server_provider(
     provider: &str,
     debug: bool,

@@ -47,10 +47,10 @@ static VTABLE: RdmaProviderVtable = RdmaProviderVtable {
     init:               Some(c_init),
     cleanup:            Some(c_cleanup),
     bind_channel:       Some(c_bind_channel),
-    supports_telemetry: None,
-    setup_telemetry:    None,
-    shutdown_telemetry: None,
-    set_telem_level:    None,
+    supports_telemetry: Some(crate::telem::supports),
+    setup_telemetry:    Some(crate::telem::setup),
+    shutdown_telemetry: Some(crate::telem::shutdown),
+    set_telem_level:    Some(crate::telem::set_level),
 };
 
 pub fn vtable() -> *const RdmaProviderVtable {

@@ -17,7 +17,7 @@ use s3_rdma::provider::{
     InflightTransfers, PendingTransfer,
     RdmaRole, RdmaServerChannelExt,
 };
-use s3_rdma::provider::{RdmaServerConfig, DEFAULT_RDMA_BUF_SIZE};
+use s3_rdma::provider::{RdmaProviderConfig, DEFAULT_RDMA_BUF_SIZE};
 use s3_rdma::provider::TelemetryConfig;
 
 fn throw(env: &mut JNIEnv<'_>, msg: &str) {
@@ -63,7 +63,7 @@ fn parse_role(role: &str) -> Option<RdmaRole> {
 // ── Factory ───────────────────────────────────────────────────────────────────
 
 /// `RdmaProvider.nativeCreate(provider, role, debug, shmPath, listenAddr,
-///                             listenPort, poolCount, bufSize) -> long`
+///                             listenPort, bufSize) -> long`
 #[no_mangle]
 pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeCreate(
     mut env:        JNIEnv<'_>,
@@ -74,8 +74,6 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeCreate(
     shm_path:       JString<'_>,
     listen_addr:    JString<'_>,
     listen_port:    jni::sys::jint,
-    // Pool management moved to hsg-rdma; accepted for Java ABI stability, unused.
-    _pool_count:    jni::sys::jint,
     buf_size:       jlong,
 ) -> jlong {
     macro_rules! jstr {
@@ -86,10 +84,10 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeCreate(
             }
         };
     }
-    let provider_str  = jstr!(provider);
-    let role_str      = jstr!(role);
-    let shm_path_str  = jstr!(shm_path);
-    let listen_str    = jstr!(listen_addr);
+    let provider_str = jstr!(provider);
+    let role_str     = jstr!(role);
+    let shm_path_str = jstr!(shm_path);
+    let listen_str   = jstr!(listen_addr);
 
     let provider_role = match parse_role(&role_str) {
         Some(r) => r,
@@ -100,14 +98,18 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeCreate(
             return 0;
         }
     };
-    let cfg = RdmaServerConfig {
-        shm_path:       shm_path_str,
-        listen_addr:    listen_str,
-        listen_port:    listen_port as u16,
-        buf_size:       buf_size as usize,
-    };
 
-    match s3_rdma::create_provider(&provider_str, debug == JNI_TRUE, provider_role, Some(&cfg)) {
+    let result = RdmaProviderConfig::builder()
+        .provider(&provider_str)
+        .debug(debug == JNI_TRUE)
+        .role(provider_role)
+        .shm_path(shm_path_str)
+        .listen_addr(listen_str)
+        .listen_port(listen_port as u16)
+        .buf_size(buf_size as usize)
+        .build();
+
+    match result {
         Ok(arc) => {
             let state = Box::new(ProviderState {
                 provider:    arc,
@@ -116,7 +118,7 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeCreate(
             });
             Box::into_raw(state) as jlong
         }
-        Err(e)  => { throw(&mut env, &e.to_string()); 0 }
+        Err(e) => { throw(&mut env, &e.to_string()); 0 }
     }
 }
 

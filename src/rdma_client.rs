@@ -357,14 +357,6 @@ impl crate::provider::RdmaClientProvider for RdmaPlugin {
         Err(crate::RdmaError::OperationNotSupported { reason: "rdma client not loaded".into() })
     }
 
-    fn bind_registered(&self, key: &[u8]) -> Result<Box<dyn crate::provider::RdmaClientChannel>, crate::RdmaError> {
-        #[cfg(feature = "rdma-client")]
-        if let Some(c) = &self.client {
-            return c.bind(DEFAULT_RDMA_BUF_SIZE, key);
-        }
-        let _ = key;
-        Err(crate::RdmaError::OperationNotSupported { reason: "rdma client not loaded".into() })
-    }
 }
 
 #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
@@ -387,17 +379,19 @@ impl crate::provider::RdmaServerProvider for RdmaPlugin {
 
 #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
 impl crate::provider::RdmaProvider for RdmaPlugin {
-    fn supports_client(&self) -> bool {
-        #[cfg(feature = "rdma-client")]
-        { self.client.is_some() }
-        #[cfg(not(feature = "rdma-client"))]
-        { false }
-    }
-
-    fn supports_server(&self) -> bool {
-        #[cfg(feature = "rdma-server")]
-        { self.server.is_some() }
-        #[cfg(not(feature = "rdma-server"))]
-        { false }
+    fn role(&self) -> crate::provider::RdmaRole {
+        let has_client = {
+            #[cfg(feature = "rdma-client")] { self.client.is_some() }
+            #[cfg(not(feature = "rdma-client"))] { false }
+        };
+        let has_server = {
+            #[cfg(feature = "rdma-server")] { self.server.is_some() }
+            #[cfg(not(feature = "rdma-server"))] { false }
+        };
+        match (has_client, has_server) {
+            (true, false) => crate::provider::RdmaRole::Client,
+            (false, true) => crate::provider::RdmaRole::Server,
+            _             => crate::provider::RdmaRole::Both,
+        }
     }
 }

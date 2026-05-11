@@ -17,6 +17,8 @@
 use std::os::raw::c_char;
 use s3_rdma::ffi::RdmaServerVtable;
 
+mod telem;
+
 // ── Mock backend ──────────────────────────────────────────────────────────────
 
 #[cfg(feature = "mock")]

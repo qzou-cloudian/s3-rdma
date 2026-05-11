@@ -404,10 +404,18 @@ impl RdmaClientProvider for MockRdmaProvider {
         }))
     }
 
-    fn bind_registered(&self, key: &[u8]) -> Result<Box<dyn RdmaClientChannel>, RdmaError> {
+}
+
+impl MockRdmaProvider {
+    /// Bind a pre-registered buffer from the provider's internal pool.
+    ///
+    /// Uses a buffer that was previously allocated and registered (e.g. at pool
+    /// construction time).  Dropping the channel does **not** free the buffer
+    /// — it returns to the pool.  Only available on [`MockRdmaProvider`]
+    /// directly; use [`RdmaClientProvider::bind`] for the general API.
+    pub fn bind_registered(&self, key: &[u8]) -> Result<Box<dyn RdmaClientChannel>, RdmaError> {
         self.dbg(&format!("bind_registered key={}", String::from_utf8_lossy(key)));
         // Use the first available registered buffer from the pool.
-        // If none are registered, return error.
         let reg = self.registered.lock().unwrap();
         let (&ptr_key, entry) = reg.iter().next().ok_or_else(|| {
             RdmaError::OperationNotSupported { reason: "no registered buffers available".into() }
@@ -451,8 +459,7 @@ impl RdmaServerProvider for MockRdmaProvider {
 }
 
 impl RdmaProvider for MockRdmaProvider {
-    fn supports_client(&self) -> bool { true }
-    fn supports_server(&self) -> bool { true }
+    fn role(&self) -> crate::provider::RdmaRole { crate::provider::RdmaRole::Both }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

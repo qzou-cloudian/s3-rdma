@@ -7,11 +7,10 @@ package io.s3rdma;
  *
  * <table border="1">
  *   <tr><th>Field</th><th>mock</th><th>cuobj</th></tr>
- *   <tr><td>{@link #shmPath}</td><td>✓</td><td>–</td></tr>
- *   <tr><td>{@link #listenAddr}</td><td>–</td><td>✓</td></tr>
- *   <tr><td>{@link #listenPort}</td><td>–</td><td>✓</td></tr>
- *   <tr><td>{@link #poolCount}</td><td>–</td><td>✓</td></tr>
- *   <tr><td>{@link #bufSize}</td><td>–</td><td>✓</td></tr>
+ *   <tr><td>{@link #shmPath}</td><td>&#x2713;</td><td>&#x2013;</td></tr>
+ *   <tr><td>{@link #listenAddr}</td><td>&#x2013;</td><td>&#x2713;</td></tr>
+ *   <tr><td>{@link #listenPort}</td><td>&#x2013;</td><td>&#x2713;</td></tr>
+ *   <tr><td>{@link #bufSize}</td><td>&#x2013;</td><td>&#x2713;</td></tr>
  * </table>
  *
  * <p>Obtain defaults via {@link #defaults()}:</p>
@@ -36,8 +35,12 @@ public final class RdmaProviderConfig {
     /** RDMA listen port for the cuObj server provider. */
     public int listenPort = 0;
 
-    /** Number of pre-allocated buffer pool slots (cuObj server provider). Default: 4. */
-    public int poolCount = 4;
+    /**
+     * @deprecated Pool management has moved to hsg-rdma; this field is ignored.
+     *             Will be removed in a future release.
+     */
+    @Deprecated
+    public int poolCount = 0;
 
     /** Size in bytes of each buffer pool slot (cuObj server). Default: 128 MiB. */
     public long bufSize = 128L * 1024 * 1024;

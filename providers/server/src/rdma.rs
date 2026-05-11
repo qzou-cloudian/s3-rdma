@@ -210,27 +210,38 @@ unsafe extern "C" fn c_open_channel(
     }
 }
 
-// ── Telemetry ────────────────────────────────────────────────────────────────
 
-// Duplicated verbatim in providers/client/src/rdma.rs — these are separate cdylib
-// crates with no shared dep; keep both copies in sync when changing flag values.
+// ── Telemetry ────────────────────────────────────────────────────────────────
+// Map our 0-3 level to the cuobj SDK flag bits (CUOBJ_LOG_PATH_*).
+// Kept in sync with providers/client/src/rdma.rs.
 fn level_to_cuobj_flags(level: u32) -> u32 {
     match level { 0 => 0, 1 => 0x0004, 2 => 0x0005, _ => 0x0007 }
 }
 
-unsafe extern "C" fn c_supports_telemetry(_: *mut c_void) -> i32 { 1 }
-unsafe extern "C" fn c_setup_telemetry(_: *mut c_void, cfg: *const CTelemetryConfig) -> i32 {
-    if cfg.is_null() { return -1; }
+unsafe extern "C" fn c_setup_telemetry(ctx: *mut c_void, cfg: *const CTelemetryConfig) -> i32 {
+    let rc = crate::telem::setup(ctx, cfg);
+    if rc != 0 || cfg.is_null() { return rc; }
     let c = unsafe { &*cfg };
-    let log_file = if c.log_file.is_null() { None }
-        else { Some(unsafe { std::ffi::CStr::from_ptr(c.log_file) }.to_string_lossy()) };
+    let log_file = if c.log_file.is_null() {
+        None
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(c.log_file) }.to_str().ok().map(str::to_owned)
+    };
     CuObjServer::setup_telemetry(c.use_otel != 0, log_file.as_deref());
     CuObjServer::set_telem_flags(level_to_cuobj_flags(c.level));
     0
 }
-unsafe extern "C" fn c_shutdown_telemetry(_: *mut c_void) -> i32 { CuObjServer::shutdown_telemetry(); 0 }
-unsafe extern "C" fn c_set_telem_level(_: *mut c_void, level: u32) -> i32 {
-    CuObjServer::set_telem_flags(level_to_cuobj_flags(level)); 0
+
+unsafe extern "C" fn c_shutdown_telemetry(ctx: *mut c_void) -> i32 {
+    crate::telem::shutdown(ctx);
+    CuObjServer::shutdown_telemetry();
+    0
+}
+
+unsafe extern "C" fn c_set_telem_level(ctx: *mut c_void, level: u32) -> i32 {
+    crate::telem::set_level(ctx, level);
+    CuObjServer::set_telem_flags(level_to_cuobj_flags(level));
+    0
 }
 
 // ── Vtable ───────────────────────────────────────────────────────────────────
@@ -240,9 +251,9 @@ static VTABLE: RdmaServerVtable = RdmaServerVtable {
     provider_version:    6,
     init:                Some(c_init),
     cleanup:             Some(c_cleanup),
-    handle_put:  Some(c_handle_put),
-    handle_get:  Some(c_handle_get),
-    supports_telemetry:  Some(c_supports_telemetry),
+    handle_put:          Some(c_handle_put),
+    handle_get:          Some(c_handle_get),
+    supports_telemetry:  Some(crate::telem::supports),
     setup_telemetry:     Some(c_setup_telemetry),
     shutdown_telemetry:  Some(c_shutdown_telemetry),
     set_telem_level:     Some(c_set_telem_level),

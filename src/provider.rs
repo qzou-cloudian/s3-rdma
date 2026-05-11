@@ -158,6 +158,10 @@ pub enum RdmaRole {
     Both,
 }
 
+impl Default for RdmaRole {
+    fn default() -> Self { Self::Both }
+}
+
 // ── RdmaTransferHandle ─────────────────────────────────────────────────────────
 
 /// Handle for an in-flight RDMA transfer (PUT or GET).
@@ -435,19 +439,6 @@ pub trait RdmaClientProvider: RdmaProviderBase {
          })
     }
 
-    /// Bind a pre-registered buffer from the provider's internal pool.
-    ///
-    /// Like [`bind`](Self::bind), but uses a buffer that was previously
-    /// allocated and registered (e.g. at pool construction time).  Dropping
-    /// the channel does **not** free the buffer — it returns to the pool.
-    fn bind_registered(
-        &self,
-        _key: &[u8],
-    ) -> Result<Box<dyn RdmaClientChannel>, crate::error::RdmaError> {
-        Err(crate::error::RdmaError::OperationNotSupported { reason: 
-            "bind_registered: not supported by this provider".into(),
-         })
-    }
 }
 
 // ── RdmaServerChannel trait ─────────────────────────────────────────────────────────
@@ -615,11 +606,18 @@ pub trait RdmaServerProvider: RdmaProviderBase {
 /// - [`RdmaPlugin`] – loads `libs3rdmaclient.so` / `libs3rdmaserver.so` at
 ///   runtime for real NVIDIA cuObject RDMA hardware.
 pub trait RdmaProvider: RdmaClientProvider + RdmaServerProvider {
+    /// The role(s) this provider was initialised with.
+    fn role(&self) -> RdmaRole;
+
     /// Returns `true` if this provider supports client-side operations.
-    fn supports_client(&self) -> bool;
+    fn supports_client(&self) -> bool {
+        matches!(self.role(), RdmaRole::Client | RdmaRole::Both)
+    }
 
     /// Returns `true` if this provider supports server-side operations.
-    fn supports_server(&self) -> bool;
+    fn supports_server(&self) -> bool {
+        matches!(self.role(), RdmaRole::Server | RdmaRole::Both)
+    }
 }
 
 // ── TelemState ────────────────────────────────────────────────────────────────
@@ -704,6 +702,134 @@ impl Default for RdmaProviderConfig {
             debug: false,
             server: RdmaServerConfig::default(),
         }
+    }
+}
+
+impl RdmaProviderConfig {
+    /// Create a new [`RdmaProviderConfigBuilder`] with defaults:
+    /// `provider = "auto"`, `debug = false`, server fields from
+    /// [`RdmaServerConfig::default()`].
+    pub fn builder() -> RdmaProviderConfigBuilder {
+        RdmaProviderConfigBuilder::new()
+    }
+}
+
+// ── RdmaProviderConfigBuilder ─────────────────────────────────────────────────
+
+/// Fluent builder for constructing RDMA providers.
+///
+/// Created via [`RdmaProviderConfig::builder()`].  Configure with the fluent
+/// setter methods, then call one of the terminal methods to produce a provider:
+/// - [`build_client`](Self::build_client) — client-only (`Arc<dyn RdmaClientProvider>`)
+/// - [`build_server`](Self::build_server) — server-only (`Arc<dyn RdmaServerProvider>`)
+/// - [`build`](Self::build) — both roles (`Arc<dyn RdmaProvider>`)
+///
+/// # Example
+///
+/// ```ignore
+/// let provider = RdmaProviderConfig::builder()
+///     .provider("cuobj")
+///     .listen_addr("192.168.1.1")
+///     .listen_port(4791)
+///     .build_server()?;
+/// ```
+pub struct RdmaProviderConfigBuilder {
+    provider: String,
+    debug:    bool,
+    role:     RdmaRole,
+    server:   RdmaServerConfig,
+}
+
+impl RdmaProviderConfigBuilder {
+    fn new() -> Self {
+        Self {
+            provider: "auto".to_owned(),
+            debug:    false,
+            role:     RdmaRole::Both,
+            server:   RdmaServerConfig::default(),
+        }
+    }
+
+    /// Set the provider name: `"mock"`, `"cuobj"`, or `"auto"` (default).
+    pub fn provider(mut self, name: impl Into<String>) -> Self {
+        self.provider = name.into();
+        self
+    }
+
+    /// Enable or disable debug logging.
+    pub fn debug(mut self, enabled: bool) -> Self {
+        self.debug = enabled;
+        self
+    }
+
+    /// Override the role for the terminal [`build`](Self::build) call.
+    ///
+    /// Defaults to [`RdmaRole::Both`].  Use this when the role is determined
+    /// at runtime; for compile-time-known roles prefer the typed terminal
+    /// methods [`build_client`](Self::build_client) /
+    /// [`build_server`](Self::build_server) / [`build`](Self::build).
+    pub fn role(mut self, role: RdmaRole) -> Self {
+        self.role = role;
+        self
+    }
+
+    /// Shared-memory directory for the mock provider (default: `"/dev/shm"`).
+    pub fn shm_path(mut self, path: impl Into<String>) -> Self {
+        self.server.shm_path = path.into();
+        self
+    }
+
+    /// RDMA listen address for the cuObj provider (e.g. `"192.168.1.1"`).
+    pub fn listen_addr(mut self, addr: impl Into<String>) -> Self {
+        self.server.listen_addr = addr.into();
+        self
+    }
+
+    /// RDMA listen port for the cuObj provider.
+    pub fn listen_port(mut self, port: u16) -> Self {
+        self.server.listen_port = port;
+        self
+    }
+
+    /// Transfer buffer size in bytes for the cuObj provider
+    /// (default: [`DEFAULT_RDMA_BUF_SIZE`]).
+    pub fn buf_size(mut self, size: usize) -> Self {
+        self.server.buf_size = size;
+        self
+    }
+
+    /// Build a **client-only** provider (`Arc<dyn RdmaClientProvider>`).
+    ///
+    /// Equivalent to `.role(RdmaRole::Client).build()` but returns the
+    /// narrower `Arc<dyn RdmaClientProvider>` type.
+    #[allow(deprecated)]
+    pub fn build_client(
+        self,
+    ) -> Result<std::sync::Arc<dyn RdmaClientProvider>, crate::error::RdmaError> {
+        crate::create_client_provider(&self.provider, self.debug)
+    }
+
+    /// Build a **server-only** provider (`Arc<dyn RdmaServerProvider>`).
+    ///
+    /// Equivalent to `.role(RdmaRole::Server).build()` but returns the
+    /// narrower `Arc<dyn RdmaServerProvider>` type.
+    #[allow(deprecated)]
+    pub fn build_server(
+        self,
+    ) -> Result<std::sync::Arc<dyn RdmaServerProvider>, crate::error::RdmaError> {
+        crate::create_server_provider(&self.provider, self.debug, &self.server)
+    }
+
+    /// Build a provider with the role set via [`.role()`](Self::role) (default: both).
+    ///
+    /// Returns `Arc<dyn RdmaProvider>`.  For compile-time-known single roles
+    /// prefer [`build_client`](Self::build_client) or
+    /// [`build_server`](Self::build_server) for narrower types.
+    #[allow(deprecated)]
+    pub fn build(
+        self,
+    ) -> Result<std::sync::Arc<dyn RdmaProvider>, crate::error::RdmaError> {
+        crate::create_provider(&self.provider, self.debug, self.role, Some(&self.server))
     }
 }
 

@@ -48,6 +48,17 @@ import java.nio.ByteBuffer;
  */
 public class RdmaProvider implements AutoCloseable {
 
+    // ── Telemetry level constants ───────────────────────────────────────────────
+
+    /** Telemetry off — no output. */
+    public static final int TELEM_OFF   = 0;
+    /** Telemetry level: errors only. */
+    public static final int TELEM_ERROR = 1;
+    /** Telemetry level: errors and informational messages. */
+    public static final int TELEM_INFO  = 2;
+    /** Telemetry level: full debug output (most verbose). */
+    public static final int TELEM_DEBUG = 3;
+
     static {
         System.loadLibrary("s3rdmajni");
     }
@@ -70,7 +81,7 @@ public class RdmaProvider implements AutoCloseable {
         long h = nativeCreate(
                 provider, role, cfg.debug,
                 cfg.shmPath, cfg.listenAddr, cfg.listenPort,
-                cfg.poolCount, cfg.bufSize);
+                cfg.bufSize);
         if (h == 0) {
             throw new RdmaException(
                 "failed to create RdmaProvider (provider=" + provider + ", role=" + role + ")");
@@ -267,7 +278,7 @@ public class RdmaProvider implements AutoCloseable {
 
     private static native long    nativeCreate(String provider, String role, boolean debug,
                                                String shmPath, String listenAddr, int listenPort,
-                                               int poolCount, long bufSize);
+                                               long bufSize);
     private native void           nativeDestroy(long handle);
     private native String         nativeName(long handle);
     private native String         nativeProtocol(long handle);

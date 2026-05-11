@@ -17,8 +17,8 @@ use pyo3::PyClassInitializer;
 use pyo3::types::PyBytes;
 
 use crate::provider::{
-    InflightTransfers, PendingTransfer,
-    RdmaRole, RdmaServerConfig, RdmaServerChannelExt, TelemetryConfig,
+    InflightTransfers, PendingTransfer, RdmaProviderConfigBuilder,
+    RdmaRole, RdmaServerChannelExt, TelemetryConfig,
     DEFAULT_RDMA_BUF_SIZE,
 };
 use crate::TelemLevel;
@@ -96,13 +96,15 @@ impl PyRdmaProvider {
         buf_size:    usize,
     ) -> PyResult<Self> {
         let provider_role = parse_role(role)?;
-        let cfg = RdmaServerConfig {
-            shm_path:       shm_path.to_owned(),
-            listen_addr:    listen_addr.to_owned(),
-            listen_port,
-            buf_size,
-        };
-        crate::create_provider(provider, debug, provider_role, Some(&cfg))
+        RdmaProviderConfigBuilder::new()
+            .provider(provider)
+            .debug(debug)
+            .role(provider_role)
+            .shm_path(shm_path)
+            .listen_addr(listen_addr)
+            .listen_port(listen_port)
+            .buf_size(buf_size)
+            .build()
             .map(|inner| Self {
                 inner,
                 inflight: InflightTransfers::new(),
@@ -134,19 +136,6 @@ impl PyRdmaProvider {
 
     /// Returns ``True`` — the channel API validates suitability at bind time.
     fn is_memory_suitable(&self, _ptr: u64, _size: usize) -> bool { true }
-
-    /// No-op — memory registration is handled internally by
-    /// :meth:`prepare_put_token` and :meth:`prepare_get_token` when they
-    /// allocate and bind a channel buffer.
-    ///
-    /// :param data: ignored (accepted for backward compatibility).
-    fn register_memory(&self, _data: &Bound<'_, PyAny>) -> PyResult<()> { Ok(()) }
-
-    /// No-op — channel resources are released automatically when
-    /// :meth:`process_rdma_reply` consumes the pending transfer.
-    ///
-    /// :param data: ignored (accepted for backward compatibility).
-    fn deregister_memory(&self, _data: &Bound<'_, PyAny>) -> PyResult<()> { Ok(()) }
 
     /// Generate an RDMA token for an S3 PUT (upload).
     ///
@@ -365,8 +354,10 @@ impl PyRdmaProvider {
     /// (Re-)configure the telemetry output.
     ///
     /// :param use_otel: ``True`` for OpenTelemetry backend, ``False`` for plain stream.
-    /// :param log_file: optional path to a log file (plain stream mode; ``None`` = stdout).
-    /// :param level: verbosity level (0=Off, 1=Error, 2=Info, 3=Debug; default 1).
+    /// :param log_file: optional path to a log file (plain stream mode; ``None`` = stderr).
+    /// :param level: verbosity level; use the ``TELEM_*`` module constants
+    ///               (``TELEM_OFF=0``, ``TELEM_ERROR=1``, ``TELEM_INFO=2``,
+    ///               ``TELEM_DEBUG=3``).  Default: ``TELEM_ERROR``.
     #[pyo3(signature = (use_otel = false, log_file = None, level = 1u32))]
     fn setup_telemetry(
         &self,
@@ -397,7 +388,9 @@ impl PyRdmaProvider {
 
     /// Set telemetry verbosity level.
     ///
-    /// :param level: verbosity level (0=Off, 1=Error, 2=Info, 3=Debug).
+    /// :param level: verbosity level; use the ``TELEM_*`` module constants
+    ///               (``TELEM_OFF=0``, ``TELEM_ERROR=1``, ``TELEM_INFO=2``,
+    ///               ``TELEM_DEBUG=3``).
     fn set_telem_level(&self, level: u32) -> PyResult<()> {
         let lvl = match level {
             0 => TelemLevel::Off,
@@ -511,5 +504,10 @@ fn s3_rdma(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMockRdmaProvider>()?;
     m.add_class::<PyCuObjProvider>()?;
     m.add_function(wrap_pyfunction!(rdma_provider_info, m)?)?;
+    // Telemetry level constants — use these instead of raw integers.
+    m.add("TELEM_OFF",   0u32)?;
+    m.add("TELEM_ERROR", 1u32)?;
+    m.add("TELEM_INFO",  2u32)?;
+    m.add("TELEM_DEBUG", 3u32)?;
     Ok(())
 }

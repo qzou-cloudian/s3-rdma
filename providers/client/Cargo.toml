@@ -17,8 +17,9 @@ mock    = []
 cuobj   = ["dep:cuobj", "dep:cuobj-sys"]
 
 [dependencies]
-tracing = "0.1"
-libc    = "0.2"
-s3-rdma = { path = "../.." }
-cuobj     = { path = "../../../cuobj",     features = ["client"], optional = true }
-cuobj-sys = { path = "../../../cuobj/cuobj-sys", features = ["client"], optional = true }
+tracing            = "0.1"
+tracing-subscriber = "0.3"
+libc               = "0.2"
+s3-rdma            = { path = "../.." }
+cuobj              = { path = "../../../cuobj",          features = ["client"], optional = true }
+cuobj-sys          = { path = "../../../cuobj/cuobj-sys", features = ["client"], optional = true }
