@@ -34,7 +34,7 @@ use cuobj::CuObjClient;
 use cuobj_sys::{self, CU_OBJ_SUCCESS, CUOBJ_GET};
 use s3_rdma::error::RdmaError;
 use s3_rdma::ffi::{ByteCursor, CTelemetryConfig, RdmaProviderVtable};
-use s3_rdma::provider::{RdmaClientChannel, RdmaPutHandle, RdmaGetHandle};
+use s3_rdma::provider::{RdmaClientChannel, RdmaTransferHandle};
 
 static PROVIDER_NAME: &[u8] = b"s3-rdma-cuobj\0";
 
@@ -156,12 +156,12 @@ impl Drop for CuObjClientChannel {
 
 impl RdmaClientChannel for CuObjClientChannel {
     fn key(&self)  -> &[u8]     { &self.key }
-    fn ptr(&self)  -> *const u8 { self.ptr }
+    fn ptr(&self)  -> *mut u8 { self.ptr }
     fn size(&self) -> usize      { self.size }
 
     fn get_max_transfer_size(&self) -> usize { usize::MAX }
 
-    fn prepare_put(&self, _offset: usize, _size: usize) -> Result<RdmaPutHandle, RdmaError> {
+    fn prepare_put(&self, _offset: usize, _size: usize) -> Result<RdmaTransferHandle, RdmaError> {
         Err(RdmaError::TokenGenerationFailed {
             key: String::from_utf8_lossy(&self.key).into_owned(),
             reason: "PUT not implemented for cuobj provider".into(),
@@ -171,23 +171,23 @@ impl RdmaClientChannel for CuObjClientChannel {
     /// Return the cached persistent DCT token immediately — no thread spawn,
     /// no cuObjGet, no DCT QP creation.  The upstream will RDMA_WRITE into
     /// our buffer using the token; we read the buffer after `complete_get`.
-    fn prepare_get(&self, offset: usize, size: usize) -> Result<RdmaGetHandle, RdmaError> {
+    fn prepare_get(&self, offset: usize, size: usize) -> Result<RdmaTransferHandle, RdmaError> {
         info!("[s3-rdma] prepare_get: token_len={} offset={offset} size={size}", self.token.len());
-        Ok(RdmaGetHandle::new(self.token.clone(), offset, size))
+        Ok(RdmaTransferHandle::new(self.token.clone(), offset, size))
     }
 
-    fn complete_put(&self, _: RdmaPutHandle, _: u16, _: usize) -> Result<(), RdmaError> {
-        Err(RdmaError::TransferFailed("PUT not implemented for cuobj provider".into()))
+    fn complete_put(&self, _: RdmaTransferHandle, _: u16, _: usize) -> Result<(), RdmaError> {
+        Err(RdmaError::TransferFailed { reason: "PUT not implemented for cuobj provider".into() })
     }
 
     /// The upstream has already written data into our buffer via RDMA_WRITE
     /// by the time the HTTP 200 arrives.  Nothing to signal.
-    fn complete_get(&self, _handle: RdmaGetHandle, rdma_status: u16, _transferred: usize) -> Result<(), RdmaError> {
+    fn complete_get(&self, _handle: RdmaTransferHandle, rdma_status: u16, _transferred: usize) -> Result<(), RdmaError> {
         info!("[s3-rdma] complete_get: status={rdma_status}");
         if (200..300).contains(&(rdma_status as u32)) {
             Ok(())
         } else {
-            Err(RdmaError::TransferFailed(format!("RDMA GET reply status={rdma_status}")))
+            Err(RdmaError::TransferFailed { reason: format!("RDMA GET reply status={rdma_status}") })
         }
     }
 }
@@ -242,6 +242,8 @@ unsafe extern "C" fn c_bind_channel(
 
 unsafe extern "C" fn c_supports_telemetry(_: *mut c_void) -> i32 { 1 }
 
+// Duplicated verbatim in providers/server/src/rdma.rs — these are separate cdylib
+// crates with no shared dep; keep both copies in sync when changing flag values.
 fn level_to_cuobj_flags(level: u32) -> u32 {
     match level { 0 => 0, 1 => 0x0004, 2 => 0x0005, _ => 0x0007 }
 }

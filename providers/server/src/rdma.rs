@@ -2,7 +2,7 @@
 
 use std::ffi::{c_void, CStr};
 use std::os::raw::c_char;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tracing::{error, info};
 
@@ -35,10 +35,15 @@ struct ServerProvider {
 unsafe impl Send for ServerProvider {}
 unsafe impl Sync for ServerProvider {}
 
-static PROVIDER: OnceLock<Option<Box<ServerProvider>>> = OnceLock::new();
+static PROVIDER: OnceLock<Mutex<Option<Box<ServerProvider>>>> = OnceLock::new();
 
-fn get_provider() -> Option<&'static ServerProvider> {
-    PROVIDER.get()?.as_deref()
+fn provider_lock() -> &'static Mutex<Option<Box<ServerProvider>>> {
+    PROVIDER.get_or_init(|| Mutex::new(None))
+}
+
+fn get_provider() -> Option<std::sync::MutexGuard<'static, Option<Box<ServerProvider>>>> {
+    let g = provider_lock().lock().unwrap();
+    if g.is_none() { None } else { Some(g) }
 }
 
 unsafe extern "C" fn c_init(params: *const RdmaServerInitParams, _ctx: *mut *mut c_void) -> i32 {
@@ -55,24 +60,27 @@ unsafe extern "C" fn c_init(params: *const RdmaServerInitParams, _ctx: *mut *mut
     };
     let buf_size = if p.buf_size > 0 { p.buf_size } else { DEFAULT_RDMA_BUF_SIZE };
     info!("[s3-rdma-server] listening {addr}:{}, buf={}MiB", p.listen_port, buf_size/(1024*1024));
-    if PROVIDER.set(Some(Box::new(ServerProvider { server: srv, buf_size }))).is_err() {
+    let mut guard = provider_lock().lock().unwrap();
+    if guard.is_some() {
         error!("[s3-rdma-server] c_init: called more than once");
         return -1;
     }
+    *guard = Some(Box::new(ServerProvider { server: srv, buf_size }));
     0
 }
 
-unsafe extern "C" fn c_cleanup(_ctx: *mut c_void) { let _ = PROVIDER.set(None); }
+unsafe extern "C" fn c_cleanup(_ctx: *mut c_void) {
+    *provider_lock().lock().unwrap() = None;
+}
 
 // ── Sync channel ────────────────────────────────────────────────────────────
 
 fn open_channel_sync(p: &ServerProvider, key: &[u8], token: &[u8])
     -> Result<Box<dyn RdmaServerChannel>, RdmaError>
 {
-    let ch = p.server.alloc_channel().map_err(|e| {
-        RdmaError::TransferFailed(format!("alloc_channel: {e:?}"))
-    })?;
-    let cid = ch.id(); std::mem::forget(ch);
+    let cid = p.server.alloc_channel().map_err(|e| {
+        RdmaError::TransferFailed { reason: format!("alloc_channel: {e:?}") }
+    })?.into_id();
     Ok(Box::new(SyncChannel {
         server: p.server.clone(), key: key.to_vec(), token: token.to_vec(),
         channel_id: cid, buf_size: p.buf_size,
@@ -92,7 +100,7 @@ impl SyncChannel {
         let mut g = self.buffer.lock().unwrap();
         if g.is_none() {
             let buf = PersistentBuffer::new(self.server.clone(), self.buf_size)
-                .map_err(|e| RdmaError::TransferFailed(format!("PersistentBuffer: {e:?}")))?;
+                .map_err(|e| RdmaError::TransferFailed { reason: format!("PersistentBuffer: {e:?}") })?;
             *g = Some(buf);
         }
         Ok(g)
@@ -113,7 +121,7 @@ impl RdmaServerChannel for SyncChannel {
         let ks = std::str::from_utf8(&self.key).unwrap_or("");
         let ts = std::str::from_utf8(&self.token).unwrap_or("");
         let n = b.handle_put(ks, offset, size, ts, Some(self.channel_id))
-            .map_err(|e| RdmaError::TransferFailed(format!("{e:?}")))?;
+            .map_err(|e| RdmaError::TransferFailed { reason: format!("{e:?}") })?;
         let buf = unsafe { std::slice::from_raw_parts(b.as_ptr(), n) };
         write(buf)
     }
@@ -129,7 +137,7 @@ impl RdmaServerChannel for SyncChannel {
         let buf = unsafe { std::slice::from_raw_parts_mut(b.as_ptr() as *mut u8, b.len()) };
         let n = read(buf)?;
         b.handle_get(ks, offset, n, ts, Some(self.channel_id))
-            .map_err(|e| RdmaError::TransferFailed(format!("{e:?}")))
+            .map_err(|e| RdmaError::TransferFailed { reason: format!("{e:?}") })
     }
 }
 
@@ -143,13 +151,14 @@ unsafe extern "C" fn c_handle_put(
     write_fn_data: *mut c_void, out_transferred: *mut usize,
 ) -> i32 {
     if s3_key.is_null() || token.is_null() || out_transferred.is_null() { return -1; }
-    let Some(p) = get_provider() else { return -1 };
+    let Some(guard) = get_provider() else { return -1 };
+    let p = guard.as_ref().unwrap().as_ref();
     let k = unsafe { (*s3_key).as_slice() }; let t = unsafe { (*token).as_slice() };
     let data = SendPtr(write_fn_data);
     let write = Box::new(move |buf: &[u8]| {
         let n = unsafe { write_fn(data.get(), buf.as_ptr() as *const c_void, buf.len()) };
         if n < 0 {
-            Err(RdmaError::TransferFailed(format!("write_fn returned {n}")))
+            Err(RdmaError::TransferFailed { reason: format!("write_fn returned {n}") })
         } else {
             Ok(n as usize)
         }
@@ -166,13 +175,14 @@ unsafe extern "C" fn c_handle_get(
     out_written: *mut usize,
 ) -> i32 {
     if s3_key.is_null() || token.is_null() || out_written.is_null() { return -1; }
-    let Some(p) = get_provider() else { return -1 };
+    let Some(guard) = get_provider() else { return -1 };
+    let p = guard.as_ref().unwrap().as_ref();
     let k = unsafe { (*s3_key).as_slice() }; let t = unsafe { (*token).as_slice() };
     let data = SendPtr(read_fn_data);
     let read = Box::new(move |buf: &mut [u8]| {
         let n = unsafe { read_fn(data.get(), buf.as_mut_ptr() as *mut c_void, buf.len()) };
         if n < 0 {
-            Err(RdmaError::TransferFailed(format!("read_fn returned {n}")))
+            Err(RdmaError::TransferFailed { reason: format!("read_fn returned {n}") })
         } else {
             Ok(n as usize)
         }
@@ -188,7 +198,8 @@ unsafe extern "C" fn c_open_channel(
     out: *mut *mut c_void,
 ) -> i32 {
     if key.is_null() || token.is_null() || out.is_null() { return -1; }
-    let Some(p) = get_provider() else { return -1 };
+    let Some(guard) = get_provider() else { return -1 };
+    let p = guard.as_ref().unwrap().as_ref();
     let k = unsafe { (*key).as_slice() }; let t = unsafe { (*token).as_slice() };
     match open_channel_sync(p, k, t) {
         Ok(ch) => {
@@ -201,6 +212,8 @@ unsafe extern "C" fn c_open_channel(
 
 // ── Telemetry ────────────────────────────────────────────────────────────────
 
+// Duplicated verbatim in providers/client/src/rdma.rs — these are separate cdylib
+// crates with no shared dep; keep both copies in sync when changing flag values.
 fn level_to_cuobj_flags(level: u32) -> u32 {
     match level { 0 => 0, 1 => 0x0004, 2 => 0x0005, _ => 0x0007 }
 }
@@ -245,7 +258,22 @@ mod tests {
     use super::*;
 
     fn rdma_ip() -> String {
-        std::env::var("RDMA_IP").unwrap_or_else(|_| "127.0.0.1".into())
+        if let Ok(ip) = std::env::var("RDMA_IP") {
+            return ip;
+        }
+        if let Some(ip) = rdma_ip_from_cufile() {
+            return ip;
+        }
+        panic!("set RDMA_IP or populate /etc/cufile.json properties.rdma_dev_addr_list");
+    }
+
+    fn rdma_ip_from_cufile() -> Option<String> {
+        let content = std::fs::read_to_string("/etc/cufile.json").ok()?;
+        // Extract first entry from: "rdma_dev_addr_list": ["<ip>", ...]
+        let after_key = content.split("rdma_dev_addr_list").nth(1)?;
+        let after_bracket = after_key.split('[').nth(1)?;
+        let ip = after_bracket.split('"').nth(1)?;
+        if ip.is_empty() { None } else { Some(ip.to_owned()) }
     }
 
     #[test]
@@ -288,10 +316,8 @@ mod tests {
     fn cuobj_connectivity() {
         let srv = Arc::new(CuObjServer::new(&rdma_ip(), 4433).expect("CuObjServer::new"));
         assert!(srv.is_connected(), "RDMA fabric not connected");
-        let ch = srv.alloc_channel().expect("alloc_channel");
-        let id = ch.id();
+        let id = srv.alloc_channel().expect("alloc_channel").into_id();
         assert_ne!(id, u16::MAX);
-        std::mem::forget(ch);
         srv.free_channel_by_id(id);
         println!("cuobj connectivity: OK");
     }
@@ -301,11 +327,9 @@ mod tests {
         let srv = Arc::new(CuObjServer::new(&rdma_ip(), 4434).expect("CuObjServer::new"));
         let mut ids = Vec::new();
         for _ in 0..4 {
-            let ch = srv.alloc_channel().expect("alloc");
-            let id = ch.id();
+            let id = srv.alloc_channel().expect("alloc").into_id();
             assert_ne!(id, u16::MAX);
             assert!(!ids.contains(&id), "duplicate channel id");
-            std::mem::forget(ch);
             ids.push(id);
         }
         for id in &ids { srv.free_channel_by_id(*id); }
@@ -315,8 +339,7 @@ mod tests {
     #[test]
     fn server_persistent_buffer_lifecycle() {
         let srv = Arc::new(CuObjServer::new(&rdma_ip(), 4435).expect("CuObjServer::new"));
-        let ch = srv.alloc_channel().expect("alloc");
-        let cid = ch.id(); std::mem::forget(ch);
+        let cid = srv.alloc_channel().expect("alloc").into_id();
         let buf = PersistentBuffer::new(Arc::clone(&srv), 4096).expect("PersistentBuffer::new");
         assert_eq!(buf.len(), 4096);
         assert!(!buf.as_ptr().is_null());
@@ -331,10 +354,10 @@ mod tests {
         let srv = Arc::new(CuObjServer::new(&rdma_ip(), 4436).expect("CuObjServer::new"));
         let layout = Layout::from_size_align(4096, 4096).unwrap();
         let ptr = unsafe { alloc(layout) };
-        let rbuf = srv.register_existing_buffer(ptr, 4096)
+        let rbuf = unsafe { srv.register_existing_buffer(ptr, 4096) }
             .expect("register_existing_buffer");
         assert!(!rbuf.is_null());
-        srv.deregister_buffer(rbuf);
+        unsafe { srv.deregister_buffer(rbuf) };
         unsafe { dealloc(ptr, layout) };
         println!("register existing buffer: OK");
     }

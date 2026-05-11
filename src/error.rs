@@ -12,13 +12,13 @@ pub enum RdmaError {
     /// Token generation failed.
     TokenGenerationFailed { key: String, reason: String },
     /// Reply token processing failed.
-    ReplyTokenProcessingFailed(String),
+    ReplyTokenProcessingFailed { reason: String },
     /// RDMA plugin failed to load or connect.
-    RdmaPluginLoadFailed(String),
+    RdmaPluginLoadFailed { reason: String },
     /// Requested provider is unknown or could not be initialised.
     ProviderUnavailable { provider: String, reason: String },
     /// RDMA data transfer failed (server side).
-    TransferFailed(String),
+    TransferFailed { reason: String },
     /// Server buffer is smaller than the size the client requested to transfer.
     /// The caller should signal `x-amz-rdma-reply: 501` so the client retries
     /// with a standard HTTP body.
@@ -27,9 +27,9 @@ pub enum RdmaError {
     Io(std::io::Error),
     /// The called method is not supported by this provider in its current role
     /// (e.g. calling `handle_put` on a client-only provider).
-    OperationNotSupported(String),
+    OperationNotSupported { reason: String },
     /// Telemetry operation failed.
-    TelemetryError(String),
+    TelemetryError { reason: String },
 }
 
 impl RdmaError {
@@ -44,10 +44,10 @@ impl RdmaError {
             self,
             RdmaError::MemoryNotSuitable { .. }
                 | RdmaError::TokenGenerationFailed { .. }
-                | RdmaError::RdmaPluginLoadFailed(_)
+                | RdmaError::RdmaPluginLoadFailed { .. }
                 | RdmaError::ProviderUnavailable { .. }
                 | RdmaError::BufferTooSmall { .. }
-                | RdmaError::TelemetryError(_)
+                | RdmaError::TelemetryError { .. }
         )
     }
 }
@@ -69,17 +69,17 @@ impl fmt::Display for RdmaError {
             RdmaError::TokenGenerationFailed { key, reason } => {
                 write!(f, "Failed to generate RDMA token for key '{key}': {reason}")
             }
-            RdmaError::ReplyTokenProcessingFailed(msg) => {
-                write!(f, "Failed to process RDMA reply token: {msg}")
+            RdmaError::ReplyTokenProcessingFailed { reason } => {
+                write!(f, "Failed to process RDMA reply token: {reason}")
             }
-            RdmaError::RdmaPluginLoadFailed(msg) => {
-                write!(f, "RDMA plugin load failed: {msg}")
+            RdmaError::RdmaPluginLoadFailed { reason } => {
+                write!(f, "RDMA plugin load failed: {reason}")
             }
             RdmaError::ProviderUnavailable { provider, reason } => {
                 write!(f, "RDMA provider '{provider}' unavailable: {reason}")
             }
-            RdmaError::TransferFailed(msg) => {
-                write!(f, "RDMA transfer failed: {msg}")
+            RdmaError::TransferFailed { reason } => {
+                write!(f, "RDMA transfer failed: {reason}")
             }
             RdmaError::BufferTooSmall { server_capacity, requested } => {
                 write!(
@@ -88,8 +88,8 @@ impl fmt::Display for RdmaError {
                 )
             }
             RdmaError::Io(e) => write!(f, "I/O error: {e}"),
-            RdmaError::OperationNotSupported(msg) => write!(f, "Operation not supported: {msg}"),
-            RdmaError::TelemetryError(msg) => write!(f, "Telemetry error: {msg}"),
+            RdmaError::OperationNotSupported { reason } => write!(f, "Operation not supported: {reason}"),
+            RdmaError::TelemetryError { reason } => write!(f, "Telemetry error: {reason}"),
         }
     }
 }

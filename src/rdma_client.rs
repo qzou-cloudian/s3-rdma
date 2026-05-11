@@ -57,22 +57,22 @@ mod real {
         /// `init` fails.
         pub fn new() -> Result<Self, RdmaError> {
             let lib = crate::ffi::find_library(LIB_NAME).ok_or_else(|| {
-                RdmaError::RdmaPluginLoadFailed(
+                RdmaError::RdmaPluginLoadFailed { reason: 
                     format!("{LIB_NAME} not found \
                              (searched LD_LIBRARY_PATH, exe dir, /lib64)")
-                )
+                 }
             })?;
 
             let provider_name = CString::new("cuobj").unwrap();
             let vtable: *const RdmaProviderVtable = unsafe {
                 let get_vtable: Symbol<GetNamedClientVtableFn> = lib
                     .get(b"s3_rdma_get_client_vtable\0")
-                    .map_err(|e| RdmaError::RdmaPluginLoadFailed(e.to_string()))?;
+                    .map_err(|e| RdmaError::RdmaPluginLoadFailed { reason: e.to_string() })?;
                 let ptr = get_vtable(provider_name.as_ptr());
                 if ptr.is_null() {
-                    return Err(RdmaError::RdmaPluginLoadFailed(
+                    return Err(RdmaError::RdmaPluginLoadFailed { reason: 
                         "s3_rdma_get_client_vtable(\"cuobj\") returned null".into()
-                    ));
+                     });
                 }
                 ptr
             };
@@ -81,9 +81,9 @@ mod real {
             if let Some(init_fn) = unsafe { (*vtable).init } {
                 let rc = unsafe { init_fn(std::ptr::null_mut(), &mut ctx) };
                 if rc != 0 {
-                    return Err(RdmaError::RdmaPluginLoadFailed(
+                    return Err(RdmaError::RdmaPluginLoadFailed { reason: 
                         format!("vtable init() returned {rc}")
-                    ));
+                     });
                 }
             }
 
@@ -115,9 +115,9 @@ mod real {
             &self, size: usize, key: &[u8],
         ) -> Result<Box<dyn RdmaClientChannel>, RdmaError> {
             let f = self.vtable().bind_channel.ok_or_else(|| {
-                RdmaError::OperationNotSupported(
+                RdmaError::OperationNotSupported { reason: 
                     "bind_channel not implemented".into(),
-                )
+                 }
             })?;
             let key_cursor = ByteCursor::from_slice(key);
             let mut out: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -143,7 +143,7 @@ mod real {
 
         pub fn setup_telemetry(&self, config: &TelemetryConfig) -> Result<(), RdmaError> {
             let f = self.vtable().setup_telemetry.ok_or_else(|| {
-                RdmaError::TelemetryError("setup_telemetry not implemented".into())
+                RdmaError::TelemetryError { reason: "setup_telemetry not implemented".into() }
             })?;
             let log_file = config.log_file.as_ref()
                 .and_then(|s| std::ffi::CString::new(s.as_str()).ok());
@@ -154,7 +154,7 @@ mod real {
             };
             let rc = unsafe { f(self.ctx, &c_cfg) };
             if rc != 0 {
-                Err(RdmaError::TelemetryError(format!("setup_telemetry returned {rc}")))
+                Err(RdmaError::TelemetryError { reason: format!("setup_telemetry returned {rc}") })
             } else {
                 Ok(())
             }
@@ -162,11 +162,11 @@ mod real {
 
         pub fn shutdown_telemetry(&self) -> Result<(), RdmaError> {
             let f = self.vtable().shutdown_telemetry.ok_or_else(|| {
-                RdmaError::TelemetryError("shutdown_telemetry not implemented".into())
+                RdmaError::TelemetryError { reason: "shutdown_telemetry not implemented".into() }
             })?;
             let rc = unsafe { f(self.ctx) };
             if rc != 0 {
-                Err(RdmaError::TelemetryError(format!("shutdown_telemetry returned {rc}")))
+                Err(RdmaError::TelemetryError { reason: format!("shutdown_telemetry returned {rc}") })
             } else {
                 Ok(())
             }
@@ -174,28 +174,28 @@ mod real {
 
         pub fn set_telem_level(&self, level: TelemLevel) -> Result<(), RdmaError> {
             let f = self.vtable().set_telem_level.ok_or_else(|| {
-                RdmaError::TelemetryError("set_telem_level not implemented".into())
+                RdmaError::TelemetryError { reason: "set_telem_level not implemented".into() }
             })?;
             let rc = unsafe { f(self.ctx, level as u32) };
             if rc != 0 {
-                Err(RdmaError::TelemetryError(format!("set_telem_level returned {rc}")))
+                Err(RdmaError::TelemetryError { reason: format!("set_telem_level returned {rc}") })
             } else {
                 Ok(())
             }
         }
 
-    // ── Availability probe ────────────────────────────────────────────────────
+        // ── Availability probe ────────────────────────────────────────────────
 
-    /// Returns `true` if the RDMA client provider plugin can be loaded
-    /// (i.e., `libs3rdmaclient.so` and its SDK dependencies are installed).
-    ///
-    /// This only checks that the shared library can be `dlopen`ed; it does
-    /// not initialise the hardware backend (which may still fail at
-    /// construction time if no GPU is available).
-    pub fn is_available() -> bool {
-        crate::ffi::find_library(LIB_NAME).is_some()
+        /// Returns `true` if the RDMA client provider plugin can be loaded
+        /// (i.e., `libs3rdmaclient.so` and its SDK dependencies are installed).
+        ///
+        /// This only checks that the shared library can be `dlopen`ed; it does
+        /// not initialise the hardware backend (which may still fail at
+        /// construction time if no GPU is available).
+        pub fn is_available() -> bool {
+            crate::ffi::find_library(LIB_NAME).is_some()
+        }
     }
-}
 
 } // mod real
 
@@ -307,18 +307,54 @@ impl RdmaPlugin {
 }
 
 #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
-impl crate::provider::RdmaClientProvider for RdmaPlugin {
+impl crate::provider::RdmaProviderBase for RdmaPlugin {
     fn name(&self) -> &str { "RdmaPlugin" }
     fn protocol(&self) -> &str { "cuobj" }
-    fn buf_size(&self) -> usize { self.buf_size }
 
+    fn supports_telemetry(&self) -> bool {
+        #[cfg(feature = "rdma-client")]
+        if let Some(c) = &self.client { if c.supports_telemetry() { return true; } }
+        #[cfg(feature = "rdma-server")]
+        if let Some(s) = &self.server { if s.supports_telemetry() { return true; } }
+        false
+    }
+
+    fn setup_telemetry(&self, config: &TelemetryConfig) -> Result<(), crate::RdmaError> {
+        #[cfg(feature = "rdma-client")]
+        if let Some(c) = &self.client { return c.setup_telemetry(config); }
+        #[cfg(feature = "rdma-server")]
+        if let Some(s) = &self.server { return s.setup_telemetry(config); }
+        let _ = config;
+        Err(crate::RdmaError::OperationNotSupported { reason: "telemetry not supported".into() })
+    }
+
+    fn shutdown_telemetry(&self) -> Result<(), crate::RdmaError> {
+        #[cfg(feature = "rdma-client")]
+        if let Some(c) = &self.client { return c.shutdown_telemetry(); }
+        #[cfg(feature = "rdma-server")]
+        if let Some(s) = &self.server { return s.shutdown_telemetry(); }
+        Err(crate::RdmaError::OperationNotSupported { reason: "telemetry not supported".into() })
+    }
+
+    fn set_telem_level(&self, level: TelemLevel) -> Result<(), crate::RdmaError> {
+        #[cfg(feature = "rdma-client")]
+        if let Some(c) = &self.client { return c.set_telem_level(level); }
+        #[cfg(feature = "rdma-server")]
+        if let Some(s) = &self.server { return s.set_telem_level(level); }
+        let _ = level;
+        Err(crate::RdmaError::OperationNotSupported { reason: "telemetry not supported".into() })
+    }
+}
+
+#[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
+impl crate::provider::RdmaClientProvider for RdmaPlugin {
     fn bind(&self, size: usize, key: &[u8]) -> Result<Box<dyn crate::provider::RdmaClientChannel>, crate::RdmaError> {
         #[cfg(feature = "rdma-client")]
         if let Some(c) = &self.client {
             return c.bind(size, key);
         }
         let _ = (size, key);
-        Err(crate::RdmaError::OperationNotSupported("rdma client not loaded".into()))
+        Err(crate::RdmaError::OperationNotSupported { reason: "rdma client not loaded".into() })
     }
 
     fn bind_registered(&self, key: &[u8]) -> Result<Box<dyn crate::provider::RdmaClientChannel>, crate::RdmaError> {
@@ -327,43 +363,7 @@ impl crate::provider::RdmaClientProvider for RdmaPlugin {
             return c.bind(DEFAULT_RDMA_BUF_SIZE, key);
         }
         let _ = key;
-        Err(crate::RdmaError::OperationNotSupported("rdma client not loaded".into()))
-    }
-
-    // ── Telemetry ────────────────────────────────────────────────────────────
-
-    fn supports_telemetry(&self) -> bool {
-        #[cfg(feature = "rdma-client")]
-        if let Some(c) = &self.client {
-            return c.supports_telemetry();
-        }
-        false
-    }
-
-    fn setup_telemetry(&self, config: &TelemetryConfig) -> Result<(), crate::RdmaError> {
-        #[cfg(feature = "rdma-client")]
-        if let Some(c) = &self.client {
-            return c.setup_telemetry(config);
-        }
-        let _ = config;
-        Err(crate::RdmaError::OperationNotSupported("rdma client not loaded".into()))
-    }
-
-    fn shutdown_telemetry(&self) -> Result<(), crate::RdmaError> {
-        #[cfg(feature = "rdma-client")]
-        if let Some(c) = &self.client {
-            return c.shutdown_telemetry();
-        }
-        Err(crate::RdmaError::OperationNotSupported("rdma client not loaded".into()))
-    }
-
-    fn set_telem_level(&self, level: TelemLevel) -> Result<(), crate::RdmaError> {
-        #[cfg(feature = "rdma-client")]
-        if let Some(c) = &self.client {
-            return c.set_telem_level(level);
-        }
-        let _ = level;
-        Err(crate::RdmaError::OperationNotSupported("rdma client not loaded".into()))
+        Err(crate::RdmaError::OperationNotSupported { reason: "rdma client not loaded".into() })
     }
 }
 
@@ -381,43 +381,7 @@ impl crate::provider::RdmaServerProvider for RdmaPlugin {
             return s.open_channel(key, token);
         }
         let _ = (key, token);
-        Err(crate::RdmaError::OperationNotSupported("rdma server not loaded".into()))
-    }
-
-    // ── Telemetry ────────────────────────────────────────────────────────────
-
-    fn supports_telemetry(&self) -> bool {
-        #[cfg(feature = "rdma-server")]
-        if let Some(s) = &self.server {
-            return s.supports_telemetry();
-        }
-        false
-    }
-
-    fn setup_telemetry(&self, config: &TelemetryConfig) -> Result<(), crate::RdmaError> {
-        #[cfg(feature = "rdma-server")]
-        if let Some(s) = &self.server {
-            return s.setup_telemetry(config);
-        }
-        let _ = config;
-        Err(crate::RdmaError::OperationNotSupported("rdma server not loaded".into()))
-    }
-
-    fn shutdown_telemetry(&self) -> Result<(), crate::RdmaError> {
-        #[cfg(feature = "rdma-server")]
-        if let Some(s) = &self.server {
-            return s.shutdown_telemetry();
-        }
-        Err(crate::RdmaError::OperationNotSupported("rdma server not loaded".into()))
-    }
-
-    fn set_telem_level(&self, level: TelemLevel) -> Result<(), crate::RdmaError> {
-        #[cfg(feature = "rdma-server")]
-        if let Some(s) = &self.server {
-            return s.set_telem_level(level);
-        }
-        let _ = level;
-        Err(crate::RdmaError::OperationNotSupported("rdma server not loaded".into()))
+        Err(crate::RdmaError::OperationNotSupported { reason: "rdma server not loaded".into() })
     }
 }
 

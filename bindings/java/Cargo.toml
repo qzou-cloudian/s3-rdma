@@ -1,6 +1,6 @@
 [package]
 name        = "s3-rdma-jni"
-version     = "0.2.0"
+version     = "0.3.0"
 edition     = "2021"
 description = "JNI bindings for the s3-rdma RDMA provider (Java)"
 license     = "MIT"

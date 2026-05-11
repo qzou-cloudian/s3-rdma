@@ -16,7 +16,7 @@
 //!
 //! | Side   | Provider method | Returns | Channel methods |
 //! |--------|----------------|---------|-----------------|
-//! | Client | `bind(ptr, size, key)` | `RdmaClientChannel` | `prepare_put`, `prepare_get`, `complete_put`, `complete_get` |
+//! | Client | `bind(size, key)` | `RdmaClientChannel` | `prepare_put`, `prepare_get`, `complete_put`, `complete_get` |
 //! | Server | `open_channel(key, token)` | `RdmaServerChannel` | `handle_put`, `handle_get` (+ ZC variants) |
 //!
 //! The channel owns the binding (key, token, buffer registration) so callers
@@ -40,7 +40,7 @@
 //! ```text
 //!   Client                                    Server
 //!   ──────                                    ──────
-//!   ch = provider.bind(ptr, size, key)
+//!   ch = provider.bind(size, key)
 //!   put = ch.prepare_put(offset, size)
 //!     │  PUT /bucket/key  +  x-amz-rdma-token: <put.token()>
 //!     │                          ↓             ch = provider.open_channel(key, put.token())
@@ -70,17 +70,18 @@ mod python;
 
 // ── Primary public API ────────────────────────────────────────────────────────
 
-pub use provider::{RdmaRole, RdmaProvider, RdmaProviderConfig};
-pub use provider::{RdmaServerChannel, RdmaClientChannel, RdmaClientProvider, RdmaServerProvider, RdmaPutHandle, RdmaGetHandle};
+pub use provider::{RdmaRole, RdmaProvider, RdmaProviderConfig, RdmaProviderBase};
+pub use provider::{RdmaServerChannel, RdmaClientChannel, RdmaClientChannelExt, RdmaServerChannelExt, RdmaClientProvider, RdmaServerProvider, RdmaTransferHandle};
 pub use provider::{TelemetryConfig, TelemLevel, TelemState};
 pub use provider::{DEFAULT_RDMA_BUF_SIZE, RDMA_REQUIRED_ALIGNMENT};
+pub use provider::{RDMA_TOKEN_HEADER, RDMA_REPLY_HEADER, RDMA_BYTES_HEADER, RDMA_STREAM_HEADER, RDMA_TOKEN_SEPARATOR};
 pub use mock::MockRdmaProvider;
 #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
 pub use rdma_client::RdmaPlugin;
 
 // ── Supporting types ──────────────────────────────────────────────────────────
 
-pub use provider::RdmaServerConfig;
+pub use provider::{RdmaServerConfig, PendingTransfer, InflightTransfers};
 pub use token::RdmaToken;
 
 #[cfg(feature = "rdma-client")]
@@ -125,9 +126,12 @@ pub fn rdma_provider_info() -> String {
 /// - `"auto"`  → tries `"cuobj"` first, falls back to `"mock"`
 ///
 /// `role` specifies which capabilities to initialise:
-/// - [`RdmaRole::Client`]  — client methods (register/token/reply) only
+/// - [`RdmaRole::Client`]  — client methods (bind/token/reply) only
 /// - [`RdmaRole::Server`]  — server methods (handle_put/handle_get) only
 /// - [`RdmaRole::Both`]    — both (typical for a gateway node)
+///
+/// `cfg` is required when `role` includes a server component (`Server` or
+/// `Both`), and ignored for `Client`-only providers.
 ///
 /// Returns [`RdmaError::ProviderUnavailable`] if the name is unrecognised,
 /// the required feature is not compiled in, or the underlying SDK fails to
@@ -136,14 +140,15 @@ pub fn create_provider(
     provider: &str,
     debug: bool,
     role: RdmaRole,
-    cfg: &RdmaServerConfig,
+    cfg: Option<&RdmaServerConfig>,
 ) -> Result<Arc<dyn RdmaProvider>, RdmaError> {
     let ep: Arc<dyn RdmaProvider> = match provider {
         "mock" => {
             if debug {
                 info!("[rdma] Using MockRdmaProvider (role={role:?})");
             }
-            Arc::new(MockRdmaProvider::new(debug, &cfg.shm_path, cfg.buf_size))
+            let shm = cfg.map_or("/dev/shm", |c| c.shm_path.as_str());
+            Arc::new(MockRdmaProvider::new(debug, shm, 0))
         }
         "cuobj" => {
             let result: Result<Arc<dyn RdmaProvider>, RdmaError>;
@@ -151,8 +156,20 @@ pub fn create_provider(
             {
                 let ep = match role {
                     RdmaRole::Client => RdmaPlugin::new_client(),
-                    RdmaRole::Server => RdmaPlugin::new_server(cfg),
-                    RdmaRole::Both   => RdmaPlugin::new_both(cfg),
+                    RdmaRole::Server => {
+                        let c = cfg.ok_or_else(|| RdmaError::ProviderUnavailable {
+                            provider: "cuobj".into(),
+                            reason: "server config required for server role".into(),
+                        })?;
+                        RdmaPlugin::new_server(c)
+                    }
+                    RdmaRole::Both => {
+                        let c = cfg.ok_or_else(|| RdmaError::ProviderUnavailable {
+                            provider: "cuobj".into(),
+                            reason: "server config required for both role".into(),
+                        })?;
+                        RdmaPlugin::new_both(c)
+                    }
                 };
                 result = ep.map(|e| {
                     if debug {
@@ -192,27 +209,25 @@ pub fn create_provider(
 /// Build an `Arc<dyn RdmaClientProvider>` for the named provider.
 ///
 /// Convenience wrapper around [`create_provider`] with [`RdmaRole::Client`].
-/// Use this in code that only needs client-side operations (register memory,
-/// generate tokens, process replies).
+/// No server configuration is needed — the provider is client-only.
 pub fn create_client_provider(
     provider: &str,
     debug: bool,
-    cfg: &RdmaServerConfig,
 ) -> Result<Arc<dyn RdmaClientProvider>, RdmaError> {
-    create_provider(provider, debug, RdmaRole::Client, cfg)
+    create_provider(provider, debug, RdmaRole::Client, None)
         .map(|p| p as Arc<dyn RdmaClientProvider>)
 }
 
 /// Build an `Arc<dyn RdmaServerProvider>` for the named provider.
 ///
 /// Convenience wrapper around [`create_provider`] with [`RdmaRole::Server`].
-/// Use this in code that only needs server-side operations (handle PUT/GET).
+/// The `cfg` provides listen address, port, and buffer size for the server.
 pub fn create_server_provider(
     provider: &str,
     debug: bool,
     cfg: &RdmaServerConfig,
 ) -> Result<Arc<dyn RdmaServerProvider>, RdmaError> {
-    create_provider(provider, debug, RdmaRole::Server, cfg)
+    create_provider(provider, debug, RdmaRole::Server, Some(cfg))
         .map(|p| p as Arc<dyn RdmaServerProvider>)
 }
 

@@ -32,7 +32,7 @@ cargo test -p s3-rdma
 cargo test -p s3-rdma -- token::tests::parse_mock_put
 
 # Run the Rust example
-cargo run --example mock_provider
+cargo run --example pingpong
 
 # Python: build extension (separate maturin project, NOT a workspace member)
 cd bindings/python && python3 -m maturin develop
@@ -186,6 +186,14 @@ RDMA_TOKEN_SEPARATOR = '|'
 - Supertrait ambiguity: when calling methods on `Arc<dyn RdmaProvider>` that exist on both
   `RdmaClientProvider` and `RdmaServerProvider`, use UFCS:
   `RdmaServerProvider::buf_size(&*state.provider)`
+
+### Known constraints
+
+**jemalloc is incompatible with cuobj** (`providers/client/src/rdma.rs`):
+`tikv-jemallocator` intercepts `malloc`/`free` globally.  cuobj's C++ internals use
+glibc `new`/`delete`; with jemalloc intercepting `free`, deallocation corrupts the
+allocator after ~3 operations.  Build any binary that loads `libs3rdmaclient.so` with
+`--no-default-features` (or ensure jemalloc is not a default feature).
 
 ### Mock token format
 

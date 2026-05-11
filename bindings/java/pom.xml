@@ -7,7 +7,7 @@
 
   <groupId>io.s3rdma</groupId>
   <artifactId>s3-rdma</artifactId>
-  <version>0.2.0</version>
+  <version>0.3.0</version>
   <packaging>jar</packaging>
   <description>GPU-Direct RDMA provider for S3 — Java JNI bindings</description>
 
