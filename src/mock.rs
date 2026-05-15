@@ -113,8 +113,10 @@ impl RdmaServerChannel for MockServerChannel {
         if self.op != "GET" {
             return Err(RdmaError::TransferFailed { reason: format!("expected GET token, got {}", self.op) });
         }
-        let cap = if size > 0 { size } else { self.token_size };
-        let capacity = cap.saturating_sub(offset);
+        // `size` is how many bytes to write; `offset` is where in SHM to write them.
+        // Do NOT subtract offset from size — offset is the write position, not a
+        // remaining-capacity indicator.
+        let capacity = if size > 0 { size } else { self.token_size.saturating_sub(offset) };
         let mut buf = vec![0u8; capacity];
         let n = read(&mut buf)?;
         let write_start = self.token_offset + offset;

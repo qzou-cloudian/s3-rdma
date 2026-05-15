@@ -12,7 +12,7 @@
 //! 3. `/lib64/`, `/usr/lib64/` (common CUDA/cuObject install locations).
 
 #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
-use crate::provider::{TelemetryConfig, TelemLevel, DEFAULT_RDMA_BUF_SIZE};
+use crate::provider::{TelemetryConfig, TelemLevel};
 
 #[cfg(feature = "rdma-client")]
 mod real {

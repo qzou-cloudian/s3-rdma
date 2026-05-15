@@ -10,7 +10,7 @@
 //! |-----------|-----------------|--------|
 //! | `"mock"`  | `RDMA_PUT_rdma-1-abc_536870912_0_key_b/k`      | Full |
 //! | `"cuobj"` | `7fab00000000:20000000:deadbeef:…`             | vaddr + size |
-//! | `"cuobj"` | `7fab00000000:20000000:deadbeef:…:67108864:0`  | vaddr + ext size + ext offset |
+//! | `"cuobj"` | `7fab00000000:20000000:deadbeef:…:0:4000000`  | vaddr + ext offset + ext size (hex) |
 //! | `""`      | binary / unknown                                | size = 0, offset = 0 |
 //!
 //! ### Extended cuObj format
@@ -18,10 +18,10 @@
 //! The cuObj SDK produces a fixed-size base descriptor string
 //! (`<vaddr_hex>:<size_hex>:<rkey_hex>:…`).  To embed transfer-specific
 //! `size` and `offset` without modifying the base format, two extra
-//! colon-separated **decimal** fields are appended:
+//! colon-separated **hexadecimal** fields are appended:
 //!
 //! ```text
-//! <cuobj_base>:<decimal_size>:<decimal_offset>
+//! <cuobj_base>:<hex_offset>:<hex_size>
 //! ```
 //!
 //! Because the base descriptor is fixed-width, these trailing fields are
@@ -72,7 +72,7 @@ use crate::provider::RDMA_TOKEN_SEPARATOR;
 /// | `size_exact` | Whether `size` is the exact intended transfer byte count. |
 ///
 /// `size_exact` is `true` for mock tokens (size always embedded) and for cuObj tokens
-/// that carry the optional `:ext_size:ext_offset` extension.  It is `false` for basic
+/// that carry the optional `:ext_offset:ext_size` extension.  It is `false` for basic
 /// cuObj tokens (where `size` = registered buffer capacity, not transfer size) and for
 /// opaque tokens.  Callers should check [`size_is_exact`](Self::size_is_exact) before
 /// using [`size`](Self::size) as a streaming limit instead of a hardware capacity.
@@ -86,7 +86,7 @@ pub struct RdmaToken {
     /// Raw token bytes passed to the provider SDK (`handle_put` / `handle_get`).
     ///
     /// For cuObj tokens this is always the **base** descriptor (without any
-    /// appended `:size:offset` extension), so the cuObj C SDK receives a clean
+    /// appended `:offset:size` extension), so the cuObj C SDK receives a clean
     /// token regardless of whether the extended format was used on the wire.
     token: Vec<u8>,
     /// Byte offset within the client buffer this instance covers.
@@ -105,7 +105,7 @@ impl RdmaToken {
 
     /// Parse raw token bytes into a structured descriptor.
     ///
-    /// Tries mock format first, then cuObj (with optional `:size:offset`
+    /// Tries mock format first, then cuObj (with optional `:offset:size`
     /// extension). Falls back to `provider = ""`, `size = 0`, `offset = 0`
     /// for unrecognised tokens.
     ///
@@ -117,7 +117,7 @@ impl RdmaToken {
             if let Some((provider, offset, size)) = Self::parse_mock_str(s) {
                 return Self { provider, token: raw.to_vec(), offset, size, size_exact: true };
             }
-            let (base, ext_size, ext_offset) = Self::split_cuobj_extension(s);
+            let (base, ext_offset, ext_size) = Self::split_cuobj_extension(s);
             if let Some(base_size) = Self::parse_cuobj_base(base) {
                 let has_ext = ext_size.is_some();
                 return Self {
@@ -167,7 +167,7 @@ impl RdmaToken {
     /// Raw token bytes to pass to the provider SDK (`handle_put` / `handle_get`).
     ///
     /// For cuObj tokens this is always the **base** descriptor without any
-    /// `:size:offset` extension, even if the token was parsed from an extended
+    /// `:offset:size` extension, even if the token was parsed from an extended
     /// wire format.
     pub fn raw(&self) -> &[u8] {
         &self.token
@@ -208,7 +208,7 @@ impl RdmaToken {
     /// Use this before relying on `size()` as a streaming transfer limit:
     ///
     /// - **`true`**: `size()` is the number of bytes to transfer (mock tokens always;
-    ///   cuObj tokens with an `:ext_size:ext_offset` extension).
+    ///   cuObj tokens with an `:ext_offset:ext_size` extension).
     /// - **`false`**: `size()` is either `0` (opaque) or the cuObj registered buffer
     ///   capacity (which may exceed the actual transfer).
     ///
@@ -225,7 +225,7 @@ impl RdmaToken {
     /// assert!(!tok.size_is_exact());
     ///
     /// // Extended cuObj: size = exact transfer size.
-    /// let tok = RdmaToken::parse_str("7fab000000000000:20000000:deadbeef0000:extra:67108864:0");
+    /// let tok = RdmaToken::parse_str("7fab000000000000:20000000:deadbeef0000:extra:0:4000000");
     /// assert!(tok.size_is_exact());
     /// assert_eq!(tok.size(), 67108864);
     /// ```
@@ -255,7 +255,7 @@ impl RdmaToken {
     ///
     /// - Mock tokens: the `_{size}_` field (decimal).
     /// - cuObj tokens: the `<size_hex>` field from the base descriptor.
-    ///   For extended cuObj tokens (`base:ext_size:ext_offset`) this is
+    ///   For extended cuObj tokens (`base:ext_offset:ext_size`) this is
     ///   still the registered capacity from the base, **not** `ext_size`.
     /// - Unknown tokens: `0`.
     pub fn total_buffer_size(&self) -> usize {
@@ -366,34 +366,34 @@ impl RdmaToken {
         Some(size)
     }
 
-    /// Detect and split the extended cuObj format `<base>:<decimal_size>:<decimal_offset>`.
+    /// Detect and split the extended cuObj format `<base>:<hex_offset>:<hex_size>`.
     ///
-    /// Returns `(base_str, Some(size), Some(offset))` when the last two
-    /// colon-separated fields are valid decimal integers **and** the prefix
+    /// Returns `(base_str, Some(offset), Some(size))` when the last two
+    /// colon-separated fields are valid **hexadecimal** integers **and** the prefix
     /// validates as a cuObj base descriptor.  Otherwise returns the input
     /// string unchanged with `None` for both optional fields.
     fn split_cuobj_extension(s: &str) -> (&str, Option<usize>, Option<usize>) {
-        // Examine the last field.
+        // Examine the last field (size, hex-encoded).
         let (before_last, last) = match s.rfind(':') {
             Some(i) => (&s[..i], &s[i + 1..]),
             None    => return (s, None, None),
         };
-        let ext_offset: usize = match last.parse() {
+        let ext_size: usize = match usize::from_str_radix(last, 16) {
             Ok(n)  => n,
             Err(_) => return (s, None, None),
         };
-        // Examine the second-to-last field.
+        // Examine the second-to-last field (offset, hex-encoded).
         let (base, middle) = match before_last.rfind(':') {
             Some(i) => (&before_last[..i], &before_last[i + 1..]),
             None    => return (s, None, None),
         };
-        let ext_size: usize = match middle.parse() {
+        let ext_offset: usize = match usize::from_str_radix(middle, 16) {
             Ok(n)  => n,
             Err(_) => return (s, None, None),
         };
         // Confirm the prefix is a valid cuObj base descriptor.
         if Self::parse_cuobj_base(base).is_some() {
-            (base, Some(ext_size), Some(ext_offset))
+            (base, Some(ext_offset), Some(ext_size))
         } else {
             (s, None, None)
         }
@@ -419,7 +419,7 @@ impl From<Vec<u8>> for RdmaToken {
             if let Some((provider, offset, size)) = Self::parse_mock_str(s) {
                 return Self { provider, token: bytes, offset, size, size_exact: true };
             }
-            let (base, ext_size, ext_offset) = Self::split_cuobj_extension(s);
+            let (base, ext_offset, ext_size) = Self::split_cuobj_extension(s);
             if let Some(base_size) = Self::parse_cuobj_base(base) {
                 let has_ext = ext_size.is_some();
                 // Store only the base descriptor; strip any extension.
@@ -680,16 +680,16 @@ mod tests {
 
     // ── Extended cuObj token tests ────────────────────────────────────────────
 
-    /// Extended format: `<cuobj_base>:<decimal_size>:<decimal_offset>`.
+    /// Extended format: `<cuobj_base>:<hex_offset>:<hex_size>`.
     const CUOBJ_EXT: &str =
-        "7fab000000000000:20000000:deadbeef0000:extra:67108864:4096";
+        "7fab000000000000:20000000:deadbeef0000:extra:1000:4000000";
 
     #[test]
     fn parse_cuobj_extended_basic() {
         let tok = RdmaToken::parse_str(CUOBJ_EXT);
         assert_eq!(tok.provider(), "cuobj");
         // Extension fields override the base size_hex.
-        assert_eq!(tok.size(),   67108864); // decimal extension, not 0x20000000
+        assert_eq!(tok.size(),   67108864); // hex extension: 0x4000000 = 64 MiB
         assert_eq!(tok.offset(), 4096);
         assert!(!tok.is_opaque());
         // Extended cuObj: size IS the exact transfer size.
@@ -699,7 +699,7 @@ mod tests {
     #[test]
     fn cuobj_extended_raw_strips_extension() {
         // raw() must return only the base descriptor; the cuObj C SDK must not
-        // see the trailing `:size:offset` fields.
+        // see the trailing `:offset:size` fields.
         let tok = RdmaToken::parse_str(CUOBJ_EXT);
         assert_eq!(tok.raw(), CUOBJ_TOK.as_bytes());
     }
@@ -758,7 +758,7 @@ mod tests {
 
     #[test]
     fn cuobj_base_token_no_extension() {
-        // A base token whose last field is not decimal → no extension detected.
+        // A base token whose last field is not hex → no extension detected.
         let tok = RdmaToken::parse_str(CUOBJ_TOK);
         assert_eq!(tok.size(), 0x20000000); // from size_hex, no override
         assert_eq!(tok.offset(), 0);

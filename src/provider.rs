@@ -45,7 +45,7 @@ pub const RDMA_REQUIRED_ALIGNMENT: usize = 4096;
 ///
 /// When present with value `"true"`, the PUT request body contains
 /// newline-delimited RDMA token strings (one per line) instead of object data.
-/// Each token line uses the extended format `<base_token>:<size>:<offset>` so
+/// Each token line uses the extended format `<base_token>:<hex_offset>:<hex_size>` so
 /// the server knows the exact transfer size and object offset for every chunk.
 ///
 /// Not used inside this crate — exported for HTTP-layer consumers.
@@ -351,6 +351,21 @@ pub trait RdmaClientChannelExt: RdmaClientChannel {
         W: FnOnce(&mut [u8]) -> usize + Send,
         S: FnOnce(&[u8]) -> Result<(u16, usize), crate::error::RdmaError> + Send;
 
+    /// Execute a full PUT from an existing byte slice: copy `data` into the
+    /// RDMA buffer at `offset`, prepare a token, call `send` with the token,
+    /// then complete.  Encapsulates the common `unsafe { copy_nonoverlapping }`
+    /// pattern used by the relay and S3 backends.
+    ///
+    /// `send` receives the token bytes and must return `(rdma_status, transferred)`.
+    fn write_from_slice<S>(
+        &self,
+        offset: usize,
+        data: &[u8],
+        send: S,
+    ) -> Result<usize, crate::error::RdmaError>
+    where
+        S: FnOnce(&[u8]) -> Result<(u16, usize), crate::error::RdmaError> + Send;
+
     /// Execute a full GET: prepare a token, call `send` with the token, complete,
     /// then pass the downloaded data to `read`.
     ///
@@ -369,6 +384,24 @@ pub trait RdmaClientChannelExt: RdmaClientChannel {
 }
 
 impl<T: RdmaClientChannel + ?Sized> RdmaClientChannelExt for T {
+    fn write_from_slice<S>(
+        &self,
+        offset: usize,
+        data: &[u8],
+        send: S,
+    ) -> Result<usize, crate::error::RdmaError>
+    where
+        S: FnOnce(&[u8]) -> Result<(u16, usize), crate::error::RdmaError> + Send,
+    {
+        let cap = self.size().saturating_sub(offset);
+        let n = data.len().min(cap);
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr().add(offset), n); }
+        let handle = self.prepare_put(offset, n)?;
+        let (status, transferred) = send(handle.token())?;
+        self.complete_put(handle, status, transferred)?;
+        Ok(transferred)
+    }
+
     fn put<W, S>(
         &self,
         offset: usize,

@@ -28,10 +28,10 @@ use std::ffi::c_void;
 use std::os::raw::c_char;
 use std::sync::OnceLock;
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use cuobj::CuObjClient;
-use cuobj_sys::{self, CU_OBJ_SUCCESS, CUOBJ_GET};
+use cuobj_sys::{self, CU_OBJ_SUCCESS, CUOBJ_GET, CUOBJ_PUT};
 use s3_rdma::error::RdmaError;
 use s3_rdma::ffi::{ByteCursor, CTelemetryConfig, RdmaProviderVtable};
 use s3_rdma::provider::{RdmaClientChannel, RdmaTransferHandle};
@@ -40,6 +40,12 @@ static PROVIDER_NAME: &[u8] = b"s3-rdma-cuobj\0";
 
 /// Page size for mmap allocations (4 KiB).
 const PAGE_SIZE: usize = 4096;
+
+/// Minimum RDMA buffer size: 64 MiB.  The global buffer is allocated once
+/// at first bind_channel — using this floor ensures that even when the first
+/// transfer is small, subsequent transfers up to 64 MiB can use RDMA without
+/// falling back to plain HTTP.
+const MIN_BUF_SIZE: usize = 64 * 1024 * 1024;
 
 fn mmap_alloc(size: usize) -> *mut u8 {
     let pages = size.div_ceil(PAGE_SIZE) * PAGE_SIZE;
@@ -65,8 +71,10 @@ struct GlobalState {
     ptr:        usize,
     /// Registered size in bytes.
     size:       usize,
-    /// Persistent DCT descriptor string (returned from every prepare_get).
-    token:      Vec<u8>,
+    /// Persistent DCT descriptor for GET (RDMA_WRITE server→client).
+    token_get:  Vec<u8>,
+    /// Persistent DCT descriptor for PUT (RDMA_READ client→server).
+    token_put:  Vec<u8>,
 }
 
 unsafe impl Send for GlobalState {}
@@ -75,34 +83,35 @@ unsafe impl Sync for GlobalState {}
 static GLOBAL: OnceLock<GlobalState> = OnceLock::new();
 
 fn global_init(requested_size: usize) -> Option<&'static GlobalState> {
+    let requested_size = requested_size.max(MIN_BUF_SIZE);
     let state = GLOBAL.get_or_init(|| {
         // 1. Create a standard cuObjClient (no ops callbacks needed).
         let client_raw = unsafe { cuobj_sys::cuobj_client_create() };
         if client_raw.is_null() {
             error!("[s3-rdma] global init: cuobj_client_create returned null");
-            return GlobalState { client_raw: 0, ptr: 0, size: 0, token: Vec::new() };
+            return GlobalState { client_raw: 0, ptr: 0, size: 0, token_get: Vec::new(), token_put: Vec::new() };
         }
         if unsafe { cuobj_sys::cuobj_client_is_connected(client_raw) } == 0 {
             error!("[s3-rdma] global init: cuObjClient not connected to RDMA fabric");
-            return GlobalState { client_raw: 0, ptr: 0, size: 0, token: Vec::new() };
+            return GlobalState { client_raw: 0, ptr: 0, size: 0, token_get: Vec::new(), token_put: Vec::new() };
         }
 
         // 2. Allocate and register the buffer (once, never freed/deregistered).
         let ptr = mmap_alloc(requested_size);
         if ptr.is_null() {
             error!("[s3-rdma] global init: mmap failed size={requested_size}");
-            return GlobalState { client_raw: 0, ptr: 0, size: 0, token: Vec::new() };
+            return GlobalState { client_raw: 0, ptr: 0, size: 0, token_get: Vec::new(), token_put: Vec::new() };
         }
         let rc = unsafe {
             cuobj_sys::cuobj_client_mem_get_descriptor(client_raw, ptr as *mut c_void, requested_size)
         };
         if rc != CU_OBJ_SUCCESS {
             error!("[s3-rdma] global init: cuMemObjGetDescriptor failed rc={rc}");
-            return GlobalState { client_raw: 0, ptr: 0, size: 0, token: Vec::new() };
+            return GlobalState { client_raw: 0, ptr: 0, size: 0, token_get: Vec::new(), token_put: Vec::new() };
         }
 
-        // 3. Get the persistent DCT descriptor (creates one DCT QP, lives forever).
-        let mut desc_str: *mut c_char = std::ptr::null_mut();
+        // 3a. Get the persistent DCT descriptor for GET (RDMA_WRITE server→client).
+        let mut desc_get: *mut c_char = std::ptr::null_mut();
         let rc = unsafe {
             cuobj_sys::cuobj_client_mem_get_rdma_token(
                 client_raw,
@@ -110,26 +119,42 @@ fn global_init(requested_size: usize) -> Option<&'static GlobalState> {
                 requested_size,
                 0,            // buf_offset
                 CUOBJ_GET,
-                &mut desc_str,
+                &mut desc_get,
             )
         };
-        if rc != CU_OBJ_SUCCESS || desc_str.is_null() {
-            error!("[s3-rdma] global init: cuMemObjGetRDMAToken failed rc={rc}");
-            return GlobalState { client_raw: 0, ptr: 0, size: 0, token: Vec::new() };
+        if rc != CU_OBJ_SUCCESS || desc_get.is_null() {
+            error!("[s3-rdma] global init: cuMemObjGetRDMAToken(GET) failed rc={rc}");
+            return GlobalState { client_raw: 0, ptr: 0, size: 0, token_get: Vec::new(), token_put: Vec::new() };
         }
+        let token_get = unsafe { std::ffi::CStr::from_ptr(desc_get).to_bytes().to_vec() };
 
-        let token = unsafe {
-            std::ffi::CStr::from_ptr(desc_str).to_bytes().to_vec()
+        // 3b. Get the persistent DCT descriptor for PUT (RDMA_READ client→server).
+        let mut desc_put: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe {
+            cuobj_sys::cuobj_client_mem_get_rdma_token(
+                client_raw,
+                ptr as *mut c_void,
+                requested_size,
+                0,
+                CUOBJ_PUT,
+                &mut desc_put,
+            )
         };
-        // Intentionally do NOT call cuMemObjPutRDMAToken — the DCT QP stays
-        // alive and the token is reused for every request.
-        info!("[s3-rdma] global init: DCT ready, token_len={} ptr={ptr:?} size={requested_size}", token.len());
+        if rc != CU_OBJ_SUCCESS || desc_put.is_null() {
+            error!("[s3-rdma] global init: cuMemObjGetRDMAToken(PUT) failed rc={rc}");
+            return GlobalState { client_raw: 0, ptr: 0, size: 0, token_get: Vec::new(), token_put: Vec::new() };
+        }
+        let token_put = unsafe { std::ffi::CStr::from_ptr(desc_put).to_bytes().to_vec() };
+
+        info!("[s3-rdma] global init: DCT ready, get_token_len={} put_token_len={} ptr={ptr:?} size={requested_size}",
+              token_get.len(), token_put.len());
 
         GlobalState {
             client_raw: client_raw as usize,
             ptr:        ptr as usize,
             size:       requested_size,
-            token,
+            token_get,
+            token_put,
         }
     });
     if state.client_raw == 0 { None } else { Some(state) }
@@ -137,12 +162,13 @@ fn global_init(requested_size: usize) -> Option<&'static GlobalState> {
 
 // ── CuObjClientChannel ────────────────────────────────────────────────────────
 
-/// One RDMA channel — a view into the global buffer + persistent DCT token.
+/// One RDMA channel — a view into the global buffer + persistent DCT tokens.
 struct CuObjClientChannel {
-    key:  Vec<u8>,
-    ptr:  *mut u8,
-    size: usize,
-    token: Vec<u8>,
+    key:       Vec<u8>,
+    ptr:       *mut u8,
+    size:      usize,
+    token_get: Vec<u8>,
+    token_put: Vec<u8>,
 }
 
 unsafe impl Send for CuObjClientChannel {}
@@ -161,23 +187,40 @@ impl RdmaClientChannel for CuObjClientChannel {
 
     fn get_max_transfer_size(&self) -> usize { usize::MAX }
 
-    fn prepare_put(&self, _offset: usize, _size: usize) -> Result<RdmaTransferHandle, RdmaError> {
-        Err(RdmaError::TokenGenerationFailed {
-            key: String::from_utf8_lossy(&self.key).into_owned(),
-            reason: "PUT not implemented for cuobj provider".into(),
-        })
+    /// Return the cached persistent PUT DCT token — the server will RDMA_READ from
+    /// our buffer using the token; data is already in place from the caller's
+    /// copy via `ptr()` after `bind()`.
+    ///
+    /// Appends `:offset:size` (hex-encoded) to the base cuObj token so the gateway
+    /// can determine the exact transfer size without relying on Content-Length.
+    /// The gateway's `RdmaToken::parse` strips this extension before passing
+    /// the base token to the cuObj C SDK.
+    fn prepare_put(&self, offset: usize, size: usize) -> Result<RdmaTransferHandle, RdmaError> {
+        info!("[s3-rdma] prepare_put: token_len={} offset={offset} size={size}", self.token_put.len());
+        let base = String::from_utf8_lossy(&self.token_put);
+        let token = format!("{base}:{offset:x}:{size:x}").into_bytes();
+        Ok(RdmaTransferHandle::new(token, offset, size))
     }
 
-    /// Return the cached persistent DCT token immediately — no thread spawn,
-    /// no cuObjGet, no DCT QP creation.  The upstream will RDMA_WRITE into
-    /// our buffer using the token; we read the buffer after `complete_get`.
+    /// Return the cached persistent GET DCT token immediately.  The upstream will
+    /// RDMA_WRITE into our buffer using the token; we read the buffer after `complete_get`.
+    ///
+    /// Appends `:offset:size` (hex-encoded) so the server knows how many bytes to RDMA_WRITE.
     fn prepare_get(&self, offset: usize, size: usize) -> Result<RdmaTransferHandle, RdmaError> {
-        info!("[s3-rdma] prepare_get: token_len={} offset={offset} size={size}", self.token.len());
-        Ok(RdmaTransferHandle::new(self.token.clone(), offset, size))
+        info!("[s3-rdma] prepare_get: token_len={} offset={offset} size={size}", self.token_get.len());
+        let base = String::from_utf8_lossy(&self.token_get);
+        let token = format!("{base}:{offset:x}:{size:x}").into_bytes();
+        Ok(RdmaTransferHandle::new(token, offset, size))
     }
 
-    fn complete_put(&self, _: RdmaTransferHandle, _: u16, _: usize) -> Result<(), RdmaError> {
-        Err(RdmaError::TransferFailed { reason: "PUT not implemented for cuobj provider".into() })
+    /// The server has finished RDMA_READ from our buffer. Confirm the reply status.
+    fn complete_put(&self, _handle: RdmaTransferHandle, rdma_status: u16, _transferred: usize) -> Result<(), RdmaError> {
+        info!("[s3-rdma] complete_put: status={rdma_status}");
+        if (200..300).contains(&(rdma_status as u32)) {
+            Ok(())
+        } else {
+            Err(RdmaError::TransferFailed { reason: format!("RDMA PUT reply status={rdma_status}") })
+        }
     }
 
     /// The upstream has already written data into our buffer via RDMA_WRITE
@@ -227,11 +270,20 @@ unsafe extern "C" fn c_bind_channel(
         }
     };
 
+    // The global buffer is fixed-size (allocated on first bind). If the
+    // requested size exceeds it, return an error so the caller falls back
+    // to plain HTTP rather than panicking on a too-small slice.
+    if size > state.size {
+        warn!("[s3-rdma] bind_channel: size={size} > buffer_size={} — falling back", state.size);
+        return -1;
+    }
+
     let channel: Box<dyn RdmaClientChannel> = Box::new(CuObjClientChannel {
-        key:   key_slice.to_vec(),
-        ptr:   state.ptr as *mut u8,
-        size:  state.size,
-        token: state.token.clone(),
+        key:       key_slice.to_vec(),
+        ptr:       state.ptr as *mut u8,
+        size:      state.size,
+        token_get: state.token_get.clone(),
+        token_put: state.token_put.clone(),
     });
     let boxed: Box<Box<dyn RdmaClientChannel>> = Box::new(channel);
     unsafe { *out = Box::into_raw(boxed) as *mut c_void; }
