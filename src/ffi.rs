@@ -25,11 +25,17 @@ impl ByteCursor {
     /// Used as a sentinel value where a `ByteCursor` is required but no data
     /// is available (e.g. absent optional fields in C structs).
     pub const fn null() -> Self {
-        Self { ptr: std::ptr::null(), len: 0 }
+        Self {
+            ptr: std::ptr::null(),
+            len: 0,
+        }
     }
 
     pub fn from_slice(s: &[u8]) -> Self {
-        Self { ptr: s.as_ptr(), len: s.len() }
+        Self {
+            ptr: s.as_ptr(),
+            len: s.len(),
+        }
     }
 
     /// # Safety
@@ -44,7 +50,9 @@ impl ByteCursor {
 }
 
 impl Default for ByteCursor {
-    fn default() -> Self { Self::null() }
+    fn default() -> Self {
+        Self::null()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -56,11 +64,8 @@ impl Default for ByteCursor {
 /// - `user_data`   – opaque pointer supplied by the caller.
 /// - `error_code`  – 0 on success; non-zero on failure.
 /// - `reply_token` – server reply token (may be null / empty).
-pub type RdmaCompletionFn = unsafe extern "C" fn(
-    user_data:   *mut c_void,
-    error_code:  i32,
-    reply_token: *const ByteCursor,
-);
+pub type RdmaCompletionFn =
+    unsafe extern "C" fn(user_data: *mut c_void, error_code: i32, reply_token: *const ByteCursor);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // C-ABI telemetry types
@@ -92,12 +97,12 @@ pub struct CTelemetryConfig {
 #[repr(C)]
 pub struct RdmaProviderVtable {
     /// Human-readable provider name (null-terminated C string).
-    pub provider_name:    *const c_char,
+    pub provider_name: *const c_char,
     /// Version integer for compatibility checks.
     pub provider_version: u32,
 
     /// Initialise the provider.
-    pub init:    Option<unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32>,
+    pub init: Option<unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32>,
     /// Destroy the provider.
     pub cleanup: Option<unsafe extern "C" fn(*mut c_void)>,
 
@@ -109,15 +114,16 @@ pub struct RdmaProviderVtable {
     /// with `Box::from_raw` twice.
     ///
     /// Returns null on error.
-    pub bind_channel: Option<unsafe extern "C" fn(
-        *mut c_void,            // ctx
-        usize,                  // size
-        *const ByteCursor,      // key
-        *mut *mut c_void,       // out_channel (Box<Box<dyn RdmaClientChannel>>)
-    ) -> i32>,
+    pub bind_channel: Option<
+        unsafe extern "C" fn(
+            *mut c_void,       // ctx
+            usize,             // size
+            *const ByteCursor, // key
+            *mut *mut c_void,  // out_channel (Box<Box<dyn RdmaClientChannel>>)
+        ) -> i32,
+    >,
 
     // ── Telemetry ────────────────────────────────────────────────────────────
-
     /// Returns `1` if this provider supports telemetry.
     pub supports_telemetry: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
 
@@ -183,7 +189,7 @@ pub struct RdmaServerInitParams {
     /// Listen port for the RDMA server.
     pub listen_port: u16,
     /// Size in bytes of each buffer slot.
-    pub buf_size:    usize,
+    pub buf_size: usize,
 }
 
 /// Callback for the HTTP round-trip in [`RdmaClientChannel::put`]/[`get`].
@@ -192,10 +198,10 @@ pub struct RdmaServerInitParams {
 /// the server's `(rdma_status, transferred_bytes)` to `out_status` /
 /// `out_transferred`.  Called synchronously between prepare and complete.
 pub type RdmaSendFn = unsafe extern "C" fn(
-    token:           *const u8,
-    token_len:       usize,
-    user_data:       *mut std::ffi::c_void,
-    out_status:      *mut u16,
+    token: *const u8,
+    token_len: usize,
+    user_data: *mut std::ffi::c_void,
+    out_status: *mut u16,
     out_transferred: *mut usize,
 );
 
@@ -213,13 +219,13 @@ unsafe impl Send for RdmaServerInitParams {}
 #[repr(C)]
 pub struct RdmaServerVtable {
     /// Human-readable provider name (null-terminated C string).
-    pub provider_name:    *const c_char,
+    pub provider_name: *const c_char,
     /// Version integer for compatibility checks.
     pub provider_version: u32,
 
     /// Initialise the server provider with the given config.
     /// On success sets `*ctx` and returns 0; non-zero on failure.
-    pub init:    Option<unsafe extern "C" fn(*const RdmaServerInitParams, *mut *mut c_void) -> i32>,
+    pub init: Option<unsafe extern "C" fn(*const RdmaServerInitParams, *mut *mut c_void) -> i32>,
     /// Destroy the server provider context.
     pub cleanup: Option<unsafe extern "C" fn(*mut c_void)>,
 
@@ -238,16 +244,18 @@ pub struct RdmaServerVtable {
     ///
     /// `write_fn` must be thread-safe.  The plugin may call it from a worker
     /// thread.  Returns 0 on success, non-zero on failure.
-    pub handle_put: Option<unsafe extern "C" fn(
-        ctx:             *mut c_void,
-        s3_key:          *const ByteCursor,
-        token:           *const ByteCursor,
-        offset:          usize,
-        size:            usize,
-        write_fn:        RdmaIoWriteFn,
-        write_fn_data:   *mut c_void,
-        out_transferred: *mut usize,
-    ) -> i32>,
+    pub handle_put: Option<
+        unsafe extern "C" fn(
+            ctx: *mut c_void,
+            s3_key: *const ByteCursor,
+            token: *const ByteCursor,
+            offset: usize,
+            size: usize,
+            write_fn: RdmaIoWriteFn,
+            write_fn_data: *mut c_void,
+            out_transferred: *mut usize,
+        ) -> i32,
+    >,
 
     /// Handle an RDMA GET.
     ///
@@ -256,18 +264,19 @@ pub struct RdmaServerVtable {
     /// RDMA_WRITEs that buffer to the client.  No intermediate copy.
     ///
     /// `read_fn` must be thread-safe.  Returns 0 on success, non-zero on failure.
-    pub handle_get: Option<unsafe extern "C" fn(
-        ctx:          *mut c_void,
-        s3_key:       *const ByteCursor,
-        token:        *const ByteCursor,
-        offset:       usize,
-        read_fn:      RdmaIoReadFn,
-        read_fn_data: *mut c_void,
-        out_written:  *mut usize,
-    ) -> i32>,
+    pub handle_get: Option<
+        unsafe extern "C" fn(
+            ctx: *mut c_void,
+            s3_key: *const ByteCursor,
+            token: *const ByteCursor,
+            offset: usize,
+            read_fn: RdmaIoReadFn,
+            read_fn_data: *mut c_void,
+            out_written: *mut usize,
+        ) -> i32,
+    >,
 
     // ── Telemetry ────────────────────────────────────────────────────────────
-
     /// Returns `1` if this provider supports telemetry.
     pub supports_telemetry: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
 
@@ -287,12 +296,14 @@ pub struct RdmaServerVtable {
     /// Open an RdmaServerChannel for key+token.
     /// On success, *out_channel receives a heap-allocated Box<dyn RdmaServerChannel>.
     /// Returns 0 on success, non-zero on failure.
-    pub open_channel: Option<unsafe extern "C" fn(
-        ctx: *mut c_void,
-        key: *const ByteCursor,
-        token: *const ByteCursor,
-        out_channel: *mut *mut c_void,
-    ) -> i32>,
+    pub open_channel: Option<
+        unsafe extern "C" fn(
+            ctx: *mut c_void,
+            key: *const ByteCursor,
+            token: *const ByteCursor,
+            out_channel: *mut *mut c_void,
+        ) -> i32,
+    >,
 }
 
 // SAFETY: vtable contains only function pointers and a static string pointer,

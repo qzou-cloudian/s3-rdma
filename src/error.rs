@@ -4,7 +4,11 @@ use std::fmt;
 #[derive(Debug)]
 pub enum RdmaError {
     /// Memory registration failed.
-    MemoryRegistrationFailed { ptr: usize, size: usize, reason: String },
+    MemoryRegistrationFailed {
+        ptr: usize,
+        size: usize,
+        reason: String,
+    },
     /// Memory deregistration failed.
     MemoryDeregistrationFailed { ptr: usize, reason: String },
     /// Memory is not suitable for RDMA.
@@ -22,7 +26,10 @@ pub enum RdmaError {
     /// Server buffer is smaller than the size the client requested to transfer.
     /// The caller should signal `x-amz-rdma-reply: 501` so the client retries
     /// with a standard HTTP body.
-    BufferTooSmall { server_capacity: usize, requested: usize },
+    BufferTooSmall {
+        server_capacity: usize,
+        requested: usize,
+    },
     /// I/O error.
     Io(std::io::Error),
     /// The called method is not supported by this provider in its current role
@@ -56,15 +63,21 @@ impl fmt::Display for RdmaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RdmaError::MemoryRegistrationFailed { ptr, size, reason } => {
-                write!(f, "Failed to register memory at {ptr:#x} (size={size}): {reason}")
+                write!(
+                    f,
+                    "Failed to register memory at {ptr:#x} (size={size}): {reason}"
+                )
             }
             RdmaError::MemoryDeregistrationFailed { ptr, reason } => {
                 write!(f, "Failed to deregister memory at {ptr:#x}: {reason}")
             }
             RdmaError::MemoryNotSuitable { ptr, size } => {
-                write!(f, "Memory at {ptr:#x} (size={size}) not suitable for RDMA \
+                write!(
+                    f,
+                    "Memory at {ptr:#x} (size={size}) not suitable for RDMA \
                            (must be non-null, {}-byte aligned, and pinnable)",
-                           crate::provider::RDMA_REQUIRED_ALIGNMENT)
+                    crate::provider::RDMA_REQUIRED_ALIGNMENT
+                )
             }
             RdmaError::TokenGenerationFailed { key, reason } => {
                 write!(f, "Failed to generate RDMA token for key '{key}': {reason}")
@@ -81,14 +94,19 @@ impl fmt::Display for RdmaError {
             RdmaError::TransferFailed { reason } => {
                 write!(f, "RDMA transfer failed: {reason}")
             }
-            RdmaError::BufferTooSmall { server_capacity, requested } => {
+            RdmaError::BufferTooSmall {
+                server_capacity,
+                requested,
+            } => {
                 write!(
                     f,
                     "server buffer too small: capacity={server_capacity}, transfer_size={requested}"
                 )
             }
             RdmaError::Io(e) => write!(f, "I/O error: {e}"),
-            RdmaError::OperationNotSupported { reason } => write!(f, "Operation not supported: {reason}"),
+            RdmaError::OperationNotSupported { reason } => {
+                write!(f, "Operation not supported: {reason}")
+            }
             RdmaError::TelemetryError { reason } => write!(f, "Telemetry error: {reason}"),
         }
     }

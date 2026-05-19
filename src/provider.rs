@@ -159,7 +159,9 @@ pub enum RdmaRole {
 }
 
 impl Default for RdmaRole {
-    fn default() -> Self { Self::Both }
+    fn default() -> Self {
+        Self::Both
+    }
 }
 
 // ── RdmaTransferHandle ─────────────────────────────────────────────────────────
@@ -185,7 +187,11 @@ impl RdmaTransferHandle {
     /// Create a new handle.  Used by provider implementations that construct
     /// handles in external crates (e.g. the `s3-rdma-client` plugin crate).
     pub fn new(token: Vec<u8>, offset: usize, size: usize) -> Self {
-        Self { token, offset, size }
+        Self {
+            token,
+            offset,
+            size,
+        }
     }
 
     /// Opaque token bytes for the `x-amz-rdma-token` HTTP header.
@@ -232,23 +238,23 @@ pub trait RdmaProviderBase: Send + Sync {
 
     /// Configure the telemetry output destination and verbosity level.
     fn setup_telemetry(&self, _config: &TelemetryConfig) -> Result<(), crate::error::RdmaError> {
-        Err(crate::error::RdmaError::OperationNotSupported { reason: 
-            "telemetry not supported by this provider".into(),
-         })
+        Err(crate::error::RdmaError::OperationNotSupported {
+            reason: "telemetry not supported by this provider".into(),
+        })
     }
 
     /// Shut down telemetry and reset to the default output stream.
     fn shutdown_telemetry(&self) -> Result<(), crate::error::RdmaError> {
-        Err(crate::error::RdmaError::OperationNotSupported { reason: 
-            "telemetry not supported by this provider".into(),
-         })
+        Err(crate::error::RdmaError::OperationNotSupported {
+            reason: "telemetry not supported by this provider".into(),
+        })
     }
 
     /// Change the verbosity level without reconfiguring the output destination.
     fn set_telem_level(&self, _level: TelemLevel) -> Result<(), crate::error::RdmaError> {
-        Err(crate::error::RdmaError::OperationNotSupported { reason: 
-            "telemetry not supported by this provider".into(),
-         })
+        Err(crate::error::RdmaError::OperationNotSupported {
+            reason: "telemetry not supported by this provider".into(),
+        })
     }
 }
 
@@ -395,7 +401,9 @@ impl<T: RdmaClientChannel + ?Sized> RdmaClientChannelExt for T {
     {
         let cap = self.size().saturating_sub(offset);
         let n = data.len().min(cap);
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr().add(offset), n); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr().add(offset), n);
+        }
         let handle = self.prepare_put(offset, n)?;
         let (status, transferred) = send(handle.token())?;
         self.complete_put(handle, status, transferred)?;
@@ -467,11 +475,10 @@ pub trait RdmaClientProvider: RdmaProviderBase {
         _size: usize,
         _key: &[u8],
     ) -> Result<Box<dyn RdmaClientChannel>, crate::error::RdmaError> {
-        Err(crate::error::RdmaError::OperationNotSupported { reason: 
-            "bind: not supported by this provider".into(),
-         })
+        Err(crate::error::RdmaError::OperationNotSupported {
+            reason: "bind: not supported by this provider".into(),
+        })
     }
-
 }
 
 // ── RdmaServerChannel trait ─────────────────────────────────────────────────────────
@@ -500,8 +507,8 @@ pub trait RdmaServerChannel: Send + Sync {
     fn handle_put(
         &self,
         offset: usize,
-        size:   usize,
-        write:  Box<dyn FnOnce(&[u8]) -> Result<usize, crate::error::RdmaError> + Send + '_>,
+        size: usize,
+        write: Box<dyn FnOnce(&[u8]) -> Result<usize, crate::error::RdmaError> + Send + '_>,
     ) -> Result<usize, crate::error::RdmaError>;
 
     /// Zero-copy RDMA GET: call `read` to fill the buffer from storage, then
@@ -514,8 +521,8 @@ pub trait RdmaServerChannel: Send + Sync {
     fn handle_get(
         &self,
         offset: usize,
-        size:   usize,
-        read:   Box<dyn FnOnce(&mut [u8]) -> Result<usize, crate::error::RdmaError> + Send + '_>,
+        size: usize,
+        read: Box<dyn FnOnce(&mut [u8]) -> Result<usize, crate::error::RdmaError> + Send + '_>,
     ) -> Result<usize, crate::error::RdmaError>;
 
     /// The S3 object key this channel is bound to.
@@ -545,35 +552,20 @@ pub trait RdmaServerChannelExt: RdmaServerChannel {
         W: FnOnce(&[u8]) -> Result<usize, crate::error::RdmaError> + Send;
 
     /// Handle an RDMA GET: call `read` to fill the buffer, then write it to the client.
-    fn get<R>(
-        &self,
-        offset: usize,
-        size: usize,
-        read: R,
-    ) -> Result<usize, crate::error::RdmaError>
+    fn get<R>(&self, offset: usize, size: usize, read: R) -> Result<usize, crate::error::RdmaError>
     where
         R: FnOnce(&mut [u8]) -> Result<usize, crate::error::RdmaError> + Send;
 }
 
 impl<T: RdmaServerChannel + ?Sized> RdmaServerChannelExt for T {
-    fn put<W>(
-        &self,
-        offset: usize,
-        size: usize,
-        write: W,
-    ) -> Result<usize, crate::error::RdmaError>
+    fn put<W>(&self, offset: usize, size: usize, write: W) -> Result<usize, crate::error::RdmaError>
     where
         W: FnOnce(&[u8]) -> Result<usize, crate::error::RdmaError> + Send,
     {
         self.handle_put(offset, size, Box::new(write))
     }
 
-    fn get<R>(
-        &self,
-        offset: usize,
-        size: usize,
-        read: R,
-    ) -> Result<usize, crate::error::RdmaError>
+    fn get<R>(&self, offset: usize, size: usize, read: R) -> Result<usize, crate::error::RdmaError>
     where
         R: FnOnce(&mut [u8]) -> Result<usize, crate::error::RdmaError> + Send,
     {
@@ -610,9 +602,9 @@ pub trait RdmaServerProvider: RdmaProviderBase {
         _key: &[u8],
         _token: &[u8],
     ) -> Result<Box<dyn RdmaServerChannel>, crate::error::RdmaError> {
-        Err(crate::error::RdmaError::OperationNotSupported { reason: 
-            "open_channel: not supported by this provider".into(),
-         })
+        Err(crate::error::RdmaError::OperationNotSupported {
+            reason: "open_channel: not supported by this provider".into(),
+        })
     }
 }
 
@@ -768,18 +760,18 @@ impl RdmaProviderConfig {
 /// ```
 pub struct RdmaProviderConfigBuilder {
     provider: String,
-    debug:    bool,
-    role:     RdmaRole,
-    server:   RdmaServerConfig,
+    debug: bool,
+    role: RdmaRole,
+    server: RdmaServerConfig,
 }
 
 impl RdmaProviderConfigBuilder {
     fn new() -> Self {
         Self {
             provider: "auto".to_owned(),
-            debug:    false,
-            role:     RdmaRole::Both,
-            server:   RdmaServerConfig::default(),
+            debug: false,
+            role: RdmaRole::Both,
+            server: RdmaServerConfig::default(),
         }
     }
 
@@ -859,9 +851,7 @@ impl RdmaProviderConfigBuilder {
     /// prefer [`build_client`](Self::build_client) or
     /// [`build_server`](Self::build_server) for narrower types.
     #[allow(deprecated)]
-    pub fn build(
-        self,
-    ) -> Result<std::sync::Arc<dyn RdmaProvider>, crate::error::RdmaError> {
+    pub fn build(self) -> Result<std::sync::Arc<dyn RdmaProvider>, crate::error::RdmaError> {
         crate::create_provider(&self.provider, self.debug, self.role, Some(&self.server))
     }
 }
@@ -885,13 +875,23 @@ impl PendingTransfer {
     }
 
     /// Complete a PUT operation, consuming this transfer.
-    pub fn complete_put(self, rdma_status: u16, transferred: usize) -> Result<(), crate::error::RdmaError> {
-        self.channel.complete_put(self.handle, rdma_status, transferred)
+    pub fn complete_put(
+        self,
+        rdma_status: u16,
+        transferred: usize,
+    ) -> Result<(), crate::error::RdmaError> {
+        self.channel
+            .complete_put(self.handle, rdma_status, transferred)
     }
 
     /// Complete a GET operation, consuming this transfer.
-    pub fn complete_get(self, rdma_status: u16, transferred: usize) -> Result<(), crate::error::RdmaError> {
-        self.channel.complete_get(self.handle, rdma_status, transferred)
+    pub fn complete_get(
+        self,
+        rdma_status: u16,
+        transferred: usize,
+    ) -> Result<(), crate::error::RdmaError> {
+        self.channel
+            .complete_get(self.handle, rdma_status, transferred)
     }
 
     /// Borrow the client channel (e.g. to access `ptr()` for data copy-back).
@@ -912,7 +912,9 @@ pub struct InflightTransfers {
 impl InflightTransfers {
     /// Create an empty registry.
     pub fn new() -> Self {
-        Self { inner: std::sync::Mutex::new(std::collections::HashMap::new()) }
+        Self {
+            inner: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
 
     /// Insert a pending transfer keyed by `token`.
@@ -937,11 +939,15 @@ impl InflightTransfers {
 }
 
 impl Default for InflightTransfers {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl std::fmt::Debug for InflightTransfers {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InflightTransfers").field("len", &self.len()).finish()
+        f.debug_struct("InflightTransfers")
+            .field("len", &self.len())
+            .finish()
     }
 }

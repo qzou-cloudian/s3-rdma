@@ -13,13 +13,12 @@ use std::sync::{Arc, Mutex};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::PyClassInitializer;
 use pyo3::types::PyBytes;
+use pyo3::PyClassInitializer;
 
 use crate::provider::{
-    InflightTransfers, PendingTransfer, RdmaProviderConfigBuilder,
-    RdmaRole, RdmaServerChannelExt, TelemetryConfig,
-    DEFAULT_RDMA_BUF_SIZE,
+    InflightTransfers, PendingTransfer, RdmaProviderConfigBuilder, RdmaRole, RdmaServerChannelExt,
+    TelemetryConfig, DEFAULT_RDMA_BUF_SIZE,
 };
 use crate::TelemLevel;
 
@@ -27,10 +26,10 @@ fn parse_role(role: &str) -> PyResult<RdmaRole> {
     match role {
         "client" => Ok(RdmaRole::Client),
         "server" => Ok(RdmaRole::Server),
-        "both"   => Ok(RdmaRole::Both),
-        other => Err(PyRuntimeError::new_err(
-            format!("unknown role '{other}' (valid: client, server, both)")
-        )),
+        "both" => Ok(RdmaRole::Both),
+        other => Err(PyRuntimeError::new_err(format!(
+            "unknown role '{other}' (valid: client, server, both)"
+        ))),
     }
 }
 
@@ -56,7 +55,7 @@ fn parse_role(role: &str) -> PyResult<RdmaRole> {
 ///     written  = ep.handle_get(b"bucket/key", received, token)
 #[pyclass(name = "RdmaProvider", subclass)]
 pub struct PyRdmaProvider {
-    inner:   Arc<dyn crate::provider::RdmaProvider>,
+    inner: Arc<dyn crate::provider::RdmaProvider>,
     /// Per-provider registry of in-flight RDMA transfers, keyed by token bytes.
     inflight: InflightTransfers,
     /// Per-token destination buffer pointers for GET operations.
@@ -87,13 +86,13 @@ impl PyRdmaProvider {
         buf_size = DEFAULT_RDMA_BUF_SIZE,
     ))]
     pub fn new(
-        provider:    &str,
-        role:        &str,
-        debug:       bool,
-        shm_path:    &str,
+        provider: &str,
+        role: &str,
+        debug: bool,
+        shm_path: &str,
         listen_addr: &str,
         listen_port: u16,
-        buf_size:    usize,
+        buf_size: usize,
     ) -> PyResult<Self> {
         let provider_role = parse_role(role)?;
         RdmaProviderConfigBuilder::new()
@@ -116,16 +115,24 @@ impl PyRdmaProvider {
     // ── Info ─────────────────────────────────────────────────────────────────
 
     /// Human-readable provider name (e.g. ``"MockRdmaProvider"``).
-    fn name(&self) -> &str { self.inner.name() }
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
 
     /// Transport protocol: ``"mock"`` or ``"cuobj"``.
-    fn protocol(&self) -> &str { self.inner.protocol() }
+    fn protocol(&self) -> &str {
+        self.inner.protocol()
+    }
 
     /// ``True`` if this provider supports client-side operations.
-    fn supports_client(&self) -> bool { self.inner.supports_client() }
+    fn supports_client(&self) -> bool {
+        self.inner.supports_client()
+    }
 
     /// ``True`` if this provider supports server-side operations.
-    fn supports_server(&self) -> bool { self.inner.supports_server() }
+    fn supports_server(&self) -> bool {
+        self.inner.supports_server()
+    }
 
     /// Capacity in bytes of the server's per-slot transfer buffer.
     fn buf_size(&self) -> usize {
@@ -135,7 +142,9 @@ impl PyRdmaProvider {
     // ── Client methods ────────────────────────────────────────────────────────
 
     /// Returns ``True`` — the channel API validates suitability at bind time.
-    fn is_memory_suitable(&self, _ptr: u64, _size: usize) -> bool { true }
+    fn is_memory_suitable(&self, _ptr: u64, _size: usize) -> bool {
+        true
+    }
 
     /// Generate an RDMA token for an S3 PUT (upload).
     ///
@@ -152,17 +161,19 @@ impl PyRdmaProvider {
     /// :returns: opaque token to attach as ``x-amz-rdma-token``.
     fn prepare_put_token<'py>(
         &self,
-        py:     Python<'py>,
-        data:   &Bound<'_, PyAny>,
+        py: Python<'py>,
+        data: &Bound<'_, PyAny>,
         offset: usize,
-        size:   usize,
+        size: usize,
         s3_key: &[u8],
     ) -> PyResult<Bound<'py, PyBytes>> {
         let buf = PyBuffer::<u8>::get_bound(data)?;
         let data_ptr = buf.buf_ptr() as *const u8;
         let data_len = buf.len_bytes();
 
-        let ch = self.inner.bind(data_len, s3_key)
+        let ch = self
+            .inner
+            .bind(data_len, s3_key)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         // Copy the caller's data into the channel's registered buffer.
@@ -174,11 +185,13 @@ impl PyRdmaProvider {
         }
 
         let put_size = size.min(copy_len.saturating_sub(offset));
-        let put_handle = ch.prepare_put(offset, put_size)
+        let put_handle = ch
+            .prepare_put(offset, put_size)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         let token = put_handle.token().to_vec();
-        self.inflight.insert(token.clone(), PendingTransfer::new(ch, put_handle));
+        self.inflight
+            .insert(token.clone(), PendingTransfer::new(ch, put_handle));
 
         Ok(PyBytes::new_bound(py, &token))
     }
@@ -199,26 +212,33 @@ impl PyRdmaProvider {
     /// :returns: opaque token to attach as ``x-amz-rdma-token``.
     fn prepare_get_token<'py>(
         &self,
-        py:     Python<'py>,
-        data:   &Bound<'_, PyAny>,
+        py: Python<'py>,
+        data: &Bound<'_, PyAny>,
         offset: usize,
-        size:   usize,
+        size: usize,
         s3_key: &[u8],
     ) -> PyResult<Bound<'py, PyBytes>> {
         let buf = PyBuffer::<u8>::get_bound(data)?;
         let dst_ptr = buf.buf_ptr() as *mut u8;
         let dst_len = buf.len_bytes();
 
-        let ch = self.inner.bind(dst_len, s3_key)
+        let ch = self
+            .inner
+            .bind(dst_len, s3_key)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         let get_size = size.min(dst_len.saturating_sub(offset));
-        let get_handle = ch.prepare_get(offset, get_size)
+        let get_handle = ch
+            .prepare_get(offset, get_size)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         let token = get_handle.token().to_vec();
-        self.inflight.insert(token.clone(), PendingTransfer::new(ch, get_handle));
-        self.get_buffers.lock().unwrap().insert(token.clone(), (dst_ptr, dst_len));
+        self.inflight
+            .insert(token.clone(), PendingTransfer::new(ch, get_handle));
+        self.get_buffers
+            .lock()
+            .unwrap()
+            .insert(token.clone(), (dst_ptr, dst_len));
 
         Ok(PyBytes::new_bound(py, &token))
     }
@@ -236,22 +256,24 @@ impl PyRdmaProvider {
     /// :param callback:       callable invoked with ``(error_code, reply_token)``.
     fn process_rdma_reply(
         &self,
-        rdma_status:   u16,
+        rdma_status: u16,
         request_token: &[u8],
-        transferred:   usize,
-        callback:      PyObject,
+        transferred: usize,
+        callback: PyObject,
     ) -> PyResult<()> {
-        let transfer = self.inflight.remove(request_token)
-            .ok_or_else(|| PyRuntimeError::new_err(
+        let transfer = self.inflight.remove(request_token).ok_or_else(|| {
+            PyRuntimeError::new_err(
                 "no pending transfer for the given token; \
-                 call prepare_put_token or prepare_get_token first"
-            ))?;
+                 call prepare_put_token or prepare_get_token first",
+            )
+        })?;
 
         let get_buf = self.get_buffers.lock().unwrap().remove(request_token);
         if let Some((dst_ptr, dst_len)) = get_buf {
-            let chan_ptr  = transfer.channel().ptr();
+            let chan_ptr = transfer.channel().ptr();
             let chan_size = transfer.channel().size();
-            transfer.complete_get(rdma_status, transferred)
+            transfer
+                .complete_get(rdma_status, transferred)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let n = transferred.min(dst_len).min(chan_size);
             if n > 0 {
@@ -260,7 +282,8 @@ impl PyRdmaProvider {
                 }
             }
         } else {
-            transfer.complete_put(rdma_status, transferred)
+            transfer
+                .complete_put(rdma_status, transferred)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
 
@@ -283,24 +306,29 @@ impl PyRdmaProvider {
     #[pyo3(signature = (s3_key, token, size = 0, offset = 0))]
     fn handle_put<'py>(
         &self,
-        py:     Python<'py>,
+        py: Python<'py>,
         s3_key: &[u8],
-        token:  &[u8],
-        size:   usize,
+        token: &[u8],
+        size: usize,
         offset: usize,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let buf_cap = if size > 0 { size } else {
+        let buf_cap = if size > 0 {
+            size
+        } else {
             self.inner.buf_size().clamp(4096, DEFAULT_RDMA_BUF_SIZE)
         };
         let mut received: Vec<u8> = Vec::with_capacity(buf_cap);
 
-        let ch = self.inner.open_channel(s3_key, token)
+        let ch = self
+            .inner
+            .open_channel(s3_key, token)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         ch.put(offset, buf_cap, |data: &[u8]| {
             received.extend_from_slice(data);
             Ok(data.len())
-        }).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         Ok(PyBytes::new_bound(py, &received))
     }
@@ -317,21 +345,24 @@ impl PyRdmaProvider {
     fn handle_get(
         &self,
         s3_key: &[u8],
-        data:   &[u8],
-        token:  &[u8],
+        data: &[u8],
+        token: &[u8],
         offset: usize,
     ) -> PyResult<usize> {
         let data_owned = data.to_vec();
         let data_len = data_owned.len();
 
-        let ch = self.inner.open_channel(s3_key, token)
+        let ch = self
+            .inner
+            .open_channel(s3_key, token)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         ch.get(offset, data_len, move |buf: &mut [u8]| {
             let n = data_len.min(buf.len());
             buf[..n].copy_from_slice(&data_owned[..n]);
             Ok(n)
-        }).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     fn __repr__(&self) -> String {
@@ -359,12 +390,7 @@ impl PyRdmaProvider {
     ///               (``TELEM_OFF=0``, ``TELEM_ERROR=1``, ``TELEM_INFO=2``,
     ///               ``TELEM_DEBUG=3``).  Default: ``TELEM_ERROR``.
     #[pyo3(signature = (use_otel = false, log_file = None, level = 1u32))]
-    fn setup_telemetry(
-        &self,
-        use_otel: bool,
-        log_file: Option<&str>,
-        level: u32,
-    ) -> PyResult<()> {
+    fn setup_telemetry(&self, use_otel: bool, log_file: Option<&str>, level: u32) -> PyResult<()> {
         let lvl = match level {
             0 => TelemLevel::Off,
             1 => TelemLevel::Error,
@@ -376,13 +402,15 @@ impl PyRdmaProvider {
             log_file: log_file.map(|s| s.to_owned()),
             level: lvl,
         };
-        self.inner.setup_telemetry(&cfg)
+        self.inner
+            .setup_telemetry(&cfg)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Shut down telemetry for this provider.
     fn shutdown_telemetry(&self) -> PyResult<()> {
-        self.inner.shutdown_telemetry()
+        self.inner
+            .shutdown_telemetry()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -398,7 +426,8 @@ impl PyRdmaProvider {
             2 => TelemLevel::Info,
             _ => TelemLevel::Debug,
         };
-        self.inner.set_telem_level(lvl)
+        self.inner
+            .set_telem_level(lvl)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 }
@@ -476,15 +505,20 @@ impl PyCuObjProvider {
         buf_size = DEFAULT_RDMA_BUF_SIZE,
     ))]
     fn new(
-        role:        &str,
-        debug:       bool,
+        role: &str,
+        debug: bool,
         listen_addr: &str,
         listen_port: u16,
-        buf_size:    usize,
+        buf_size: usize,
     ) -> PyResult<PyClassInitializer<Self>> {
         let base = PyRdmaProvider::new(
-            "cuobj", role, debug, "/dev/shm",
-            listen_addr, listen_port, buf_size,
+            "cuobj",
+            role,
+            debug,
+            "/dev/shm",
+            listen_addr,
+            listen_port,
+            buf_size,
         )?;
         Ok(PyClassInitializer::from(base).add_subclass(PyCuObjProvider))
     }
@@ -505,9 +539,9 @@ fn s3_rdma(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCuObjProvider>()?;
     m.add_function(wrap_pyfunction!(rdma_provider_info, m)?)?;
     // Telemetry level constants — use these instead of raw integers.
-    m.add("TELEM_OFF",   0u32)?;
+    m.add("TELEM_OFF", 0u32)?;
     m.add("TELEM_ERROR", 1u32)?;
-    m.add("TELEM_INFO",  2u32)?;
+    m.add("TELEM_INFO", 2u32)?;
     m.add("TELEM_DEBUG", 3u32)?;
     Ok(())
 }

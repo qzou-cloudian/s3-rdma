@@ -58,36 +58,44 @@
 //! | `rdma-server` | Enable [`RdmaPluginServer`] / [`RdmaPlugin`] server role   |
 //! | (none)          | Only [`MockRdmaProvider`] available                                 |
 
-pub(crate) mod rdma_client;
-pub(crate) mod rdma_server;
 pub mod error;
 pub mod ffi;
 pub mod mock;
 pub mod provider;
-pub mod token;
 #[cfg(feature = "pyo3")]
 mod python;
+pub(crate) mod rdma_client;
+pub(crate) mod rdma_server;
+pub mod token;
 
 // ── Primary public API ────────────────────────────────────────────────────────
 
-pub use provider::{RdmaRole, RdmaProvider, RdmaProviderConfig, RdmaProviderConfigBuilder, RdmaProviderBase};
-pub use provider::{RdmaServerChannel, RdmaClientChannel, RdmaClientChannelExt, RdmaServerChannelExt, RdmaClientProvider, RdmaServerProvider, RdmaTransferHandle};
-pub use provider::{TelemetryConfig, TelemLevel, TelemState};
-pub use provider::{DEFAULT_RDMA_BUF_SIZE, RDMA_REQUIRED_ALIGNMENT};
-pub use provider::{RDMA_TOKEN_HEADER, RDMA_REPLY_HEADER, RDMA_BYTES_HEADER, RDMA_STREAM_HEADER, RDMA_TOKEN_SEPARATOR};
 pub use mock::MockRdmaProvider;
+pub use provider::{
+    RdmaClientChannel, RdmaClientChannelExt, RdmaClientProvider, RdmaServerChannel,
+    RdmaServerChannelExt, RdmaServerProvider, RdmaTransferHandle,
+};
+pub use provider::{
+    RdmaProvider, RdmaProviderBase, RdmaProviderConfig, RdmaProviderConfigBuilder, RdmaRole,
+};
+pub use provider::{TelemLevel, TelemState, TelemetryConfig};
+pub use provider::{DEFAULT_RDMA_BUF_SIZE, RDMA_REQUIRED_ALIGNMENT};
+pub use provider::{
+    RDMA_BYTES_HEADER, RDMA_REPLY_HEADER, RDMA_STREAM_HEADER, RDMA_TOKEN_HEADER,
+    RDMA_TOKEN_SEPARATOR,
+};
 #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
 pub use rdma_client::RdmaPlugin;
 
 // ── Supporting types ──────────────────────────────────────────────────────────
 
-pub use provider::{RdmaServerConfig, PendingTransfer, InflightTransfers};
+pub use provider::{InflightTransfers, PendingTransfer, RdmaServerConfig};
 pub use token::RdmaToken;
 
 #[cfg(feature = "rdma-client")]
-pub use rdma_client::RdmaPluginClient;
-#[cfg(feature = "rdma-client")]
 pub use rdma_client::rdma_available;
+#[cfg(feature = "rdma-client")]
+pub use rdma_client::RdmaPluginClient;
 
 #[cfg(feature = "rdma-server")]
 pub use rdma_server::RdmaPluginServer;
@@ -109,7 +117,11 @@ pub fn rdma_provider_info() -> String {
 
     #[cfg(feature = "rdma-client")]
     {
-        let status = if rdma_available() { "available" } else { "unavailable" };
+        let status = if rdma_available() {
+            "available"
+        } else {
+            "unavailable"
+        };
         entries.push(format!("cuobj ({status})"));
     }
 
@@ -173,15 +185,17 @@ pub fn create_provider(
                         RdmaPlugin::new_both(c)
                     }
                 };
-                result = ep.map(|e| {
-                    if debug {
-                        info!("[rdma] Using RdmaPlugin (role={role:?})");
-                    }
-                    Arc::new(e) as Arc<dyn RdmaProvider>
-                }).map_err(|e| RdmaError::ProviderUnavailable {
-                    provider: provider.to_owned(),
-                    reason: e.to_string(),
-                });
+                result = ep
+                    .map(|e| {
+                        if debug {
+                            info!("[rdma] Using RdmaPlugin (role={role:?})");
+                        }
+                        Arc::new(e) as Arc<dyn RdmaProvider>
+                    })
+                    .map_err(|e| RdmaError::ProviderUnavailable {
+                        provider: provider.to_owned(),
+                        reason: e.to_string(),
+                    });
             }
             #[cfg(not(any(feature = "rdma-client", feature = "rdma-server")))]
             {
@@ -200,10 +214,12 @@ pub fn create_provider(
                 Err(_) => return create_provider("mock", debug, role, cfg),
             }
         }
-        other => return Err(RdmaError::ProviderUnavailable {
-            provider: other.to_owned(),
-            reason: "unknown provider (valid: mock, cuobj, auto)".to_owned(),
-        }),
+        other => {
+            return Err(RdmaError::ProviderUnavailable {
+                provider: other.to_owned(),
+                reason: "unknown provider (valid: mock, cuobj, auto)".to_owned(),
+            })
+        }
     };
     Ok(ep)
 }
@@ -212,7 +228,10 @@ pub fn create_provider(
 ///
 /// Convenience wrapper around [`create_provider`] with [`RdmaRole::Client`].
 /// No server configuration is needed — the provider is client-only.
-#[deprecated(since = "0.4.0", note = "use `RdmaProviderConfig::builder().build_client()` instead")]
+#[deprecated(
+    since = "0.4.0",
+    note = "use `RdmaProviderConfig::builder().build_client()` instead"
+)]
 #[allow(deprecated)]
 pub fn create_client_provider(
     provider: &str,
@@ -226,7 +245,10 @@ pub fn create_client_provider(
 ///
 /// Convenience wrapper around [`create_provider`] with [`RdmaRole::Server`].
 /// The `cfg` provides listen address, port, and buffer size for the server.
-#[deprecated(since = "0.4.0", note = "use `RdmaProviderConfig::builder().build_server()` instead")]
+#[deprecated(
+    since = "0.4.0",
+    note = "use `RdmaProviderConfig::builder().build_server()` instead"
+)]
 #[allow(deprecated)]
 pub fn create_server_provider(
     provider: &str,
@@ -236,6 +258,3 @@ pub fn create_server_provider(
     create_provider(provider, debug, RdmaRole::Server, Some(cfg))
         .map(|p| p as Arc<dyn RdmaServerProvider>)
 }
-
-
-

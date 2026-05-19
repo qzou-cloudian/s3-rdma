@@ -31,7 +31,7 @@ use std::sync::OnceLock;
 use tracing::{error, info, warn};
 
 use cuobj::CuObjClient;
-use cuobj_sys::{self, CU_OBJ_SUCCESS, CUOBJ_GET, CUOBJ_PUT};
+use cuobj_sys::{self, CUOBJ_GET, CUOBJ_PUT, CU_OBJ_SUCCESS};
 use s3_rdma::error::RdmaError;
 use s3_rdma::ffi::{ByteCursor, CTelemetryConfig, RdmaProviderVtable};
 use s3_rdma::provider::{RdmaClientChannel, RdmaTransferHandle};
@@ -59,7 +59,11 @@ fn mmap_alloc(size: usize) -> *mut u8 {
             0,
         )
     };
-    if ptr == libc::MAP_FAILED { std::ptr::null_mut() } else { ptr as *mut u8 }
+    if ptr == libc::MAP_FAILED {
+        std::ptr::null_mut()
+    } else {
+        ptr as *mut u8
+    }
 }
 
 // ── Global state (created once, lives for the process lifetime) ────────────────
@@ -68,13 +72,13 @@ struct GlobalState {
     /// Raw cuObjClient handle (standard, no ops callbacks).
     client_raw: usize,
     /// mmap'd, ibv-registered buffer.
-    ptr:        usize,
+    ptr: usize,
     /// Registered size in bytes.
-    size:       usize,
+    size: usize,
     /// Persistent DCT descriptor for GET (RDMA_WRITE server→client).
-    token_get:  Vec<u8>,
+    token_get: Vec<u8>,
     /// Persistent DCT descriptor for PUT (RDMA_READ client→server).
-    token_put:  Vec<u8>,
+    token_put: Vec<u8>,
 }
 
 unsafe impl Send for GlobalState {}
@@ -157,16 +161,20 @@ fn global_init(requested_size: usize) -> Option<&'static GlobalState> {
             token_put,
         }
     });
-    if state.client_raw == 0 { None } else { Some(state) }
+    if state.client_raw == 0 {
+        None
+    } else {
+        Some(state)
+    }
 }
 
 // ── CuObjClientChannel ────────────────────────────────────────────────────────
 
 /// One RDMA channel — a view into the global buffer + persistent DCT tokens.
 struct CuObjClientChannel {
-    key:       Vec<u8>,
-    ptr:       *mut u8,
-    size:      usize,
+    key: Vec<u8>,
+    ptr: *mut u8,
+    size: usize,
     token_get: Vec<u8>,
     token_put: Vec<u8>,
 }
@@ -181,11 +189,19 @@ impl Drop for CuObjClientChannel {
 }
 
 impl RdmaClientChannel for CuObjClientChannel {
-    fn key(&self)  -> &[u8]     { &self.key }
-    fn ptr(&self)  -> *mut u8 { self.ptr }
-    fn size(&self) -> usize      { self.size }
+    fn key(&self) -> &[u8] {
+        &self.key
+    }
+    fn ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+    fn size(&self) -> usize {
+        self.size
+    }
 
-    fn get_max_transfer_size(&self) -> usize { usize::MAX }
+    fn get_max_transfer_size(&self) -> usize {
+        usize::MAX
+    }
 
     /// Return the cached persistent PUT DCT token — the server will RDMA_READ from
     /// our buffer using the token; data is already in place from the caller's
@@ -196,7 +212,10 @@ impl RdmaClientChannel for CuObjClientChannel {
     /// The gateway's `RdmaToken::parse` strips this extension before passing
     /// the base token to the cuObj C SDK.
     fn prepare_put(&self, offset: usize, size: usize) -> Result<RdmaTransferHandle, RdmaError> {
-        info!("[s3-rdma] prepare_put: token_len={} offset={offset} size={size}", self.token_put.len());
+        info!(
+            "[s3-rdma] prepare_put: token_len={} offset={offset} size={size}",
+            self.token_put.len()
+        );
         let base = String::from_utf8_lossy(&self.token_put);
         let token = format!("{base}:{offset:x}:{size:x}").into_bytes();
         Ok(RdmaTransferHandle::new(token, offset, size))
@@ -207,30 +226,47 @@ impl RdmaClientChannel for CuObjClientChannel {
     ///
     /// Appends `:offset:size` (hex-encoded) so the server knows how many bytes to RDMA_WRITE.
     fn prepare_get(&self, offset: usize, size: usize) -> Result<RdmaTransferHandle, RdmaError> {
-        info!("[s3-rdma] prepare_get: token_len={} offset={offset} size={size}", self.token_get.len());
+        info!(
+            "[s3-rdma] prepare_get: token_len={} offset={offset} size={size}",
+            self.token_get.len()
+        );
         let base = String::from_utf8_lossy(&self.token_get);
         let token = format!("{base}:{offset:x}:{size:x}").into_bytes();
         Ok(RdmaTransferHandle::new(token, offset, size))
     }
 
     /// The server has finished RDMA_READ from our buffer. Confirm the reply status.
-    fn complete_put(&self, _handle: RdmaTransferHandle, rdma_status: u16, _transferred: usize) -> Result<(), RdmaError> {
+    fn complete_put(
+        &self,
+        _handle: RdmaTransferHandle,
+        rdma_status: u16,
+        _transferred: usize,
+    ) -> Result<(), RdmaError> {
         info!("[s3-rdma] complete_put: status={rdma_status}");
         if (200..300).contains(&(rdma_status as u32)) {
             Ok(())
         } else {
-            Err(RdmaError::TransferFailed { reason: format!("RDMA PUT reply status={rdma_status}") })
+            Err(RdmaError::TransferFailed {
+                reason: format!("RDMA PUT reply status={rdma_status}"),
+            })
         }
     }
 
     /// The upstream has already written data into our buffer via RDMA_WRITE
     /// by the time the HTTP 200 arrives.  Nothing to signal.
-    fn complete_get(&self, _handle: RdmaTransferHandle, rdma_status: u16, _transferred: usize) -> Result<(), RdmaError> {
+    fn complete_get(
+        &self,
+        _handle: RdmaTransferHandle,
+        rdma_status: u16,
+        _transferred: usize,
+    ) -> Result<(), RdmaError> {
         info!("[s3-rdma] complete_get: status={rdma_status}");
         if (200..300).contains(&(rdma_status as u32)) {
             Ok(())
         } else {
-            Err(RdmaError::TransferFailed { reason: format!("RDMA GET reply status={rdma_status}") })
+            Err(RdmaError::TransferFailed {
+                reason: format!("RDMA GET reply status={rdma_status}"),
+            })
         }
     }
 }
@@ -255,9 +291,14 @@ unsafe extern "C" fn c_init(_: *mut c_void, _: *mut *mut c_void) -> i32 {
 unsafe extern "C" fn c_cleanup(_: *mut c_void) {}
 
 unsafe extern "C" fn c_bind_channel(
-    _ctx: *mut c_void, size: usize, key: *const ByteCursor, out: *mut *mut c_void,
+    _ctx: *mut c_void,
+    size: usize,
+    key: *const ByteCursor,
+    out: *mut *mut c_void,
 ) -> i32 {
-    if key.is_null() || out.is_null() { return -1; }
+    if key.is_null() || out.is_null() {
+        return -1;
+    }
     let key_slice = unsafe { (*key).as_slice() };
 
     info!("[s3-rdma] bind_channel: size={size}");
@@ -274,19 +315,24 @@ unsafe extern "C" fn c_bind_channel(
     // requested size exceeds it, return an error so the caller falls back
     // to plain HTTP rather than panicking on a too-small slice.
     if size > state.size {
-        warn!("[s3-rdma] bind_channel: size={size} > buffer_size={} — falling back", state.size);
+        warn!(
+            "[s3-rdma] bind_channel: size={size} > buffer_size={} — falling back",
+            state.size
+        );
         return -1;
     }
 
     let channel: Box<dyn RdmaClientChannel> = Box::new(CuObjClientChannel {
-        key:       key_slice.to_vec(),
-        ptr:       state.ptr as *mut u8,
-        size:      state.size,
+        key: key_slice.to_vec(),
+        ptr: state.ptr as *mut u8,
+        size: state.size,
         token_get: state.token_get.clone(),
         token_put: state.token_put.clone(),
     });
     let boxed: Box<Box<dyn RdmaClientChannel>> = Box::new(channel);
-    unsafe { *out = Box::into_raw(boxed) as *mut c_void; }
+    unsafe {
+        *out = Box::into_raw(boxed) as *mut c_void;
+    }
     0
 }
 
@@ -294,17 +340,27 @@ unsafe extern "C" fn c_bind_channel(
 // Map our 0-3 level to the cuobj SDK flag bits (CUOBJ_LOG_PATH_*).
 // Kept in sync with providers/server/src/rdma.rs.
 fn level_to_cuobj_flags(level: u32) -> u32 {
-    match level { 0 => 0, 1 => 0x0004, 2 => 0x0005, _ => 0x0007 }
+    match level {
+        0 => 0,
+        1 => 0x0004,
+        2 => 0x0005,
+        _ => 0x0007,
+    }
 }
 
 unsafe extern "C" fn c_setup_telemetry(ctx: *mut c_void, cfg: *const CTelemetryConfig) -> i32 {
     let rc = crate::telem::setup(ctx, cfg);
-    if rc != 0 || cfg.is_null() { return rc; }
+    if rc != 0 || cfg.is_null() {
+        return rc;
+    }
     let c = unsafe { &*cfg };
     let log_file = if c.log_file.is_null() {
         None
     } else {
-        unsafe { std::ffi::CStr::from_ptr(c.log_file) }.to_str().ok().map(str::to_owned)
+        unsafe { std::ffi::CStr::from_ptr(c.log_file) }
+            .to_str()
+            .ok()
+            .map(str::to_owned)
     };
     CuObjClient::setup_telemetry(c.use_otel != 0, log_file.as_deref());
     CuObjClient::set_telem_flags(level_to_cuobj_flags(c.level));
@@ -324,15 +380,17 @@ unsafe extern "C" fn c_set_telem_level(ctx: *mut c_void, level: u32) -> i32 {
 }
 
 static VTABLE: RdmaProviderVtable = RdmaProviderVtable {
-    provider_name:       PROVIDER_NAME.as_ptr() as *const c_char,
-    provider_version:    1,
-    init:                Some(c_init),
-    cleanup:             Some(c_cleanup),
-    bind_channel:        Some(c_bind_channel),
-    supports_telemetry:  Some(crate::telem::supports),
-    setup_telemetry:     Some(c_setup_telemetry),
-    shutdown_telemetry:  Some(c_shutdown_telemetry),
-    set_telem_level:     Some(c_set_telem_level),
+    provider_name: PROVIDER_NAME.as_ptr() as *const c_char,
+    provider_version: 1,
+    init: Some(c_init),
+    cleanup: Some(c_cleanup),
+    bind_channel: Some(c_bind_channel),
+    supports_telemetry: Some(crate::telem::supports),
+    setup_telemetry: Some(c_setup_telemetry),
+    shutdown_telemetry: Some(c_shutdown_telemetry),
+    set_telem_level: Some(c_set_telem_level),
 };
 
-pub fn vtable() -> *const RdmaProviderVtable { &VTABLE }
+pub fn vtable() -> *const RdmaProviderVtable {
+    &VTABLE
+}

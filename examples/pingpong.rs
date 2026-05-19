@@ -3,7 +3,9 @@
 //!   cargo run --example pingpong --manifest-path core/Cargo.toml
 
 use s3_rdma::mock::MockRdmaProvider;
-use s3_rdma::provider::{RdmaClientChannelExt, RdmaClientProvider, RdmaServerChannelExt, RdmaServerProvider};
+use s3_rdma::provider::{
+    RdmaClientChannelExt, RdmaClientProvider, RdmaServerChannelExt, RdmaServerProvider,
+};
 
 fn main() {
     println!("=== ping-pong (single-threaded) ===\n");
@@ -13,45 +15,71 @@ fn main() {
 
     let client = MockRdmaProvider::new(false, "/dev/shm", size);
     let ch = client.bind(size, key).unwrap();
-    println!("client: buffer {:p}, {} bytes, key '{}'", ch.ptr(), size, std::str::from_utf8(key).unwrap());
+    println!(
+        "client: buffer {:p}, {} bytes, key '{}'",
+        ch.ptr(),
+        size,
+        std::str::from_utf8(key).unwrap()
+    );
 
     let server = MockRdmaProvider::new(false, "/dev/shm", size);
 
     // ── PUT ────────────────────────────────────────────────────────────────
 
-    let n = ch.put(0, size,
-        |buf: &mut [u8]| { buf[..4].copy_from_slice(b"ping"); 4 },
-        |token: &[u8]| {
-            let srv = server.open_channel(key, token).unwrap();
-            let mut out = Vec::new();
-            let n = srv.put(0, size, |data: &[u8]| {
-                out.extend_from_slice(data);
-                Ok(data.len())
-            }).unwrap();
-            println!("PUT:  client sent 'ping' -> server received {} bytes: '{}'",
-                     n, std::str::from_utf8(&out[..4]).unwrap());
-            Ok((200, n))
-        },
-    ).unwrap();
+    let n = ch
+        .put(
+            0,
+            size,
+            |buf: &mut [u8]| {
+                buf[..4].copy_from_slice(b"ping");
+                4
+            },
+            |token: &[u8]| {
+                let srv = server.open_channel(key, token).unwrap();
+                let mut out = Vec::new();
+                let n = srv
+                    .put(0, size, |data: &[u8]| {
+                        out.extend_from_slice(data);
+                        Ok(data.len())
+                    })
+                    .unwrap();
+                println!(
+                    "PUT:  client sent 'ping' -> server received {} bytes: '{}'",
+                    n,
+                    std::str::from_utf8(&out[..4]).unwrap()
+                );
+                Ok((200, n))
+            },
+        )
+        .unwrap();
     assert_eq!(n, size);
 
     // ── GET ────────────────────────────────────────────────────────────────
 
     let mut received = Vec::new();
-    let _n = ch.get(0, size,
-        |token: &[u8]| {
-            let srv = server.open_channel(key, token).unwrap();
-            let n = srv.get(0, 0, |buf: &mut [u8]| {
-                buf[..4].copy_from_slice(b"pong");
-                Ok(4)
-            }).unwrap();
-            println!("GET:  server wrote {} bytes", n);
-            Ok((200, n))
-        },
-        |data: &[u8]| received.extend_from_slice(data),
-    ).unwrap();
+    let _n = ch
+        .get(
+            0,
+            size,
+            |token: &[u8]| {
+                let srv = server.open_channel(key, token).unwrap();
+                let n = srv
+                    .get(0, 0, |buf: &mut [u8]| {
+                        buf[..4].copy_from_slice(b"pong");
+                        Ok(4)
+                    })
+                    .unwrap();
+                println!("GET:  server wrote {} bytes", n);
+                Ok((200, n))
+            },
+            |data: &[u8]| received.extend_from_slice(data),
+        )
+        .unwrap();
     assert_eq!(received, b"pong");
-    println!("      client received: '{}'", std::str::from_utf8(&received).unwrap());
+    println!(
+        "      client received: '{}'",
+        std::str::from_utf8(&received).unwrap()
+    );
 
     drop(ch);
     println!("\nping-pong OK.");

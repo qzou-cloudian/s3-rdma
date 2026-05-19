@@ -9,7 +9,9 @@ use std::ffi::c_void;
 
 use s3_rdma::ffi::CTelemetryConfig;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
-use tracing_subscriber::{filter::LevelFilter, fmt, layer::SubscriberExt, reload, util::SubscriberInitExt};
+use tracing_subscriber::{
+    filter::LevelFilter, fmt, layer::SubscriberExt, reload, util::SubscriberInitExt,
+};
 
 type LevelReloadFn = Box<dyn Fn(LevelFilter) + Send + Sync + 'static>;
 static LEVEL_RELOAD: std::sync::Mutex<Option<LevelReloadFn>> = std::sync::Mutex::new(None);
@@ -23,10 +25,14 @@ fn level_to_lf(level: u32) -> LevelFilter {
     }
 }
 
-pub(crate) unsafe extern "C" fn supports(_: *mut c_void) -> i32 { 1 }
+pub(crate) unsafe extern "C" fn supports(_: *mut c_void) -> i32 {
+    1
+}
 
 pub(crate) unsafe extern "C" fn setup(_: *mut c_void, cfg: *const CTelemetryConfig) -> i32 {
-    if cfg.is_null() { return -1; }
+    if cfg.is_null() {
+        return -1;
+    }
     let c = unsafe { &*cfg };
     let log_file = if c.log_file.is_null() {
         None
@@ -39,8 +45,11 @@ pub(crate) unsafe extern "C" fn setup(_: *mut c_void, cfg: *const CTelemetryConf
 
     let writer = match log_file.as_deref() {
         Some(path) => match std::fs::File::create(path) {
-            Ok(f)  => BoxMakeWriter::new(std::sync::Mutex::new(f)),
-            Err(e) => { tracing::error!("setup_telemetry: {path}: {e}"); return -1; }
+            Ok(f) => BoxMakeWriter::new(std::sync::Mutex::new(f)),
+            Err(e) => {
+                tracing::error!("setup_telemetry: {path}: {e}");
+                return -1;
+            }
         },
         None => BoxMakeWriter::new(|| std::io::stderr()),
     };
@@ -49,7 +58,9 @@ pub(crate) unsafe extern "C" fn setup(_: *mut c_void, cfg: *const CTelemetryConf
         .with(filter)
         .with(fmt::layer().with_writer(writer));
     if registry.try_init().is_ok() {
-        let reload_fn: LevelReloadFn = Box::new(move |lf| { let _ = handle.modify(|f| *f = lf); });
+        let reload_fn: LevelReloadFn = Box::new(move |lf| {
+            let _ = handle.modify(|f| *f = lf);
+        });
         *LEVEL_RELOAD.lock().unwrap() = Some(reload_fn);
     }
     0

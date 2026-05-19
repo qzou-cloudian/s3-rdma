@@ -14,8 +14,8 @@
 //! Adding a new backend (e.g. UCX): add a Cargo feature, implement shims in a
 //! new module, add a match arm in `s3_rdma_get_client_vtable`.
 
-use std::os::raw::c_char;
 use s3_rdma::ffi::RdmaProviderVtable;
+use std::os::raw::c_char;
 
 mod telem;
 
