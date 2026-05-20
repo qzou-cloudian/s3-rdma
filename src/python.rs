@@ -17,7 +17,7 @@ use pyo3::types::PyBytes;
 use pyo3::PyClassInitializer;
 
 use crate::provider::{
-    InflightTransfers, PendingTransfer, RdmaProviderConfigBuilder, RdmaRole, RdmaServerChannelExt,
+    InflightTransfers, PendingTransfer, RdmaProviderConfig, RdmaRole, RdmaServerChannelExt,
     TelemetryConfig, DEFAULT_RDMA_BUF_SIZE,
 };
 use crate::TelemLevel;
@@ -59,7 +59,7 @@ pub struct PyRdmaProvider {
     /// Per-provider registry of in-flight RDMA transfers, keyed by token bytes.
     inflight: InflightTransfers,
     /// Per-token destination buffer pointers for GET operations.
-    get_buffers: Mutex<HashMap<Vec<u8>, (*mut u8, usize)>>,
+    get_buffers: Mutex<HashMap<Vec<u8>, (usize, usize)>>,
 }
 
 #[pymethods]
@@ -95,7 +95,7 @@ impl PyRdmaProvider {
         buf_size: usize,
     ) -> PyResult<Self> {
         let provider_role = parse_role(role)?;
-        RdmaProviderConfigBuilder::new()
+        RdmaProviderConfig::builder()
             .provider(provider)
             .debug(debug)
             .role(provider_role)
@@ -238,7 +238,7 @@ impl PyRdmaProvider {
         self.get_buffers
             .lock()
             .unwrap()
-            .insert(token.clone(), (dst_ptr, dst_len));
+            .insert(token.clone(), (dst_ptr as usize, dst_len));
 
         Ok(PyBytes::new_bound(py, &token))
     }
@@ -269,7 +269,7 @@ impl PyRdmaProvider {
         })?;
 
         let get_buf = self.get_buffers.lock().unwrap().remove(request_token);
-        if let Some((dst_ptr, dst_len)) = get_buf {
+        if let Some((dst_addr, dst_len)) = get_buf {
             let chan_ptr = transfer.channel().ptr();
             let chan_size = transfer.channel().size();
             transfer
@@ -278,7 +278,7 @@ impl PyRdmaProvider {
             let n = transferred.min(dst_len).min(chan_size);
             if n > 0 {
                 unsafe {
-                    std::ptr::copy_nonoverlapping(chan_ptr, dst_ptr, n);
+                    std::ptr::copy_nonoverlapping(chan_ptr, dst_addr as *mut u8, n);
                 }
             }
         } else {

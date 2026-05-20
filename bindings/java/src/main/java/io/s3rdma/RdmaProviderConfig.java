@@ -35,13 +35,6 @@ public final class RdmaProviderConfig {
     /** RDMA listen port for the cuObj server provider. */
     public int listenPort = 0;
 
-    /**
-     * @deprecated Pool management has moved to hsg-rdma; this field is ignored.
-     *             Will be removed in a future release.
-     */
-    @Deprecated
-    public int poolCount = 0;
-
     /** Size in bytes of each buffer pool slot (cuObj server). Default: 128 MiB. */
     public long bufSize = 128L * 1024 * 1024;
 

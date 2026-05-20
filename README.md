@@ -194,20 +194,26 @@ The main binary has **no compile-time dependency** on any RDMA SDK.
 | `pyo3` | Python bindings via PyO3 (used by `bindings/python/`) |
 | (none) | Only `MockRdmaProvider` available |
 
-### Provider factory functions
+### Provider builder
 
 ```rust
-// Full provider (client+server roles)
-let ep: Arc<dyn RdmaProvider> = create_provider("auto", true, RdmaRole::Both, &cfg)?;
+// Full provider (client+server roles by default)
+let ep: Arc<dyn RdmaProvider> = RdmaProviderConfig::builder()
+    .provider("auto")
+    .debug(true)
+    .build()?;
 
 // Client-only
-let ep: Arc<dyn RdmaClientProvider> = create_client_provider("mock", false, &cfg)?;
+let ep: Arc<dyn RdmaClientProvider> = RdmaProviderConfig::builder()
+    .provider("mock")
+    .build_client()?;
 
-// Server-only  
-let ep: Arc<dyn RdmaServerProvider> = create_server_provider("cuobj", false, &cfg)?;
-
-// Worker pool (bounded concurrency)
-let ep: Box<dyn RdmaServerProvider> = create_worker_pool("auto", false, &cfg, 4)?;
+// Server-only
+let ep: Arc<dyn RdmaServerProvider> = RdmaProviderConfig::builder()
+    .provider("cuobj")
+    .listen_addr("192.168.1.1")
+    .listen_port(4791)
+    .build_server()?;
 ```
 
 `"auto"` tries `"cuobj"` first, then falls back to `"mock"`.
@@ -402,4 +408,3 @@ Place `libs3rdmaclient.so` and `libs3rdmaserver.so` alongside the gateway binary
 
 Minimum Rust edition: **2021**.  `unsafe` in `core` is limited to raw-pointer forwarding
 across plugin boundaries and POSIX SHM operations in `MockRdmaProvider`.
-

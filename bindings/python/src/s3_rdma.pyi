@@ -51,7 +51,6 @@ class RdmaProvider:
         shm_path: str = "/dev/shm",
         listen_addr: str = "",
         listen_port: int = 0,
-        pool_count: int = 4,
         buf_size: int = 134217728,
     ) -> None:
         """
@@ -64,7 +63,6 @@ class RdmaProvider:
         :param shm_path: SHM directory for the mock provider (default ``"/dev/shm"``).
         :param listen_addr: RDMA listen address for the cuObj server role.
         :param listen_port: RDMA listen port for the cuObj server role.
-        :param pool_count: number of buffer pool slots for the cuObj server (default 4).
         :param buf_size: buffer slot size in bytes for the cuObj server (default 128 MiB).
         :raises RuntimeError: if the provider is unavailable or fails to initialise.
         """
@@ -287,7 +285,6 @@ class CuObjProvider(RdmaProvider):
         debug: bool = False,
         listen_addr: str = "",
         listen_port: int = 0,
-        pool_count: int = 4,
         buf_size: int = 134217728,
     ) -> None:
         """
@@ -297,7 +294,6 @@ class CuObjProvider(RdmaProvider):
         :param debug: emit trace lines to stderr (default ``False``).
         :param listen_addr: RDMA listen address for the server role.
         :param listen_port: RDMA listen port for the server role.
-        :param pool_count: number of pre-allocated buffer pool slots (default 4).
         :param buf_size: size of each buffer pool slot in bytes (default 128 MiB).
         :raises RuntimeError: if the cuObj plugin is unavailable or fails to initialise.
         """

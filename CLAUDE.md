@@ -138,13 +138,13 @@ The main binary has **no compile-time dependency** on any RDMA SDK.
 > **Note:** `BufferPool`, `OwnedBufferGuard`, and `RdmaWorkerPool` have moved to the
 > `hsg-rdma` crate (hsg project) which owns pool management, observability, and async APIs.
 
-### Provider factory functions (`src/lib.rs`)
+### Provider builder (`src/provider.rs`)
 
-| Function | Returns | Notes |
-|----------|---------|-------|
-| `create_provider(name, debug, role, cfg)` | `Arc<dyn RdmaProvider>` | name: `"mock"`, `"cuobj"`, `"auto"` |
-| `create_client_provider(name, debug, cfg)` | `Arc<dyn RdmaClientProvider>` | wrapper with `RdmaRole::Client` |
-| `create_server_provider(name, debug, cfg)` | `Arc<dyn RdmaServerProvider>` | wrapper with `RdmaRole::Server` |
+| Builder call | Returns | Notes |
+|--------------|---------|-------|
+| `RdmaProviderConfig::builder().provider(name).build()` | `Arc<dyn RdmaProvider>` | name: `"mock"`, `"cuobj"`, `"auto"` |
+| `RdmaProviderConfig::builder().provider(name).build_client()` | `Arc<dyn RdmaClientProvider>` | client-only role |
+| `RdmaProviderConfig::builder().provider(name).build_server()` | `Arc<dyn RdmaServerProvider>` | server-only role |
 
 `"auto"` tries `"cuobj"` first, falls back to `"mock"`.
 

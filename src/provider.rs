@@ -823,26 +823,84 @@ impl RdmaProviderConfigBuilder {
         self
     }
 
+    fn build_for_role(
+        provider: &str,
+        debug: bool,
+        role: RdmaRole,
+        server: &RdmaServerConfig,
+    ) -> Result<std::sync::Arc<dyn RdmaProvider>, crate::error::RdmaError> {
+        let ep: std::sync::Arc<dyn RdmaProvider> = match provider {
+            "mock" => {
+                if debug {
+                    tracing::info!("[rdma] Using MockRdmaProvider (role={role:?})");
+                }
+                std::sync::Arc::new(crate::MockRdmaProvider::new(debug, &server.shm_path, 0))
+            }
+            "cuobj" => {
+                let result: Result<std::sync::Arc<dyn RdmaProvider>, crate::error::RdmaError>;
+                #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
+                {
+                    let ep = match role {
+                        RdmaRole::Client => crate::RdmaPlugin::new_client(),
+                        RdmaRole::Server => crate::RdmaPlugin::new_server(server),
+                        RdmaRole::Both => crate::RdmaPlugin::new_both(server),
+                    };
+                    result = ep
+                        .map(|e| {
+                            if debug {
+                                tracing::info!("[rdma] Using RdmaPlugin (role={role:?})");
+                            }
+                            std::sync::Arc::new(e) as std::sync::Arc<dyn RdmaProvider>
+                        })
+                        .map_err(|e| crate::error::RdmaError::ProviderUnavailable {
+                            provider: provider.to_owned(),
+                            reason: e.to_string(),
+                        });
+                }
+                #[cfg(not(any(feature = "rdma-client", feature = "rdma-server")))]
+                {
+                    let _ = (debug, role, server);
+                    result = Err(crate::error::RdmaError::ProviderUnavailable {
+                        provider: provider.to_owned(),
+                        reason: "compiled without `rdma-client` or `rdma-server` features".into(),
+                    });
+                }
+                result?
+            }
+            "auto" => {
+                return Self::build_for_role("cuobj", debug, role, server)
+                    .or_else(|_| Self::build_for_role("mock", debug, role, server));
+            }
+            other => {
+                return Err(crate::error::RdmaError::ProviderUnavailable {
+                    provider: other.to_owned(),
+                    reason: "unknown provider (valid: mock, cuobj, auto)".to_owned(),
+                })
+            }
+        };
+        Ok(ep)
+    }
+
     /// Build a **client-only** provider (`Arc<dyn RdmaClientProvider>`).
     ///
     /// Equivalent to `.role(RdmaRole::Client).build()` but returns the
     /// narrower `Arc<dyn RdmaClientProvider>` type.
-    #[allow(deprecated)]
     pub fn build_client(
         self,
     ) -> Result<std::sync::Arc<dyn RdmaClientProvider>, crate::error::RdmaError> {
-        crate::create_client_provider(&self.provider, self.debug)
+        Self::build_for_role(&self.provider, self.debug, RdmaRole::Client, &self.server)
+            .map(|p| p as std::sync::Arc<dyn RdmaClientProvider>)
     }
 
     /// Build a **server-only** provider (`Arc<dyn RdmaServerProvider>`).
     ///
     /// Equivalent to `.role(RdmaRole::Server).build()` but returns the
     /// narrower `Arc<dyn RdmaServerProvider>` type.
-    #[allow(deprecated)]
     pub fn build_server(
         self,
     ) -> Result<std::sync::Arc<dyn RdmaServerProvider>, crate::error::RdmaError> {
-        crate::create_server_provider(&self.provider, self.debug, &self.server)
+        Self::build_for_role(&self.provider, self.debug, RdmaRole::Server, &self.server)
+            .map(|p| p as std::sync::Arc<dyn RdmaServerProvider>)
     }
 
     /// Build a provider with the role set via [`.role()`](Self::role) (default: both).
@@ -850,9 +908,8 @@ impl RdmaProviderConfigBuilder {
     /// Returns `Arc<dyn RdmaProvider>`.  For compile-time-known single roles
     /// prefer [`build_client`](Self::build_client) or
     /// [`build_server`](Self::build_server) for narrower types.
-    #[allow(deprecated)]
     pub fn build(self) -> Result<std::sync::Arc<dyn RdmaProvider>, crate::error::RdmaError> {
-        crate::create_provider(&self.provider, self.debug, self.role, Some(&self.server))
+        Self::build_for_role(&self.provider, self.debug, self.role, &self.server)
     }
 }
 
