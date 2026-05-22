@@ -328,7 +328,7 @@ pub type GetNamedServerVtableFn =
 /// Search for `lib_name` in standard locations and return the loaded library.
 ///
 /// Requires `rdma-client` or `rdma-server` feature for `libloading`.
-/// Search order: LD_LIBRARY_PATH → executable directory → `/lib64/` → `/usr/lib64/`.
+/// Search order: LD_LIBRARY_PATH → executable directory → `/lib64/` → `/usr/lib64/` → `/usr/local/lib/`.
 #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
 pub fn find_library(lib_name: &str) -> Option<libloading::Library> {
     fn try_load(path: impl AsRef<std::ffi::OsStr>) -> Option<libloading::Library> {
@@ -344,7 +344,7 @@ pub fn find_library(lib_name: &str) -> Option<libloading::Library> {
             }
         }
     }
-    for dir in &["/lib64", "/usr/lib64"] {
+    for dir in &["/lib64", "/usr/lib64", "/usr/local/lib"] {
         if let Some(lib) = try_load(format!("{dir}/{lib_name}")) {
             return Some(lib);
         }

@@ -24,11 +24,12 @@ mod real {
     use crate::ffi::{ByteCursor, CTelemetryConfig, GetNamedClientVtableFn, RdmaProviderVtable};
     use crate::provider::{RdmaClientChannel, TelemLevel, TelemetryConfig};
 
-    const LIB_NAME: &str = "libs3rdmaclient.so";
+    const LIB_NAMES: &[&str] = &["libs3rdmaclient.so", "libcuobjclient.so"];
+
     // ── RdmaPluginClient ──────────────────────────────────────────────────
 
-    /// RDMA client provider that loads `libs3rdmaclient.so` at runtime and
-    /// calls through the exported [`RdmaProviderVtable`].
+    /// RDMA client provider that loads `libs3rdmaclient.so` (or `libcuobjclient.so`) at runtime
+    /// and calls through the exported [`RdmaProviderVtable`].
     ///
     /// The plugin is queried for the `"cuobj"` backend name; the `.so` routes
     /// this to whichever hardware backend it was compiled with (currently cuObj).
@@ -56,14 +57,16 @@ mod real {
         /// the underlying RDMA SDK `.so` is missing), or the vtable's
         /// `init` fails.
         pub fn new() -> Result<Self, RdmaError> {
-            let lib = crate::ffi::find_library(LIB_NAME).ok_or_else(|| {
-                RdmaError::RdmaPluginLoadFailed {
+            let lib = LIB_NAMES
+                .iter()
+                .find_map(|name| crate::ffi::find_library(name))
+                .ok_or_else(|| RdmaError::RdmaPluginLoadFailed {
                     reason: format!(
-                        "{LIB_NAME} not found \
-                             (searched LD_LIBRARY_PATH, exe dir, /lib64)"
+                        "{} not found \
+                             (searched LD_LIBRARY_PATH, exe dir, /lib64, /usr/lib64, /usr/local/lib)",
+                        LIB_NAMES.join(" / ")
                     ),
-                }
-            })?;
+                })?;
 
             let provider_name = CString::new("cuobj").unwrap();
             let vtable: *const RdmaProviderVtable = unsafe {
@@ -232,7 +235,9 @@ mod real {
         /// not initialise the hardware backend (which may still fail at
         /// construction time if no GPU is available).
         pub fn is_available() -> bool {
-            crate::ffi::find_library(LIB_NAME).is_some()
+            LIB_NAMES
+                .iter()
+                .any(|name| crate::ffi::find_library(name).is_some())
         }
     }
 } // mod real

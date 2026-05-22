@@ -82,32 +82,52 @@ fn global_init(requested_size: usize) -> Option<&'static GlobalState> {
         let client_raw = unsafe { cuobj_sys::cuobj_client_create() };
         if client_raw.is_null() {
             error!("[s3-rdma] global init: cuobj_client_create returned null");
-            return GlobalState { client_raw: 0, ptr: 0, size: 0 };
+            return GlobalState {
+                client_raw: 0,
+                ptr: 0,
+                size: 0,
+            };
         }
         if unsafe { cuobj_sys::cuobj_client_is_connected(client_raw) } == 0 {
             error!("[s3-rdma] global init: cuObjClient not connected to RDMA fabric");
-            return GlobalState { client_raw: 0, ptr: 0, size: 0 };
+            return GlobalState {
+                client_raw: 0,
+                ptr: 0,
+                size: 0,
+            };
         }
 
         // 2. Allocate and register the buffer (once, never freed/deregistered).
         let ptr = mmap_alloc(requested_size);
         if ptr.is_null() {
             error!("[s3-rdma] global init: mmap failed size={requested_size}");
-            return GlobalState { client_raw: 0, ptr: 0, size: 0 };
+            return GlobalState {
+                client_raw: 0,
+                ptr: 0,
+                size: 0,
+            };
         }
         let rc = unsafe {
-            cuobj_sys::cuobj_client_mem_get_descriptor(client_raw, ptr as *mut c_void, requested_size)
+            cuobj_sys::cuobj_client_mem_get_descriptor(
+                client_raw,
+                ptr as *mut c_void,
+                requested_size,
+            )
         };
         if rc != CU_OBJ_SUCCESS {
             error!("[s3-rdma] global init: cuMemObjGetDescriptor failed rc={rc}");
-            return GlobalState { client_raw: 0, ptr: 0, size: 0 };
+            return GlobalState {
+                client_raw: 0,
+                ptr: 0,
+                size: 0,
+            };
         }
         info!("[s3-rdma] global init: buffer registered ptr={ptr:?} size={requested_size}");
 
         GlobalState {
             client_raw: client_raw as usize,
-            ptr:        ptr as usize,
-            size:       requested_size,
+            ptr: ptr as usize,
+            size: requested_size,
         }
     });
     if state.client_raw == 0 {
@@ -161,7 +181,10 @@ impl RdmaClientChannel for CuObjClientChannel {
     /// the base token to the cuObj C SDK.
     fn prepare_put(&self, offset: usize, size: usize) -> Result<RdmaTransferHandle, RdmaError> {
         let token_put = self.token(CUOBJ_PUT, offset, size)?;
-        info!("[s3-rdma] prepare_put: token_len={} offset={offset} size={size}", token_put.len());
+        info!(
+            "[s3-rdma] prepare_put: token_len={} offset={offset} size={size}",
+            token_put.len()
+        );
         let base = String::from_utf8_lossy(&token_put);
         let token = format!("{base}:{offset:x}:{size:x}").into_bytes();
         Ok(RdmaTransferHandle::new(token, offset, size))
@@ -173,7 +196,10 @@ impl RdmaClientChannel for CuObjClientChannel {
     /// Appends `:offset:size` (hex-encoded) so the server knows how many bytes to RDMA_WRITE.
     fn prepare_get(&self, offset: usize, size: usize) -> Result<RdmaTransferHandle, RdmaError> {
         let token_get = self.token(CUOBJ_GET, offset, size)?;
-        info!("[s3-rdma] prepare_get: token_len={} offset={offset} size={size}", token_get.len());
+        info!(
+            "[s3-rdma] prepare_get: token_len={} offset={offset} size={size}",
+            token_get.len()
+        );
         let base = String::from_utf8_lossy(&token_get);
         let token = format!("{base}:{offset:x}:{size:x}").into_bytes();
         Ok(RdmaTransferHandle::new(token, offset, size))

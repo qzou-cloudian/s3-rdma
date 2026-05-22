@@ -21,11 +21,11 @@ mod real {
     use libloading::{Library, Symbol};
     use std::ffi::{c_void, CString};
 
-    const LIB_NAME: &str = "libs3rdmaserver.so";
+    const LIB_NAMES: &[&str] = &["libs3rdmaserver.so", "libcuobjserver.so"];
 
     // ── RdmaPluginServer ──────────────────────────────────────────────────
 
-    /// RDMA server provider that loads `libs3rdmaserver.so` at runtime.
+    /// RDMA server provider that loads `libs3rdmaserver.so` (or `libcuobjserver.so`) at runtime.
     ///
     /// Wraps a server + buffer pool internally (inside the plugin); the gateway
     /// has no compile-time dependency on any RDMA SDK.
@@ -42,14 +42,16 @@ mod real {
     impl RdmaPluginServer {
         /// Load the plugin and initialise it with the given config.
         pub fn new(cfg: &RdmaServerConfig) -> Result<Self, RdmaError> {
-            let lib = crate::ffi::find_library(LIB_NAME).ok_or_else(|| {
-                RdmaError::RdmaPluginLoadFailed {
+            let lib = LIB_NAMES
+                .iter()
+                .find_map(|name| crate::ffi::find_library(name))
+                .ok_or_else(|| RdmaError::RdmaPluginLoadFailed {
                     reason: format!(
-                        "{LIB_NAME} not found \
-                             (searched LD_LIBRARY_PATH, exe dir, /lib64, /usr/lib64)"
+                        "{} not found \
+                             (searched LD_LIBRARY_PATH, exe dir, /lib64, /usr/lib64, /usr/local/lib)",
+                        LIB_NAMES.join(" / ")
                     ),
-                }
-            })?;
+                })?;
 
             let provider_name = CString::new("cuobj").unwrap();
             let vtable: *const RdmaServerVtable = unsafe {

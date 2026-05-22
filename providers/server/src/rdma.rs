@@ -7,11 +7,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{error, info};
 
 use cuobj::server::CuObjServer;
-use cuobj::PersistentBuffer;
+use cuobj::{PersistentBuffer, ScatterGatherEntry as CuObjSge};
 use s3_rdma::error::RdmaError;
 use s3_rdma::ffi::{ByteCursor, CTelemetryConfig, RdmaServerInitParams, RdmaServerVtable};
-use s3_rdma::provider::RdmaServerChannel;
 use s3_rdma::provider::DEFAULT_RDMA_BUF_SIZE;
+use s3_rdma::provider::{RdmaServerChannel, ScatterGatherEntry};
 
 /// Wraps a `*mut c_void` user-data pointer so it can cross thread boundaries.
 ///
@@ -197,6 +197,87 @@ impl RdmaServerChannel for SyncChannel {
             .map_err(|e| RdmaError::TransferFailed {
                 reason: format!("{e:?}"),
             })
+    }
+
+    fn handle_put_scatter(
+        &self,
+        entries: &[ScatterGatherEntry],
+        remote_offset: usize,
+        mut write: Box<dyn FnMut(&[u8]) -> Result<usize, RdmaError> + Send + '_>,
+    ) -> Result<usize, RdmaError> {
+        let guard = self.get_buffer()?;
+        let b = guard.as_ref().unwrap();
+        let ks = std::str::from_utf8(&self.key).unwrap_or("");
+        let ts = std::str::from_utf8(&self.token).unwrap_or("");
+        let cuobj_entries: Vec<CuObjSge> = entries
+            .iter()
+            .map(|e| CuObjSge {
+                offset: e.offset,
+                size: e.size,
+            })
+            .collect();
+        let sg = b
+            .scatter_gather(&cuobj_entries)
+            .map_err(|e| RdmaError::TransferFailed {
+                reason: format!("{e:?}"),
+            })?;
+        let n = sg
+            .handle_put(ks, remote_offset, ts, Some(self.channel_id))
+            .map_err(|e| RdmaError::TransferFailed {
+                reason: format!("{e:?}"),
+            })?;
+        drop(sg);
+        let buf = b.as_slice();
+        let mut total = 0;
+        for entry in entries {
+            let slice = &buf[entry.offset..entry.offset + entry.size];
+            total += write(slice)?;
+        }
+        let _ = n;
+        Ok(total)
+    }
+
+    fn handle_get_scatter(
+        &self,
+        entries: &[ScatterGatherEntry],
+        remote_offset: usize,
+        mut read: Box<dyn FnMut(&mut [u8]) -> Result<usize, RdmaError> + Send + '_>,
+    ) -> Result<usize, RdmaError> {
+        let mut guard = self.buffer.lock().unwrap();
+        if guard.is_none() {
+            let buf = PersistentBuffer::new(self.server.clone(), self.buf_size).map_err(|e| {
+                RdmaError::TransferFailed {
+                    reason: format!("PersistentBuffer: {e:?}"),
+                }
+            })?;
+            *guard = Some(buf);
+        }
+        let b = guard.as_mut().unwrap();
+        let ks = std::str::from_utf8(&self.key).unwrap_or("");
+        let ts = std::str::from_utf8(&self.token).unwrap_or("");
+        let cuobj_entries: Vec<CuObjSge> = entries
+            .iter()
+            .map(|e| CuObjSge {
+                offset: e.offset,
+                size: e.size,
+            })
+            .collect();
+        let buf_slice = b.as_mut_slice();
+        for entry in entries {
+            let slice = &mut buf_slice[entry.offset..entry.offset + entry.size];
+            read(slice)?;
+        }
+        let sg = b
+            .scatter_gather(&cuobj_entries)
+            .map_err(|e| RdmaError::TransferFailed {
+                reason: format!("{e:?}"),
+            })?;
+        let n = sg
+            .handle_get(ks, remote_offset, ts, Some(self.channel_id))
+            .map_err(|e| RdmaError::TransferFailed {
+                reason: format!("{e:?}"),
+            })?;
+        Ok(n)
     }
 }
 

@@ -777,4 +777,68 @@ mod tests {
         assert_eq!(n, 3);
         assert_eq!(received, b"bar");
     }
+
+    #[test]
+    fn put_scatter_default_fallback() {
+        use crate::provider::ScatterGatherEntry;
+
+        let client = MockRdmaProvider::new(false, "/dev/shm", 4096);
+        let ch = client.bind(4096, b"sg-key").unwrap();
+        let server = MockRdmaProvider::new(false, "/dev/shm", 4096);
+
+        let payload = b"AABBBB";
+        let buf = unsafe { std::slice::from_raw_parts_mut(ch.ptr(), ch.size()) };
+        buf[..payload.len()].copy_from_slice(payload);
+        let handle = ch.prepare_put(0, payload.len()).unwrap();
+
+        let entries = [
+            ScatterGatherEntry { offset: 0, size: 2 },
+            ScatterGatherEntry { offset: 2, size: 4 },
+        ];
+        let token = handle.token().to_vec();
+        let srv = server.open_channel(b"sg-key", &token).unwrap();
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        let n = srv
+            .put_scatter(&entries, 0, |slice: &[u8]| {
+                chunks.push(slice.to_vec());
+                Ok(slice.len())
+            })
+            .unwrap();
+
+        ch.complete_put(handle, 200, n).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], b"AA");
+        assert_eq!(chunks[1], b"BBBB");
+        assert_eq!(n, 6);
+    }
+
+    #[test]
+    fn get_scatter_default_fallback() {
+        use crate::provider::ScatterGatherEntry;
+
+        let client = MockRdmaProvider::new(false, "/dev/shm", 4096);
+        let ch = client.bind(4096, b"sg-get-key").unwrap();
+        let server = MockRdmaProvider::new(false, "/dev/shm", 4096);
+
+        let handle = ch.prepare_get(0, 6).unwrap();
+        let entries = [
+            ScatterGatherEntry { offset: 0, size: 3 },
+            ScatterGatherEntry { offset: 3, size: 3 },
+        ];
+        let token = handle.token().to_vec();
+        let srv = server.open_channel(b"sg-get-key", &token).unwrap();
+        let fills: &[&[u8]] = &[b"FOO", b"BAR"];
+        let mut call = 0usize;
+        let n = srv
+            .get_scatter(&entries, 0, |buf: &mut [u8]| {
+                buf.copy_from_slice(fills[call]);
+                call += 1;
+                Ok(buf.len())
+            })
+            .unwrap();
+
+        ch.complete_get(handle, 200, n).unwrap();
+        let received = unsafe { std::slice::from_raw_parts(ch.ptr(), n) };
+        assert_eq!(&received[..6], b"FOOBAR");
+    }
 }

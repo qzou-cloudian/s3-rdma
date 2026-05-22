@@ -164,6 +164,21 @@ impl Default for RdmaRole {
     }
 }
 
+// ── ScatterGatherEntry ────────────────────────────────────────────────────────
+
+/// One region in a server-side scatter-gather list.
+///
+/// All offsets are relative to the start of the server's RDMA-registered base
+/// buffer.  Each entry must be non-zero in size and must not exceed the buffer
+/// bounds.  The cuObj SDK supports at most 10 entries per operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScatterGatherEntry {
+    /// Byte offset from the start of the server's RDMA buffer.
+    pub offset: usize,
+    /// Number of bytes for this entry.  Must be > 0.
+    pub size: usize,
+}
+
 // ── RdmaTransferHandle ─────────────────────────────────────────────────────────
 
 /// Handle for an in-flight RDMA transfer (PUT or GET).
@@ -525,6 +540,81 @@ pub trait RdmaServerChannel: Send + Sync {
         read: Box<dyn FnOnce(&mut [u8]) -> Result<usize, crate::error::RdmaError> + Send + '_>,
     ) -> Result<usize, crate::error::RdmaError>;
 
+    /// Zero-copy scatter-gather RDMA PUT: RDMA-read from the client buffer into
+    /// non-contiguous regions of the server's registered buffer, then call
+    /// `write` once per entry with that entry's data slice.
+    ///
+    /// `entries` describe the server-side buffer layout (offsets and sizes within
+    /// the server's RDMA buffer).  `remote_offset` is the byte offset within the
+    /// client's registered buffer.  Total bytes transferred equals the sum of all
+    /// entry sizes.
+    ///
+    /// The default implementation falls back to a single contiguous RDMA PUT and
+    /// calls `write` sequentially with chunks of the contiguous result, one per
+    /// entry.  Override in hardware providers to use true SG RDMA operations.
+    fn handle_put_scatter(
+        &self,
+        entries: &[ScatterGatherEntry],
+        remote_offset: usize,
+        mut write: Box<dyn FnMut(&[u8]) -> Result<usize, crate::error::RdmaError> + Send + '_>,
+    ) -> Result<usize, crate::error::RdmaError> {
+        let total_size: usize = entries.iter().map(|e| e.size).sum();
+        let entries_owned: Vec<ScatterGatherEntry> = entries.to_vec();
+        self.handle_put(
+            remote_offset,
+            total_size,
+            Box::new(move |buf| {
+                let mut pos = 0;
+                let mut total = 0;
+                for entry in &entries_owned {
+                    let end = (pos + entry.size).min(buf.len());
+                    total += write(&buf[pos..end])?;
+                    pos += entry.size;
+                    if pos >= buf.len() {
+                        break;
+                    }
+                }
+                Ok(total)
+            }),
+        )
+    }
+
+    /// Zero-copy scatter-gather RDMA GET: call `read` once per entry to fill
+    /// non-contiguous regions of the server's registered buffer, then
+    /// RDMA-write all regions to the client in a single operation.
+    ///
+    /// `entries` describe the server-side buffer layout.  `remote_offset` is
+    /// the byte offset within the client's registered buffer.
+    ///
+    /// The default implementation falls back to a single contiguous RDMA GET:
+    /// `read` is called once per entry to fill sequential chunks of the buffer.
+    fn handle_get_scatter(
+        &self,
+        entries: &[ScatterGatherEntry],
+        remote_offset: usize,
+        mut read: Box<dyn FnMut(&mut [u8]) -> Result<usize, crate::error::RdmaError> + Send + '_>,
+    ) -> Result<usize, crate::error::RdmaError> {
+        let total_size: usize = entries.iter().map(|e| e.size).sum();
+        let entries_owned: Vec<ScatterGatherEntry> = entries.to_vec();
+        self.handle_get(
+            remote_offset,
+            total_size,
+            Box::new(move |buf| {
+                let mut pos = 0;
+                let mut total = 0;
+                for entry in &entries_owned {
+                    let end = (pos + entry.size).min(buf.len());
+                    total += read(&mut buf[pos..end])?;
+                    pos += entry.size;
+                    if pos >= buf.len() {
+                        break;
+                    }
+                }
+                Ok(total)
+            }),
+        )
+    }
+
     /// The S3 object key this channel is bound to.
     fn key(&self) -> &[u8];
 
@@ -555,6 +645,30 @@ pub trait RdmaServerChannelExt: RdmaServerChannel {
     fn get<R>(&self, offset: usize, size: usize, read: R) -> Result<usize, crate::error::RdmaError>
     where
         R: FnOnce(&mut [u8]) -> Result<usize, crate::error::RdmaError> + Send;
+
+    /// Scatter-gather RDMA PUT wrapper — no `Box::new` needed.
+    ///
+    /// `write` is called once per [`ScatterGatherEntry`] with that entry's slice.
+    fn put_scatter<W>(
+        &self,
+        entries: &[ScatterGatherEntry],
+        remote_offset: usize,
+        write: W,
+    ) -> Result<usize, crate::error::RdmaError>
+    where
+        W: FnMut(&[u8]) -> Result<usize, crate::error::RdmaError> + Send;
+
+    /// Scatter-gather RDMA GET wrapper — no `Box::new` needed.
+    ///
+    /// `read` is called once per [`ScatterGatherEntry`] to fill that entry's region.
+    fn get_scatter<R>(
+        &self,
+        entries: &[ScatterGatherEntry],
+        remote_offset: usize,
+        read: R,
+    ) -> Result<usize, crate::error::RdmaError>
+    where
+        R: FnMut(&mut [u8]) -> Result<usize, crate::error::RdmaError> + Send;
 }
 
 impl<T: RdmaServerChannel + ?Sized> RdmaServerChannelExt for T {
@@ -570,6 +684,30 @@ impl<T: RdmaServerChannel + ?Sized> RdmaServerChannelExt for T {
         R: FnOnce(&mut [u8]) -> Result<usize, crate::error::RdmaError> + Send,
     {
         self.handle_get(offset, size, Box::new(read))
+    }
+
+    fn put_scatter<W>(
+        &self,
+        entries: &[ScatterGatherEntry],
+        remote_offset: usize,
+        write: W,
+    ) -> Result<usize, crate::error::RdmaError>
+    where
+        W: FnMut(&[u8]) -> Result<usize, crate::error::RdmaError> + Send,
+    {
+        self.handle_put_scatter(entries, remote_offset, Box::new(write))
+    }
+
+    fn get_scatter<R>(
+        &self,
+        entries: &[ScatterGatherEntry],
+        remote_offset: usize,
+        read: R,
+    ) -> Result<usize, crate::error::RdmaError>
+    where
+        R: FnMut(&mut [u8]) -> Result<usize, crate::error::RdmaError> + Send,
+    {
+        self.handle_get_scatter(entries, remote_offset, Box::new(read))
     }
 }
 
