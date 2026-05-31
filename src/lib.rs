@@ -79,7 +79,10 @@ pub use provider::{
     RdmaProvider, RdmaProviderBase, RdmaProviderConfig, RdmaProviderConfigBuilder, RdmaRole,
 };
 pub use provider::{TelemLevel, TelemState, TelemetryConfig};
-pub use provider::{DEFAULT_RDMA_BUF_SIZE, RDMA_REQUIRED_ALIGNMENT};
+pub use provider::{
+    DEFAULT_RDMA_BUF_SIZE, DEFAULT_RDMA_CLIENT_POOL_SLOTS, DEFAULT_RDMA_CLIENT_POOL_WAIT_MS,
+    RDMA_REQUIRED_ALIGNMENT,
+};
 pub use provider::{
     RDMA_BYTES_HEADER, RDMA_REPLY_HEADER, RDMA_STREAM_HEADER, RDMA_TOKEN_HEADER,
     RDMA_TOKEN_SEPARATOR,

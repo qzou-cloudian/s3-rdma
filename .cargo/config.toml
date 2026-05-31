@@ -1,0 +1,25 @@
+# cuObj SDK location.
+#
+# The SDK lives under ~/work/cuobj-sdk/src (headers in src/include, libraries in
+# src/lib).  The copies that used to be in /usr/local/lib were removed, so:
+#
+#   * CUOBJ_ROOT_DIR points cuobj-sys's build.rs at this SDK for both the
+#     headers (src/include/cuobjclient.h) and the link libraries (src/lib).
+#   * the -rpath link arg bakes src/lib into every binary / cdylib built here so
+#     libcuobjclient.so.1 / libcuobjserver.so.1 resolve at runtime without
+#     needing LD_LIBRARY_PATH or an ldconfig entry.
+#
+# --disable-new-dtags emits DT_RPATH (not DT_RUNPATH).  DT_RPATH is transitive,
+# so the rpath also resolves the SDK's own dependency libcufile.so.0 (which
+# lives in src/lib); DT_RUNPATH would only cover the binary's direct NEEDED.
+#
+# NOTE: the path is absolute and machine-specific to this dev box.
+
+[env]
+CUOBJ_ROOT_DIR = "/home/qingshan/work/cuobj-sdk/src"
+
+[build]
+rustflags = [
+    "-C", "link-arg=-Wl,--disable-new-dtags",
+    "-C", "link-arg=-Wl,-rpath,/home/qingshan/work/cuobj-sdk/src/lib",
+]

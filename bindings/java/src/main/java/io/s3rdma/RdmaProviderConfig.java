@@ -10,7 +10,10 @@ package io.s3rdma;
  *   <tr><td>{@link #shmPath}</td><td>&#x2713;</td><td>&#x2013;</td></tr>
  *   <tr><td>{@link #listenAddr}</td><td>&#x2013;</td><td>&#x2713;</td></tr>
  *   <tr><td>{@link #listenPort}</td><td>&#x2013;</td><td>&#x2713;</td></tr>
- *   <tr><td>{@link #bufSize}</td><td>&#x2013;</td><td>&#x2713;</td></tr>
+ *   <tr><td>{@link #bufSize}</td><td>&#x2013;</td><td>server</td></tr>
+ *   <tr><td>{@link #clientBufSize}</td><td>&#x2013;</td><td>client</td></tr>
+ *   <tr><td>{@link #clientPoolSlots}</td><td>&#x2013;</td><td>client</td></tr>
+ *   <tr><td>{@link #clientPoolWaitMs}</td><td>&#x2013;</td><td>client</td></tr>
  * </table>
  *
  * <p>Obtain defaults via {@link #defaults()}:</p>
@@ -37,6 +40,15 @@ public final class RdmaProviderConfig {
 
     /** Size in bytes of each buffer pool slot (cuObj server). Default: 128 MiB. */
     public long bufSize = 128L * 1024 * 1024;
+
+    /** Size in bytes of each buffer pool slot (cuObj client). Default: 128 MiB. */
+    public long clientBufSize = 128L * 1024 * 1024;
+
+    /** Maximum number of buffer pool slots (cuObj client). Default: 4. */
+    public long clientPoolSlots = 4;
+
+    /** Milliseconds to wait for a free buffer pool slot (cuObj client). Default: 100. */
+    public long clientPoolWaitMs = 100;
 
     /** Returns a default configuration suitable for the mock provider. */
     public static RdmaProviderConfig defaults() {

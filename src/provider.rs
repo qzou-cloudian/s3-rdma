@@ -33,6 +33,12 @@ pub const RDMA_BYTES_HEADER: &str = "x-amz-rdma-bytes";
 /// allocation cap in binding-layer `handle_put` helpers.
 pub const DEFAULT_RDMA_BUF_SIZE: usize = 128 * 1024 * 1024;
 
+/// Default number of registered client buffer slots for the cuObj provider.
+pub const DEFAULT_RDMA_CLIENT_POOL_SLOTS: usize = 4;
+
+/// Default time to wait for a free cuObj client buffer slot before failing bind.
+pub const DEFAULT_RDMA_CLIENT_POOL_WAIT_MS: u64 = 100;
+
 /// Required alignment for RDMA-registered buffers: 4 KiB.
 ///
 /// All buffers passed to [`RdmaClientProvider::register_memory`] must be
@@ -843,6 +849,7 @@ impl std::fmt::Debug for TelemState {
 /// Unified configuration for constructing an [`RdmaProvider`].
 ///
 /// The `server` fields are only used when `role` includes the server role.
+/// The client pool fields are used by the cuObj client plugin.
 /// Telemetry is configured post-construction via
 /// [`RdmaClientProvider::setup_telemetry`].
 #[derive(Debug, Clone)]
@@ -855,6 +862,12 @@ pub struct RdmaProviderConfig {
     pub debug: bool,
     /// Server-side configuration (used when `role` includes `Server`).
     pub server: RdmaServerConfig,
+    /// Size in bytes of each cuObj client buffer pool slot.
+    pub client_buf_size: usize,
+    /// Maximum number of cuObj client buffer pool slots.
+    pub client_pool_slots: usize,
+    /// Time to wait for a free cuObj client pool slot before failing bind.
+    pub client_pool_wait_ms: u64,
 }
 
 impl Default for RdmaProviderConfig {
@@ -864,6 +877,9 @@ impl Default for RdmaProviderConfig {
             role: RdmaRole::Both,
             debug: false,
             server: RdmaServerConfig::default(),
+            client_buf_size: DEFAULT_RDMA_BUF_SIZE,
+            client_pool_slots: DEFAULT_RDMA_CLIENT_POOL_SLOTS,
+            client_pool_wait_ms: DEFAULT_RDMA_CLIENT_POOL_WAIT_MS,
         }
     }
 }
@@ -901,6 +917,9 @@ pub struct RdmaProviderConfigBuilder {
     debug: bool,
     role: RdmaRole,
     server: RdmaServerConfig,
+    client_buf_size: usize,
+    client_pool_slots: usize,
+    client_pool_wait_ms: u64,
 }
 
 impl RdmaProviderConfigBuilder {
@@ -910,6 +929,9 @@ impl RdmaProviderConfigBuilder {
             debug: false,
             role: RdmaRole::Both,
             server: RdmaServerConfig::default(),
+            client_buf_size: DEFAULT_RDMA_BUF_SIZE,
+            client_pool_slots: DEFAULT_RDMA_CLIENT_POOL_SLOTS,
+            client_pool_wait_ms: DEFAULT_RDMA_CLIENT_POOL_WAIT_MS,
         }
     }
 
@@ -961,11 +983,35 @@ impl RdmaProviderConfigBuilder {
         self
     }
 
+    /// Client-side cuObj buffer pool slot size in bytes
+    /// (default: [`DEFAULT_RDMA_BUF_SIZE`]).
+    pub fn client_buf_size(mut self, size: usize) -> Self {
+        self.client_buf_size = size;
+        self
+    }
+
+    /// Maximum number of client-side cuObj buffer pool slots
+    /// (default: [`DEFAULT_RDMA_CLIENT_POOL_SLOTS`]).
+    pub fn client_pool_slots(mut self, slots: usize) -> Self {
+        self.client_pool_slots = slots;
+        self
+    }
+
+    /// Time in milliseconds to wait for a free client-side cuObj pool slot
+    /// before failing bind (default: [`DEFAULT_RDMA_CLIENT_POOL_WAIT_MS`]).
+    pub fn client_pool_wait_ms(mut self, wait_ms: u64) -> Self {
+        self.client_pool_wait_ms = wait_ms;
+        self
+    }
+
     fn build_for_role(
         provider: &str,
         debug: bool,
         role: RdmaRole,
         server: &RdmaServerConfig,
+        client_buf_size: usize,
+        client_pool_slots: usize,
+        client_pool_wait_ms: u64,
     ) -> Result<std::sync::Arc<dyn RdmaProvider>, crate::error::RdmaError> {
         let ep: std::sync::Arc<dyn RdmaProvider> = match provider {
             "mock" => {
@@ -979,9 +1025,18 @@ impl RdmaProviderConfigBuilder {
                 #[cfg(any(feature = "rdma-client", feature = "rdma-server"))]
                 {
                     let ep = match role {
-                        RdmaRole::Client => crate::RdmaPlugin::new_client(),
+                        RdmaRole::Client => crate::RdmaPlugin::new_client_with_pool(
+                            client_buf_size,
+                            client_pool_slots,
+                            client_pool_wait_ms,
+                        ),
                         RdmaRole::Server => crate::RdmaPlugin::new_server(server),
-                        RdmaRole::Both => crate::RdmaPlugin::new_both(server),
+                        RdmaRole::Both => crate::RdmaPlugin::new_both_with_client_pool(
+                            server,
+                            client_buf_size,
+                            client_pool_slots,
+                            client_pool_wait_ms,
+                        ),
                     };
                     result = ep
                         .map(|e| {
@@ -997,7 +1052,14 @@ impl RdmaProviderConfigBuilder {
                 }
                 #[cfg(not(any(feature = "rdma-client", feature = "rdma-server")))]
                 {
-                    let _ = (debug, role, server);
+                    let _ = (
+                        debug,
+                        role,
+                        server,
+                        client_buf_size,
+                        client_pool_slots,
+                        client_pool_wait_ms,
+                    );
                     result = Err(crate::error::RdmaError::ProviderUnavailable {
                         provider: provider.to_owned(),
                         reason: "compiled without `rdma-client` or `rdma-server` features".into(),
@@ -1006,8 +1068,26 @@ impl RdmaProviderConfigBuilder {
                 result?
             }
             "auto" => {
-                return Self::build_for_role("cuobj", debug, role, server)
-                    .or_else(|_| Self::build_for_role("mock", debug, role, server));
+                return Self::build_for_role(
+                    "cuobj",
+                    debug,
+                    role,
+                    server,
+                    client_buf_size,
+                    client_pool_slots,
+                    client_pool_wait_ms,
+                )
+                .or_else(|_| {
+                    Self::build_for_role(
+                        "mock",
+                        debug,
+                        role,
+                        server,
+                        client_buf_size,
+                        client_pool_slots,
+                        client_pool_wait_ms,
+                    )
+                });
             }
             other => {
                 return Err(crate::error::RdmaError::ProviderUnavailable {
@@ -1026,8 +1106,16 @@ impl RdmaProviderConfigBuilder {
     pub fn build_client(
         self,
     ) -> Result<std::sync::Arc<dyn RdmaClientProvider>, crate::error::RdmaError> {
-        Self::build_for_role(&self.provider, self.debug, RdmaRole::Client, &self.server)
-            .map(|p| p as std::sync::Arc<dyn RdmaClientProvider>)
+        Self::build_for_role(
+            &self.provider,
+            self.debug,
+            RdmaRole::Client,
+            &self.server,
+            self.client_buf_size,
+            self.client_pool_slots,
+            self.client_pool_wait_ms,
+        )
+        .map(|p| p as std::sync::Arc<dyn RdmaClientProvider>)
     }
 
     /// Build a **server-only** provider (`Arc<dyn RdmaServerProvider>`).
@@ -1037,8 +1125,16 @@ impl RdmaProviderConfigBuilder {
     pub fn build_server(
         self,
     ) -> Result<std::sync::Arc<dyn RdmaServerProvider>, crate::error::RdmaError> {
-        Self::build_for_role(&self.provider, self.debug, RdmaRole::Server, &self.server)
-            .map(|p| p as std::sync::Arc<dyn RdmaServerProvider>)
+        Self::build_for_role(
+            &self.provider,
+            self.debug,
+            RdmaRole::Server,
+            &self.server,
+            self.client_buf_size,
+            self.client_pool_slots,
+            self.client_pool_wait_ms,
+        )
+        .map(|p| p as std::sync::Arc<dyn RdmaServerProvider>)
     }
 
     /// Build a provider with the role set via [`.role()`](Self::role) (default: both).
@@ -1047,7 +1143,43 @@ impl RdmaProviderConfigBuilder {
     /// prefer [`build_client`](Self::build_client) or
     /// [`build_server`](Self::build_server) for narrower types.
     pub fn build(self) -> Result<std::sync::Arc<dyn RdmaProvider>, crate::error::RdmaError> {
-        Self::build_for_role(&self.provider, self.debug, self.role, &self.server)
+        Self::build_for_role(
+            &self.provider,
+            self.debug,
+            self.role,
+            &self.server,
+            self.client_buf_size,
+            self.client_pool_slots,
+            self.client_pool_wait_ms,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        RdmaProviderConfig, DEFAULT_RDMA_BUF_SIZE, DEFAULT_RDMA_CLIENT_POOL_SLOTS,
+        DEFAULT_RDMA_CLIENT_POOL_WAIT_MS,
+    };
+
+    #[test]
+    fn provider_config_has_client_pool_defaults() {
+        let cfg = RdmaProviderConfig::default();
+        assert_eq!(cfg.client_buf_size, DEFAULT_RDMA_BUF_SIZE);
+        assert_eq!(cfg.client_pool_slots, DEFAULT_RDMA_CLIENT_POOL_SLOTS);
+        assert_eq!(cfg.client_pool_wait_ms, DEFAULT_RDMA_CLIENT_POOL_WAIT_MS);
+    }
+
+    #[test]
+    fn builder_accepts_client_pool_settings() {
+        let builder = RdmaProviderConfig::builder()
+            .client_buf_size(4096)
+            .client_pool_slots(2)
+            .client_pool_wait_ms(7);
+
+        assert_eq!(builder.client_buf_size, 4096);
+        assert_eq!(builder.client_pool_slots, 2);
+        assert_eq!(builder.client_pool_wait_ms, 7);
     }
 }
 

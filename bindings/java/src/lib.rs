@@ -60,7 +60,8 @@ fn parse_role(role: &str) -> Option<RdmaRole> {
 // ── Factory ───────────────────────────────────────────────────────────────────
 
 /// `RdmaProvider.nativeCreate(provider, role, debug, shmPath, listenAddr,
-///                             listenPort, bufSize) -> long`
+///                             listenPort, bufSize, clientBufSize,
+///                             clientPoolSlots, clientPoolWaitMs) -> long`
 #[no_mangle]
 pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeCreate(
     mut env: JNIEnv<'_>,
@@ -72,6 +73,9 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeCreate(
     listen_addr: JString<'_>,
     listen_port: jni::sys::jint,
     buf_size: jlong,
+    client_buf_size: jlong,
+    client_pool_slots: jlong,
+    client_pool_wait_ms: jlong,
 ) -> jlong {
     macro_rules! jstr {
         ($s:expr) => {
@@ -108,6 +112,9 @@ pub extern "system" fn Java_io_s3rdma_RdmaProvider_nativeCreate(
         .listen_addr(listen_str)
         .listen_port(listen_port as u16)
         .buf_size(buf_size as usize)
+        .client_buf_size(client_buf_size as usize)
+        .client_pool_slots(client_pool_slots as usize)
+        .client_pool_wait_ms(client_pool_wait_ms as u64)
         .build();
 
     match result {

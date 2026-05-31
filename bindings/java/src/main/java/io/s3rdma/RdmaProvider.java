@@ -81,7 +81,7 @@ public class RdmaProvider implements AutoCloseable {
         long h = nativeCreate(
                 provider, role, cfg.debug,
                 cfg.shmPath, cfg.listenAddr, cfg.listenPort,
-                cfg.bufSize);
+                cfg.bufSize, cfg.clientBufSize, cfg.clientPoolSlots, cfg.clientPoolWaitMs);
         if (h == 0) {
             throw new RdmaException(
                 "failed to create RdmaProvider (provider=" + provider + ", role=" + role + ")");
@@ -278,7 +278,8 @@ public class RdmaProvider implements AutoCloseable {
 
     private static native long    nativeCreate(String provider, String role, boolean debug,
                                                String shmPath, String listenAddr, int listenPort,
-                                               long bufSize);
+                                               long bufSize, long clientBufSize,
+                                               long clientPoolSlots, long clientPoolWaitMs);
     private native void           nativeDestroy(long handle);
     private native String         nativeName(long handle);
     private native String         nativeProtocol(long handle);

@@ -52,6 +52,9 @@ class RdmaProvider:
         listen_addr: str = "",
         listen_port: int = 0,
         buf_size: int = 134217728,
+        client_buf_size: int = 134217728,
+        client_pool_slots: int = 4,
+        client_pool_wait_ms: int = 100,
     ) -> None:
         """
         Create an RDMA provider.
@@ -64,6 +67,9 @@ class RdmaProvider:
         :param listen_addr: RDMA listen address for the cuObj server role.
         :param listen_port: RDMA listen port for the cuObj server role.
         :param buf_size: buffer slot size in bytes for the cuObj server (default 128 MiB).
+        :param client_buf_size: buffer slot size in bytes for the cuObj client pool (default 128 MiB).
+        :param client_pool_slots: maximum cuObj client pool slots (default 4).
+        :param client_pool_wait_ms: milliseconds to wait for a free client pool slot (default 100).
         :raises RuntimeError: if the provider is unavailable or fails to initialise.
         """
         ...
@@ -286,6 +292,9 @@ class CuObjProvider(RdmaProvider):
         listen_addr: str = "",
         listen_port: int = 0,
         buf_size: int = 134217728,
+        client_buf_size: int = 134217728,
+        client_pool_slots: int = 4,
+        client_pool_wait_ms: int = 100,
     ) -> None:
         """
         Create a cuObj RDMA provider.
@@ -295,6 +304,9 @@ class CuObjProvider(RdmaProvider):
         :param listen_addr: RDMA listen address for the server role.
         :param listen_port: RDMA listen port for the server role.
         :param buf_size: size of each buffer pool slot in bytes (default 128 MiB).
+        :param client_buf_size: size of each cuObj client pool slot in bytes (default 128 MiB).
+        :param client_pool_slots: maximum cuObj client pool slots (default 4).
+        :param client_pool_wait_ms: milliseconds to wait for a free client pool slot (default 100).
         :raises RuntimeError: if the cuObj plugin is unavailable or fails to initialise.
         """
         ...

@@ -13,6 +13,13 @@ pub enum RdmaError {
     MemoryDeregistrationFailed { ptr: usize, reason: String },
     /// Memory is not suitable for RDMA.
     MemoryNotSuitable { ptr: usize, size: usize },
+    /// All client buffer-pool slots are leased and the wait timed out.
+    /// Benign capacity pressure — the caller should fall back to plain HTTP
+    /// for this transfer and retry RDMA later.
+    PoolExhausted { slots: usize, wait_ms: u64 },
+    /// The requested transfer is larger than a single client buffer-pool slot.
+    /// The caller should fall back to plain HTTP for this transfer.
+    RequestTooLarge { requested: usize, slot_size: usize },
     /// Token generation failed.
     TokenGenerationFailed { key: String, reason: String },
     /// Reply token processing failed.
@@ -49,7 +56,9 @@ impl RdmaError {
     pub fn is_fallback_eligible(&self) -> bool {
         matches!(
             self,
-            RdmaError::MemoryNotSuitable { .. }
+            RdmaError::PoolExhausted { .. }
+                | RdmaError::RequestTooLarge { .. }
+                | RdmaError::MemoryNotSuitable { .. }
                 | RdmaError::TokenGenerationFailed { .. }
                 | RdmaError::RdmaPluginLoadFailed { .. }
                 | RdmaError::ProviderUnavailable { .. }
@@ -77,6 +86,21 @@ impl fmt::Display for RdmaError {
                     "Memory at {ptr:#x} (size={size}) not suitable for RDMA \
                            (must be non-null, {}-byte aligned, and pinnable)",
                     crate::provider::RDMA_REQUIRED_ALIGNMENT
+                )
+            }
+            RdmaError::PoolExhausted { slots, wait_ms } => {
+                write!(
+                    f,
+                    "RDMA client buffer pool exhausted (slots={slots}, waited {wait_ms}ms)"
+                )
+            }
+            RdmaError::RequestTooLarge {
+                requested,
+                slot_size,
+            } => {
+                write!(
+                    f,
+                    "requested transfer ({requested}) exceeds client pool slot size ({slot_size})"
                 )
             }
             RdmaError::TokenGenerationFailed { key, reason } => {

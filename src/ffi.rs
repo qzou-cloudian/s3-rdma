@@ -86,6 +86,38 @@ pub struct CTelemetryConfig {
 // RdmaProviderVtable
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Configuration passed to `RdmaProviderVtable::init` for client providers.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RdmaClientInitParams {
+    /// Size in bytes of each client-side registered buffer slot.
+    pub client_buf_size: usize,
+    /// Maximum number of client-side registered buffer slots.
+    pub client_pool_slots: usize,
+    /// Time to wait for a free client pool slot before failing bind.
+    pub client_pool_wait_ms: u64,
+}
+
+// ── bind_channel return codes ──────────────────────────────────────────────
+//
+// `bind_channel` returns an `i32`.  `0` is success; negative values encode why
+// the bind failed so the loader can reconstruct the matching [`RdmaError`]
+// variant (and decide fallback eligibility) without an out-param.  Shared by
+// the plugin (which returns them) and the loader (which maps them back).
+
+/// `bind_channel` succeeded; `*out_channel` is valid.
+pub const RDMA_BIND_OK: i32 = 0;
+/// Bind failed for an unspecified reason.
+pub const RDMA_BIND_ERR_GENERIC: i32 = -1;
+/// Requested transfer is larger than a single pool slot.
+pub const RDMA_BIND_ERR_TOO_LARGE: i32 = -2;
+/// All pool slots are leased and the wait timed out.
+pub const RDMA_BIND_ERR_EXHAUSTED: i32 = -3;
+/// A slot buffer could not be allocated/registered (genuine hardware fault).
+pub const RDMA_BIND_ERR_REGISTER: i32 = -4;
+/// The backend is not ready (plugin/client not initialised or not connected).
+pub const RDMA_BIND_ERR_NOT_READY: i32 = -5;
+
 /// C vtable exported by every RDMA provider plugin.
 ///
 /// A plugin `cdylib` must export:
@@ -102,6 +134,9 @@ pub struct RdmaProviderVtable {
     pub provider_version: u32,
 
     /// Initialise the provider.
+    ///
+    /// Client providers receive a pointer to [`RdmaClientInitParams`] cast to
+    /// `*mut c_void`.  Older providers may ignore this pointer.
     pub init: Option<unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32>,
     /// Destroy the provider.
     pub cleanup: Option<unsafe extern "C" fn(*mut c_void)>,
@@ -141,6 +176,9 @@ pub struct RdmaProviderVtable {
 // to send and share across threads once the library is loaded.
 unsafe impl Send for RdmaProviderVtable {}
 unsafe impl Sync for RdmaProviderVtable {}
+
+// SAFETY: only used during init() on the calling thread; `Sync` is not needed.
+unsafe impl Send for RdmaClientInitParams {}
 
 /// Function signature of the plugin entry point for the client provider.
 ///

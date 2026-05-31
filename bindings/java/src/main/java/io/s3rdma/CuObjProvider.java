@@ -55,7 +55,11 @@ public final class CuObjProvider extends RdmaProvider {
      * @param role {@code "client"}, {@code "server"}, or {@code "both"}
      * @param cfg  provider configuration; for the server role set
      *             {@link RdmaProviderConfig#listenAddr} and
-     *             {@link RdmaProviderConfig#listenPort}
+     *             {@link RdmaProviderConfig#listenPort}; for the client role,
+     *             {@link RdmaProviderConfig#clientBufSize},
+     *             {@link RdmaProviderConfig#clientPoolSlots}, and
+     *             {@link RdmaProviderConfig#clientPoolWaitMs} configure the
+     *             registered buffer pool
      * @throws RdmaException if the cuObj plugin is unavailable or fails to initialise
      */
     public CuObjProvider(String role, RdmaProviderConfig cfg) throws RdmaException {

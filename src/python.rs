@@ -18,7 +18,8 @@ use pyo3::PyClassInitializer;
 
 use crate::provider::{
     InflightTransfers, PendingTransfer, RdmaProviderConfig, RdmaRole, RdmaServerChannelExt,
-    TelemetryConfig, DEFAULT_RDMA_BUF_SIZE,
+    TelemetryConfig, DEFAULT_RDMA_BUF_SIZE, DEFAULT_RDMA_CLIENT_POOL_SLOTS,
+    DEFAULT_RDMA_CLIENT_POOL_WAIT_MS,
 };
 use crate::TelemLevel;
 
@@ -73,6 +74,9 @@ impl PyRdmaProvider {
     /// :param listen_addr: RDMA listen address for the cuObj server.
     /// :param listen_port: RDMA listen port for the cuObj server.
     /// :param buf_size: buffer slot size in bytes for the cuObj server (default 128 MiB).
+    /// :param client_buf_size: buffer slot size in bytes for the cuObj client pool (default 128 MiB).
+    /// :param client_pool_slots: maximum cuObj client pool slots (default 4).
+    /// :param client_pool_wait_ms: milliseconds to wait for a free client pool slot (default 100).
     /// :raises RuntimeError: if the provider is unavailable or fails to initialise.
     #[new]
     #[pyo3(signature = (
@@ -84,6 +88,9 @@ impl PyRdmaProvider {
         listen_addr = "",
         listen_port = 0u16,
         buf_size = DEFAULT_RDMA_BUF_SIZE,
+        client_buf_size = DEFAULT_RDMA_BUF_SIZE,
+        client_pool_slots = DEFAULT_RDMA_CLIENT_POOL_SLOTS,
+        client_pool_wait_ms = DEFAULT_RDMA_CLIENT_POOL_WAIT_MS,
     ))]
     pub fn new(
         provider: &str,
@@ -93,6 +100,9 @@ impl PyRdmaProvider {
         listen_addr: &str,
         listen_port: u16,
         buf_size: usize,
+        client_buf_size: usize,
+        client_pool_slots: usize,
+        client_pool_wait_ms: u64,
     ) -> PyResult<Self> {
         let provider_role = parse_role(role)?;
         RdmaProviderConfig::builder()
@@ -103,6 +113,9 @@ impl PyRdmaProvider {
             .listen_addr(listen_addr)
             .listen_port(listen_port)
             .buf_size(buf_size)
+            .client_buf_size(client_buf_size)
+            .client_pool_slots(client_pool_slots)
+            .client_pool_wait_ms(client_pool_wait_ms)
             .build()
             .map(|inner| Self {
                 inner,
@@ -171,9 +184,11 @@ impl PyRdmaProvider {
         let data_ptr = buf.buf_ptr() as *const u8;
         let data_len = buf.len_bytes();
 
-        let ch = self
-            .inner
-            .bind(data_len, s3_key)
+        // `bind` may block waiting for a free buffer-pool slot (cuObj client);
+        // release the GIL so other Python threads can complete in-flight
+        // transfers and free slots.  `bind`'s lease/release is pure Rust.
+        let ch = py
+            .allow_threads(|| self.inner.bind(data_len, s3_key))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         // Copy the caller's data into the channel's registered buffer.
@@ -222,9 +237,10 @@ impl PyRdmaProvider {
         let dst_ptr = buf.buf_ptr() as *mut u8;
         let dst_len = buf.len_bytes();
 
-        let ch = self
-            .inner
-            .bind(dst_len, s3_key)
+        // Release the GIL while `bind` may block on a free pool slot, so other
+        // Python threads can free slots by completing their transfers.
+        let ch = py
+            .allow_threads(|| self.inner.bind(dst_len, s3_key))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         let get_size = size.min(dst_len.saturating_sub(offset));
@@ -456,7 +472,18 @@ impl PyMockRdmaProvider {
     #[new]
     #[pyo3(signature = (debug = false))]
     fn new(debug: bool) -> PyResult<PyClassInitializer<Self>> {
-        let base = PyRdmaProvider::new("mock", "both", debug, "/dev/shm", "", 0, 0)?;
+        let base = PyRdmaProvider::new(
+            "mock",
+            "both",
+            debug,
+            "/dev/shm",
+            "",
+            0,
+            0,
+            DEFAULT_RDMA_BUF_SIZE,
+            DEFAULT_RDMA_CLIENT_POOL_SLOTS,
+            DEFAULT_RDMA_CLIENT_POOL_WAIT_MS,
+        )?;
         Ok(PyClassInitializer::from(base).add_subclass(PyMockRdmaProvider))
     }
 }
@@ -494,6 +521,9 @@ impl PyCuObjProvider {
     /// :param listen_addr: RDMA listen address for the server role (cuObj server).
     /// :param listen_port: RDMA listen port for the server role (cuObj server).
     /// :param buf_size: size of each buffer pool slot in bytes (default 128 MiB).
+    /// :param client_buf_size: size of each cuObj client pool slot in bytes (default 128 MiB).
+    /// :param client_pool_slots: maximum cuObj client pool slots (default 4).
+    /// :param client_pool_wait_ms: milliseconds to wait for a free client pool slot (default 100).
     /// :raises RuntimeError: if the cuObj plugin is unavailable or fails to initialise.
     #[new]
     #[pyo3(signature = (
@@ -503,6 +533,9 @@ impl PyCuObjProvider {
         listen_addr = "",
         listen_port = 0u16,
         buf_size = DEFAULT_RDMA_BUF_SIZE,
+        client_buf_size = DEFAULT_RDMA_BUF_SIZE,
+        client_pool_slots = DEFAULT_RDMA_CLIENT_POOL_SLOTS,
+        client_pool_wait_ms = DEFAULT_RDMA_CLIENT_POOL_WAIT_MS,
     ))]
     fn new(
         role: &str,
@@ -510,6 +543,9 @@ impl PyCuObjProvider {
         listen_addr: &str,
         listen_port: u16,
         buf_size: usize,
+        client_buf_size: usize,
+        client_pool_slots: usize,
+        client_pool_wait_ms: u64,
     ) -> PyResult<PyClassInitializer<Self>> {
         let base = PyRdmaProvider::new(
             "cuobj",
@@ -519,6 +555,9 @@ impl PyCuObjProvider {
             listen_addr,
             listen_port,
             buf_size,
+            client_buf_size,
+            client_pool_slots,
+            client_pool_wait_ms,
         )?;
         Ok(PyClassInitializer::from(base).add_subclass(PyCuObjProvider))
     }

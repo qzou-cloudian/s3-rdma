@@ -21,8 +21,15 @@ mod real {
     use libloading::{Library, Symbol};
 
     use crate::error::RdmaError;
-    use crate::ffi::{ByteCursor, CTelemetryConfig, GetNamedClientVtableFn, RdmaProviderVtable};
-    use crate::provider::{RdmaClientChannel, TelemLevel, TelemetryConfig};
+    use crate::ffi::{
+        ByteCursor, CTelemetryConfig, GetNamedClientVtableFn, RdmaClientInitParams,
+        RdmaProviderVtable, RDMA_BIND_ERR_EXHAUSTED, RDMA_BIND_ERR_NOT_READY,
+        RDMA_BIND_ERR_REGISTER, RDMA_BIND_ERR_TOO_LARGE, RDMA_BIND_OK,
+    };
+    use crate::provider::{
+        RdmaClientChannel, TelemLevel, TelemetryConfig, DEFAULT_RDMA_BUF_SIZE,
+        DEFAULT_RDMA_CLIENT_POOL_SLOTS, DEFAULT_RDMA_CLIENT_POOL_WAIT_MS,
+    };
 
     const LIB_NAMES: &[&str] = &["libs3rdmaclient.so", "libcuobjclient.so"];
 
@@ -57,6 +64,18 @@ mod real {
         /// the underlying RDMA SDK `.so` is missing), or the vtable's
         /// `init` fails.
         pub fn new() -> Result<Self, RdmaError> {
+            Self::new_with_pool(
+                DEFAULT_RDMA_BUF_SIZE,
+                DEFAULT_RDMA_CLIENT_POOL_SLOTS,
+                DEFAULT_RDMA_CLIENT_POOL_WAIT_MS,
+            )
+        }
+
+        pub fn new_with_pool(
+            client_buf_size: usize,
+            client_pool_slots: usize,
+            client_pool_wait_ms: u64,
+        ) -> Result<Self, RdmaError> {
             let lib = LIB_NAMES
                 .iter()
                 .find_map(|name| crate::ffi::find_library(name))
@@ -84,9 +103,15 @@ mod real {
                 ptr
             };
 
+            let params = RdmaClientInitParams {
+                client_buf_size,
+                client_pool_slots,
+                client_pool_wait_ms,
+            };
+
             let mut ctx = std::ptr::null_mut::<c_void>();
             if let Some(init_fn) = unsafe { (*vtable).init } {
-                let rc = unsafe { init_fn(std::ptr::null_mut(), &mut ctx) };
+                let rc = unsafe { init_fn(&params as *const _ as *mut c_void, &mut ctx) };
                 if rc != 0 {
                     return Err(RdmaError::RdmaPluginLoadFailed {
                         reason: format!("vtable init() returned {rc}"),
@@ -142,11 +167,32 @@ mod real {
             let key_cursor = ByteCursor::from_slice(key);
             let mut out: *mut std::ffi::c_void = std::ptr::null_mut();
             let rc = unsafe { f(self.ctx, size, &key_cursor, &mut out) };
-            if rc != 0 || out.is_null() {
-                return Err(RdmaError::MemoryRegistrationFailed {
-                    ptr: 0,
-                    size,
-                    reason: format!("bind_channel returned {rc}"),
+            if rc != RDMA_BIND_OK || out.is_null() {
+                // Reconstruct the category from the reason code (the detailed
+                // reason string stays in the plugin's logs).  Fields the loader
+                // can't know (pool slot_size/slots) are left zero.
+                return Err(match rc {
+                    RDMA_BIND_ERR_TOO_LARGE => RdmaError::RequestTooLarge {
+                        requested: size,
+                        slot_size: 0,
+                    },
+                    RDMA_BIND_ERR_EXHAUSTED => RdmaError::PoolExhausted {
+                        slots: 0,
+                        wait_ms: 0,
+                    },
+                    RDMA_BIND_ERR_REGISTER => RdmaError::MemoryRegistrationFailed {
+                        ptr: 0,
+                        size,
+                        reason: "slot allocation/registration failed".into(),
+                    },
+                    RDMA_BIND_ERR_NOT_READY => RdmaError::RdmaPluginLoadFailed {
+                        reason: "RDMA client backend not ready".into(),
+                    },
+                    _ => RdmaError::MemoryRegistrationFailed {
+                        ptr: 0,
+                        size,
+                        reason: format!("bind_channel returned {rc}"),
+                    },
                 });
             }
             let boxed: Box<Box<dyn RdmaClientChannel>> =
@@ -293,9 +339,25 @@ impl RdmaPlugin {
     /// Returns `Err` if the `rdma-client` feature is not compiled in or the
     /// plugin cannot be loaded.
     pub fn new_client() -> Result<Self, crate::RdmaError> {
+        Self::new_client_with_pool(
+            crate::provider::DEFAULT_RDMA_BUF_SIZE,
+            crate::provider::DEFAULT_RDMA_CLIENT_POOL_SLOTS,
+            crate::provider::DEFAULT_RDMA_CLIENT_POOL_WAIT_MS,
+        )
+    }
+
+    pub fn new_client_with_pool(
+        client_buf_size: usize,
+        client_pool_slots: usize,
+        client_pool_wait_ms: u64,
+    ) -> Result<Self, crate::RdmaError> {
         #[cfg(feature = "rdma-client")]
         {
-            let client = real::RdmaPluginClient::new()?;
+            let client = real::RdmaPluginClient::new_with_pool(
+                client_buf_size,
+                client_pool_slots,
+                client_pool_wait_ms,
+            )?;
             Ok(Self {
                 client: Some(client),
                 #[cfg(feature = "rdma-server")]
@@ -305,6 +367,7 @@ impl RdmaPlugin {
         }
         #[cfg(not(feature = "rdma-client"))]
         {
+            let _ = (client_buf_size, client_pool_slots, client_pool_wait_ms);
             Err(crate::RdmaError::ProviderUnavailable {
                 provider: "cuobj".into(),
                 reason: "compiled without the `rdma-client` feature".into(),
@@ -340,10 +403,33 @@ impl RdmaPlugin {
     /// (not a hard error); the server role is still available.
     /// If the server plugin fails, `Err` is returned.
     pub fn new_both(cfg: &crate::provider::RdmaServerConfig) -> Result<Self, crate::RdmaError> {
+        Self::new_both_with_client_pool(
+            cfg,
+            crate::provider::DEFAULT_RDMA_BUF_SIZE,
+            crate::provider::DEFAULT_RDMA_CLIENT_POOL_SLOTS,
+            crate::provider::DEFAULT_RDMA_CLIENT_POOL_WAIT_MS,
+        )
+    }
+
+    pub fn new_both_with_client_pool(
+        cfg: &crate::provider::RdmaServerConfig,
+        client_buf_size: usize,
+        client_pool_slots: usize,
+        client_pool_wait_ms: u64,
+    ) -> Result<Self, crate::RdmaError> {
         let mut ep = Self::new_server(cfg)?;
         #[cfg(feature = "rdma-client")]
         {
-            ep.client = real::RdmaPluginClient::new().ok();
+            ep.client = real::RdmaPluginClient::new_with_pool(
+                client_buf_size,
+                client_pool_slots,
+                client_pool_wait_ms,
+            )
+            .ok();
+        }
+        #[cfg(not(feature = "rdma-client"))]
+        {
+            let _ = (client_buf_size, client_pool_slots, client_pool_wait_ms);
         }
         Ok(ep)
     }
